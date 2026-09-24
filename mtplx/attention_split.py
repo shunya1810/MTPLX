@@ -650,7 +650,9 @@ def _install_split_attention_hook(attn: Any) -> bool:
             )
         else:
             output = None
-            if getattr(self, "_mtplx_mma_draft_enabled", False):
+            if int(queries.shape[2]) >= 9 and _gqa_mma_prefill_enabled():
+                output = _mma_prefill_attention(self, queries, cache, mask)
+            if output is None and getattr(self, "_mtplx_mma_draft_enabled", False):
                 output = _mma_draft_attention(self, queries, cache, mask)
             if output is None:
                 output = scaled_dot_product_attention(
@@ -667,6 +669,52 @@ def _install_split_attention_hook(attn: Any) -> bool:
     cls.__call__ = split_call
     cls._mtplx_split_full_attention_installed = True
     return True
+
+
+def _gqa_mma_prefill_enabled() -> bool:
+    """Flash-style MMA prefill attention: M1-family default, ``MTPLX_GQA_MMA_PREFILL`` = 1/0."""
+    from .cache_state import _env_flag_default_m1
+
+    return _env_flag_default_m1("MTPLX_GQA_MMA_PREFILL")
+
+
+def _mma_prefill_attention(attn: Any, queries: mx.array, cache: Any, mask: Any):
+    """Causal prefill chunk on sdpa_gqa_mma_prefill, or None for fused SDPA.
+
+    Fused SDPA materializes the head_dim-256 score tensor: slower than the MMA
+    kernel past ~48K cached keys on M1 Max (256K chunk 512: 0.95 -> 0.65 s per
+    layer) and 26 GB transient per layer at 256K chunk 2048. Only the dense
+    contiguous prefill container (python-int offset, new rows already written)
+    with mask None/"causal" and at least ``MTPLX_GQA_MMA_PREFILL_MIN_PREFIX``
+    (49152) cached keys is served.
+    """
+    if mask is not None and not (isinstance(mask, str) and mask == "causal"):
+        return None
+    k_buf = getattr(cache, "keys", None)
+    v_buf = getattr(cache, "values", None)
+    offset = getattr(cache, "offset", None)
+    if k_buf is None or v_buf is None or not isinstance(offset, int):
+        return None
+    if k_buf.ndim != 4 or v_buf.ndim != 4:
+        return None
+    q_len = int(queries.shape[2])
+    prefix = int(offset) - q_len
+    min_prefix = int(os.environ.get("MTPLX_GQA_MMA_PREFILL_MIN_PREFIX", "49152") or "49152")
+    if prefix < max(0, min_prefix):
+        return None
+    from .kernels.sdpa_gqa_mma import sdpa_gqa_mma_prefill
+
+    out = sdpa_gqa_mma_prefill(
+        queries=queries,
+        keys=k_buf,
+        values=v_buf,
+        prefix=prefix,
+        scale=attn.scale,
+        num_kv_heads=int(k_buf.shape[1]),
+    )
+    if out is not None:
+        attn._mtplx_mma_prefill_calls = int(getattr(attn, "_mtplx_mma_prefill_calls", 0)) + 1
+    return out
 
 
 def _mma_draft_attention(attn: Any, queries: mx.array, cache: Any, mask: Any):

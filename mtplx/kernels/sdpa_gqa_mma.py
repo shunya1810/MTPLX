@@ -302,6 +302,78 @@ _REDUCE = r"""
 """
 
 
+def _rep(source: str, old: str, new: str) -> str:
+    if source.count(old) != 1:
+        raise RuntimeError("sdpa_gqa_mma prefill source patch point moved")
+    return source.replace(old, new)
+
+
+def _prefill_source() -> str:
+    """Prefill variant of ``_SOURCE`` (flash-style, no split-K, no score tensor).
+
+    A prefill chunk of L queries after P cached keys is cut into query blocks
+    of QL positions; block b is exactly a tail-causal window whose offset is
+    P + (b + 1) * QL, so the verify kernel's visibility rule is the causal
+    mask. Grid z indexes the block; each threadgroup normalizes and writes
+    its rows directly. Derived from ``_SOURCE`` by five anchored patches so
+    the two kernels share one inner loop.
+    """
+    s = _SOURCE
+    s = _rep(s, """    const int split = threadgroup_position_in_grid.z;""",
+             """    const int qb = threadgroup_position_in_grid.z;
+    const int L_ = q_total;""")
+    s = _rep(s, """    const int n_kv = static_cast<int>(offset[0]);
+    const int S_ = splits;
+
+    int per = (n_kv + S_ - 1) / S_;
+    per = ((per + BK - 1) / BK) * BK;
+    const int k_begin = split * per;
+    const int k_end = min(n_kv, k_begin + per);""",
+             """    // Block qb is a tail-causal window ending at P + (qb + 1) * QL.
+    const int P_ = static_cast<int>(offset[0]);
+    const int n_kv = P_ + qb * QL + QL;
+    const int k_begin = 0;
+    const int k_end = min(n_kv, P_ + L_);""")
+    s = _rep(s, """        vec<InT, 2> v2 = vec<InT, 2>(0);
+        if (r < R) {
+            v2 = *((const device vec<InT, 2>*)(queries + (size_t)(h * R + r) * D + d));
+        }""",
+             """        vec<InT, 2> v2 = vec<InT, 2>(0);
+        if (r < R && qb * QL + (r % QL) < L_) {
+            v2 = *((const device vec<InT, 2>*)(queries
+                + ((size_t)(h * GQA_F + r / QL) * L_ + qb * QL + (r % QL)) * D + d));
+        }""")
+    s = _rep(s, """            const bool rv = srow < R;""",
+             """            const bool rv = srow < R && qb * QL + (srow % QL) < L_;""")
+    s = _rep(s, """        if (r < R) {
+            const size_t prow = (size_t)(h * R + r) * S_ + split;
+            device float* p = partials + prow * D + sg * DCOLS;
+            _Pragma("clang loop unroll(full)")
+            for (int t = 0; t < NDT; ++t) {
+                p[t * 8 + fn] = Oacc[rt * NDT + t].thread_elements()[0];
+                p[t * 8 + fn + 1] = Oacc[rt * NDT + t].thread_elements()[1];
+            }
+        }
+    }
+    if (tid < R) {
+        const size_t prow = (size_t)(h * R + tid) * S_ + split;
+        maxs[prow] = Ss[tid * LDS + 0];
+        sums[prow] = Ss[tid * LDS + 1];
+    }""",
+             """        if (r < R && qb * QL + (r % QL) < L_) {
+            const float inv = 1.0f / Ss[r * LDS + 1];
+            device OutT* p = out
+                + ((size_t)(h * GQA_F + r / QL) * L_ + qb * QL + (r % QL)) * D + sg * DCOLS;
+            _Pragma("clang loop unroll(full)")
+            for (int t = 0; t < NDT; ++t) {
+                p[t * 8 + fn] = static_cast<OutT>(Oacc[rt * NDT + t].thread_elements()[0] * inv);
+                p[t * 8 + fn + 1] = static_cast<OutT>(Oacc[rt * NDT + t].thread_elements()[1] * inv);
+            }
+        }
+    }""")
+    return s
+
+
 @lru_cache(maxsize=None)
 def _kernels():
     if not mx.metal.is_available():
@@ -322,6 +394,21 @@ def _kernels():
         source=_REDUCE,
     )
     return partials, reduce
+
+
+@lru_cache(maxsize=None)
+def _prefill_kernel():
+    if not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name="mtplx_sdpa_gqa_mma_prefill",
+        input_names=[
+            "queries", "keys", "values", "k_scales", "v_scales", "offset",
+            "k_hs", "k_ts", "v_hs", "v_ts", "s_hs", "s_ts", "scale", "q_total",
+        ],
+        output_names=["out"],
+        source=_prefill_source(),
+    )
 
 
 def _env_int(name: str, default: int) -> int:
@@ -499,6 +586,78 @@ def sdpa_gqa_mma(
         template=[("D", d), ("OutT", queries.dtype)],
         grid=(hq * q_len * d, 1, 1),
         threadgroup=(d, 1, 1),
+        output_shapes=[queries.shape],
+        output_dtypes=[queries.dtype],
+    )
+    return out
+
+
+def sdpa_gqa_mma_prefill(
+    *,
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    prefix: int,
+    scale: float,
+    num_kv_heads: int,
+    block_positions: int = 4,
+) -> mx.array | None:
+    """Causal prefill attention of ``queries`` [1, Hq, L, D] over dense K/V.
+
+    ``keys``/``values`` are the whole ``[1, Hk, cap, D]`` buffers with the L
+    new rows already written at [prefix, prefix + L). Query position i sees
+    keys [0, prefix + i]. No score tensor is materialized: on M1 Max one
+    layer at 256K context / chunk 2048 drops from 3.89 s and 26 GB transient
+    (fused SDPA, head_dim 256) to 2.88 s with no transient, and from 0.95 s to
+    0.65 s at chunk 512 (qwen38-mlx-research/mma_prefill_proto.py). Returns
+    None when the contract is not met.
+    """
+    if not mx.metal.is_available():
+        return _bail("metal_unavailable")
+    if queries.ndim != 4 or keys.ndim != 4 or values.ndim != 4:
+        return _bail("ndim")
+    bsz, hq, q_len, d = (int(x) for x in queries.shape)
+    if bsz != 1:
+        return _bail("batch_size")
+    if d % 32 or d > 256 or int(keys.shape[3]) != d or int(values.shape[3]) != d:
+        return _bail("head_dim")
+    hk = int(num_kv_heads)
+    if hk <= 0 or hq % hk or int(keys.shape[1]) != hk:
+        return _bail("gqa_heads")
+    ql = int(block_positions)
+    if ql < 1 or (hq // hk) * ql > 32:
+        return _bail("rows")
+    if queries.dtype not in (mx.float16, mx.bfloat16):
+        return _bail("query_dtype")
+    if keys.dtype != queries.dtype or values.dtype != queries.dtype:
+        return _bail("kv_dtype")
+    prefix = int(prefix)
+    cap = int(keys.shape[2])
+    if prefix < 0 or prefix + q_len > cap or int(values.shape[2]) != cap:
+        return _bail("offset_range")
+    kernel = _prefill_kernel()
+    if kernel is None:
+        return _bail("kernel_unavailable")
+    blocks = (q_len + ql - 1) // ql
+    dummy = _dummy_scales()
+    (out,) = kernel(
+        inputs=[
+            queries, keys, values, dummy, dummy,
+            mx.array([prefix], dtype=mx.int32),
+            cap * d, d, cap * d, d, 0, 0,
+            float(scale), q_len,
+        ],
+        template=[
+            ("InT", queries.dtype),
+            ("OutT", queries.dtype),
+            ("D", d),
+            ("GQA_F", hq // hk),
+            ("QL", ql),
+            ("KQ", 0),
+            ("KT", 1),
+        ],
+        grid=(hk * 32, 4, blocks),
+        threadgroup=(32, 4, 1),
         output_shapes=[queries.shape],
         output_dtypes=[queries.dtype],
     )
