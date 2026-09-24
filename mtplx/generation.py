@@ -1978,6 +1978,35 @@ def _forward_ar_optional_hidden(
     )
 
 
+def _long_context_prefill_chunk(chunk: int) -> int:
+    """Cap the prefill chunk for very long prompts (M1-family default).
+
+    Head_dim-256 prefill attention on MLX 0.32 materializes the score tensor:
+    24 heads x chunk x context x 2 B per layer, 25 GB at chunk 2048 / 245K
+    context. On a 64 GB M1 Max that OOMed every 256K prefill at the default
+    2048 (OFF and q8 alike) while chunk 512 completed (2026-09-24). Above
+    ``MTPLX_PREFILL_LONG_CONTEXT_THRESHOLD`` tokens (default 163840) the chunk
+    is capped at ``MTPLX_PREFILL_CHUNK_SIZE_LONG_CONTEXT`` (M1 default 512,
+    elsewhere 0 = no cap; an explicit value applies on any GPU).
+    """
+    from .cache_state import m1_long_context_defaults
+
+    raw = (os.environ.get("MTPLX_PREFILL_CHUNK_SIZE_LONG_CONTEXT") or "").strip()
+    if raw:
+        try:
+            cap = int(raw)
+        except ValueError:
+            cap = 0
+    else:
+        cap = 512 if m1_long_context_defaults() else 0
+    if cap <= 0:
+        return chunk
+    context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
+    if context_tokens <= _env_int("MTPLX_PREFILL_LONG_CONTEXT_THRESHOLD", 163840):
+        return chunk
+    return max(1, min(int(chunk), int(cap)))
+
+
 def _prefill_chunk_size() -> int:
     override = _PREFILL_CHUNK_SIZE_OVERRIDE.get()
     if override is not None:
@@ -1986,8 +2015,10 @@ def _prefill_chunk_size() -> int:
     if raw == "auto":
         layout = _sustained_prefill_layout()
         if layout == "contiguous_dense_decode":
-            return max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_DENSE", 2048))
-        return max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_REPAGE", 2048))
+            chunk = max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_DENSE", 2048))
+        else:
+            chunk = max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_REPAGE", 2048))
+        return _long_context_prefill_chunk(chunk)
     try:
         return max(1, int(raw))
     except ValueError:
