@@ -114,3 +114,14 @@ def test_contract_bails_return_none() -> None:
         )
         is None
     )
+
+
+def test_dense_verify_route_min_capacity_floor(monkeypatch):
+    from mtplx.attention_split import _gqa_mma_min_capacity
+
+    monkeypatch.delenv("MTPLX_GQA_MMA_MIN_CAPACITY", raising=False)
+    assert _gqa_mma_min_capacity() == 4096
+    monkeypatch.setenv("MTPLX_GQA_MMA_MIN_CAPACITY", "0")
+    assert _gqa_mma_min_capacity() == 0
+    monkeypatch.setenv("MTPLX_GQA_MMA_MIN_CAPACITY", "junk")
+    assert _gqa_mma_min_capacity() == 4096

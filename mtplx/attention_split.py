@@ -30,6 +30,21 @@ def _gqa_mma_enabled() -> bool:
     return _env_flag_default_m1("MTPLX_GQA_MMA")
 
 
+def _gqa_mma_min_capacity() -> int:
+    """Smallest dense key capacity the MMA verify route serves (``MTPLX_GQA_MMA_MIN_CAPACITY``).
+
+    Below ~4K keys the kernel only ties the packed kernel (M1 Max, 1 layer,
+    q_len 2/4: 0.35-0.44 ms both), and on the eager capture_commit verify
+    that ``mtplx tune`` uses it cost ~15-20 ms per D3 verify (183-token code
+    prompt: D3 31-32 vs 37-40 tok/s with the route off, 2026-09-25). Same
+    floor as the MTP draft route's ``MTPLX_GQA_MMA_DRAFT_THRESHOLD``.
+    """
+    try:
+        return int(os.environ.get("MTPLX_GQA_MMA_MIN_CAPACITY", "4096") or "4096")
+    except ValueError:
+        return 4096
+
+
 # F23b (2026-08-16): packed-GQA route declines. Counted only when the lane
 # is enabled AND the call is a verify-shaped dense-cache window (q_len 2..4,
 # cache present, blockwise/paged lanes not owning attention) yet the route
@@ -534,7 +549,7 @@ def _install_split_attention_hook(attn: Any) -> bool:
                 )
             else:
                 output = None
-                if _gqa_mma_enabled():
+                if _gqa_mma_enabled() and int(cache.keys.shape[2]) >= _gqa_mma_min_capacity():
                     # M1-family MMA split-K kernel (kernels/sdpa_gqa_mma): same
                     # tail-causal contract and full-capacity buffers as the
                     # packed kernel; bails (None) fall through to it.
