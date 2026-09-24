@@ -460,6 +460,90 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
+_M1_LONG_CONTEXT_GPU: bool | None = None
+
+
+def m1_long_context_defaults() -> bool:
+    """True when the M1-family long-context paged defaults apply.
+
+    The eager paged/quantized verify fixes below were measured on an M1 Max
+    (``applegpu_g13s``) only, so they default ON for the M1 GPU family
+    (``applegpu_g13*``) and stay opt-in elsewhere. ``MTPLX_M1_LONG_CONTEXT``
+    forces the family gate either way ("1"/"0"); each feature's own env still
+    wins over this gate (see ``_env_flag_default_m1``).
+    """
+    global _M1_LONG_CONTEXT_GPU
+    raw = os.environ.get("MTPLX_M1_LONG_CONTEXT", "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if _M1_LONG_CONTEXT_GPU is None:
+        try:
+            import mlx.core as mx
+
+            arch = str(mx.device_info().get("architecture", "")).lower()
+        except Exception:
+            arch = ""
+        _M1_LONG_CONTEXT_GPU = arch.startswith("applegpu_g13")
+    return bool(_M1_LONG_CONTEXT_GPU)
+
+
+_MMA_TRACE_LINES = 0
+
+
+def _trace_mma_route(cache: Any, queries: Any, mask: Any, out: Any) -> None:
+    """``MTPLX_GQA_MMA_TRACE=1``: first 64 adapter attention decisions to stderr.
+
+    Inside a compiled verify graph this runs at trace time only, so a line
+    means "the traced graph contains this route".
+    """
+    global _MMA_TRACE_LINES
+    if not _env_truthy("MTPLX_GQA_MMA_TRACE") or _MMA_TRACE_LINES >= 64:
+        return
+    _MMA_TRACE_LINES += 1
+    try:
+        from .kernels.sdpa_gqa_mma import gqa_mma_bail_counts
+
+        bails = dict(gqa_mma_bail_counts)
+    except Exception:
+        bails = {}
+    offset = cache.cache[2]
+    print(
+        "mtplx_gqa_mma_route "
+        f"cache={type(cache).__name__} layout={getattr(cache, 'layout', '-')} "
+        f"engaged={out is not None} q_len={int(queries.shape[2])} "
+        f"mask={type(mask).__name__} capacity={int(cache.capacity)} "
+        f"static_max={cache._static_attention_max_offset()} "
+        f"traced={cache._concrete_offset() is None} "
+        f"phase={current_attention_phase()} bails={bails} "
+        f"offset_kind={type(offset).__name__}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _quant_pages_adapter_enabled() -> bool:
+    """Quantized compiled-verify adapter keeps token-major pages (see layout).
+
+    Requires the MMA kernel (the only kernel that reads quantized pages);
+    ``MTPLX_KV_QUANT_PAGES_ADAPTER`` = 1/0 overrides the M1 gate.
+    """
+    return _env_flag_default_m1("MTPLX_GQA_MMA") and _env_flag_default_m1(
+        "MTPLX_KV_QUANT_PAGES_ADAPTER"
+    )
+
+
+def _env_flag_default_m1(name: str) -> bool:
+    """Tri-state feature flag: explicit env value wins, unset follows the M1 gate."""
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return m1_long_context_defaults()
+
+
 def _paged_gqa_sdpa_route_decision_from_env(
     *,
     q_len: int,
@@ -1283,6 +1367,35 @@ class VllmMetalPagedKVCache:
         self.offset = 0
         total = min(int(offset), int(keys.shape[2]))
         if total <= 0:
+            return
+        chunk = _env_int("MTPLX_REPAGE_QUANT_CHUNK_TOKENS", 16384)
+        if (
+            self.kv_quant
+            and chunk > 0
+            and total > chunk
+            and _env_flag_default_m1("MTPLX_REPAGE_EVAL_PER_LAYER")
+        ):
+            # Quantize the contiguous prefill KV in token chunks, evaluating
+            # each: quantize_symmetric runs in fp32, and one whole 256K layer
+            # at once held ~7 GB of fp32 temporaries (repage_peak_probe,
+            # 2026-09-24). Rowwise quantization -> identical integers/scales.
+            import mlx.core as mx
+
+            for start in range(0, total, chunk):
+                end = min(total, start + chunk)
+                self._write_tail(keys[..., start:end, :], values[..., start:end, :])
+                mx.eval(
+                    *[
+                        arr
+                        for arr in (
+                            self.key_cache,
+                            self.value_cache,
+                            self.key_scale_cache,
+                            self.value_scale_cache,
+                        )
+                        if arr is not None
+                    ]
+                )
             return
         self._write_tail(keys[..., :total, :], values[..., :total, :])
 
@@ -2948,6 +3061,37 @@ class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
     def _flat_value_cache(self):
         return self.cache[1].reshape(-1, int(self.cache[1].shape[2]), int(self.cache[1].shape[3]))
 
+    def _concrete_offset(self) -> int | None:
+        """Host-int offset on the eager path; None inside an ``mx.compile`` trace.
+
+        Same contract as graphbank ``TensorOffsetKVCache._concrete_offset``:
+        a tracer raises on ``.item()``, a concrete scalar does not.
+        """
+        try:
+            return int(self.cache[2].item())
+        except Exception:
+            return None
+
+    def _eager_inplace_offset(self, steps: int) -> int | None:
+        """Offset for an in-place eager write/restore, or None to stay functional.
+
+        Eager (above-router) verify used the compiled path's functional
+        ``slice_update`` while ``rollback_state`` held lazy slices of the SAME
+        buffers, so MLX could never donate them: every write copied the whole
+        per-layer page buffer (256K fp16 6.2 ms/layer, 128K q8 1.96 ms/layer,
+        adapter_write_probe 2026-09-24). The in-place variant materializes the
+        pre-write rows first, like the dense ``TensorOffsetKVCache`` eager
+        path. M1-family default, ``MTPLX_PAGED_ADAPTER_INPLACE_WRITE`` A/B.
+        """
+        if not _env_flag_default_m1("MTPLX_PAGED_ADAPTER_INPLACE_WRITE"):
+            return None
+        off_i = self._concrete_offset()
+        if off_i is None or off_i < 0 or off_i + int(steps) > int(self.capacity):
+            # Tracer (compiled graph) or a write past the fixed capacity: keep
+            # the historical functional path and its clamping behaviour.
+            return None
+        return off_i
+
     def update_without_fetch(self, keys: Any, values: Any) -> None:
         import mlx.core as mx
 
@@ -2955,6 +3099,31 @@ class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
         started = time.perf_counter()
         k_3d = mx.contiguous(keys[0].transpose(1, 0, 2))
         v_3d = mx.contiguous(values[0].transpose(1, 0, 2))
+        off_i = self._eager_inplace_offset(steps)
+        if off_i is not None:
+            shape = self.cache[0].shape
+            flat_k = self._flat_key_cache()
+            flat_v = self._flat_value_cache()
+            # Dynamic slices always produce fresh buffers (a basic row slice
+            # of the flat pages would alias them and see the write below).
+            snap_k = mx.slice(flat_k, self.cache[2], axes=(0,), slice_size=k_3d.shape)
+            snap_v = mx.slice(flat_v, self.cache[2], axes=(0,), slice_size=v_3d.shape)
+            mx.eval(snap_k, snap_v)
+            self.rollback_state[0] = self.cache[2]
+            self.rollback_state[1] = snap_k
+            self.rollback_state[2] = snap_v
+            # Drop the container refs so the flat views are the only owners
+            # and the row assignment can donate the page buffer.
+            self.cache[0] = None
+            self.cache[1] = None
+            flat_k[off_i : off_i + steps] = k_3d
+            flat_v[off_i : off_i + steps] = v_3d
+            self.cache[0] = flat_k.reshape(shape)
+            self.cache[1] = flat_v.reshape(shape)
+            self.cache[2] = self.cache[2] + steps
+            self.update_calls += 1
+            self.cache_write_time_s += time.perf_counter() - started
+            return
         flat_k = self._flat_key_cache()
         flat_v = self._flat_value_cache()
         self.rollback_state[0] = self.cache[2]
@@ -3010,7 +3179,7 @@ class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
         if int(queries.shape[0]) != 1:
             return None
         if (
-            _env_truthy("MTPLX_PAGED_TAILMASK_ELIDE")
+            _env_flag_default_m1("MTPLX_PAGED_TAILMASK_ELIDE")
             and isinstance(mask, mx.array)
             and mask.dtype == mx.bool_
             and int(mask.shape[-2]) == int(queries.shape[2])
@@ -3023,11 +3192,19 @@ class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
             # kernel refuses array masks outright (its mask gate is the
             # 147.4k decline, receipts 2026-08-26 12:58), so elide it.
             # Equivalence is pinned numerically by
-            # tests/test_paged_tailmask_elide.py; opt-in until a serve
-            # trajectory-sha gate runs on a bench window.
+            # tests/test_paged_tailmask_elide.py. Default ON for the M1 GPU
+            # family after the serve trajectory gate (2026-09-24, M1 Max,
+            # temperature 0: identical streamed text with and without the
+            # elision at 8K/34K for paged fp16 and q8); opt-in elsewhere.
             mask = None
         static_max_offset = self._static_attention_max_offset()
         started = time.perf_counter()
+        out = self._mma_attention(queries, scale=scale, mask=mask)
+        _trace_mma_route(self, queries, mask, out)
+        if out is not None:
+            self.paged_attention_calls += 1
+            self.attention_time_s += time.perf_counter() - started
+            return out
         from .kernels.sdpa_2pass_paged import sdpa_2pass_paged_tail_dynamic_offset
 
         out = sdpa_2pass_paged_tail_dynamic_offset(
@@ -3045,6 +3222,36 @@ class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
             self.paged_attention_calls += 1
             self.attention_time_s += time.perf_counter() - started
         return out
+
+    def _mma_attention(self, queries: Any, *, scale: float, mask: Any) -> Any | None:
+        """M1-family MMA split-K kernel over the token-major fp16 pages.
+
+        Same tail-causal contract as the dynamic-offset paged kernel (mask
+        must already be None/"causal"); None = not applicable, caller keeps
+        the historical kernel. ``MTPLX_GQA_MMA`` overrides the M1 gate.
+        """
+        if mask is not None and not (isinstance(mask, str) and mask == "causal"):
+            return None
+        if not _env_flag_default_m1("MTPLX_GQA_MMA"):
+            return None
+        from .kernels.sdpa_gqa_mma import sdpa_gqa_mma
+
+        pages = self.cache[0]
+        heads = int(pages.shape[2])
+        dim = int(pages.shape[3])
+        vdim = int(self.cache[1].shape[3])
+        return sdpa_gqa_mma(
+            queries=queries,
+            keys=pages,
+            values=self.cache[1],
+            offset=self.cache[2],
+            scale=float(scale),
+            num_kv_heads=heads,
+            k_strides=(dim, heads * dim),
+            v_strides=(vdim, heads * vdim),
+            ceiling=int(self._static_attention_max_offset() or self.capacity),
+            max_q_len=16,
+        )
 
     def _static_attention_max_offset(self) -> int | None:
         if self.static_max_offset is not None:
@@ -3100,6 +3307,25 @@ class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
             and self.rollback_state[2] is not None
             and int(self.rollback_state[1].shape[0]) == n
         ):
+            back_i = None
+            if _env_flag_default_m1("MTPLX_PAGED_ADAPTER_INPLACE_WRITE"):
+                try:
+                    back_i = int(self.rollback_state[0].item())
+                except Exception:
+                    back_i = None
+            if back_i is not None and 0 <= back_i and back_i + n <= int(self.capacity):
+                # Eager restore in place (see _eager_inplace_offset).
+                shape = self.cache[0].shape
+                flat_k = self._flat_key_cache()
+                flat_v = self._flat_value_cache()
+                self.cache[0] = None
+                self.cache[1] = None
+                flat_k[back_i : back_i + n] = self.rollback_state[1]
+                flat_v[back_i : back_i + n] = self.rollback_state[2]
+                self.cache[0] = flat_k.reshape(shape)
+                self.cache[1] = flat_v.reshape(shape)
+                self.cache[2] = self.rollback_state[0]
+                return n
             flat_k = self._flat_key_cache()
             flat_v = self._flat_value_cache()
             flat_k = mx.slice_update(
@@ -3240,6 +3466,7 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
         source_dtypes: tuple[Any, Any],
         head_dims: tuple[int, int],
         rope_delta: Any = None,
+        layout: str = "bank",
     ) -> None:
         super().__init__(
             key_cache=key_cache,
@@ -3254,6 +3481,14 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
         self.kv_quant_config = kv_quant_config
         self.source_dtypes = tuple(source_dtypes)
         self.head_dims = (int(head_dims[0]), int(head_dims[1]))
+        # "bank": head-major [1, H, cap, packed] leaves (packed-quant kernel).
+        # "pages": the stock token-major pages [blocks, block_size, H, packed]
+        # + scales [blocks, block_size, H, 1] kept as-is (MMA kernel reads any
+        # layout): no pages<->bank transposes at promotion/demotion, so the
+        # quantized KV exists once (q4 stays 0.26x of fp16).
+        if layout not in ("bank", "pages"):
+            raise ValueError(f"unknown quantized adapter layout {layout!r}")
+        self.layout = layout
 
     @property
     def kv_bits(self) -> int:
@@ -3315,6 +3550,20 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
                 "paged cache is not promotable to the quantized adapter"
             )
         heads = int(entry.key_cache.shape[2])
+        if _quant_pages_adapter_enabled():
+            return cls(
+                key_cache=entry.key_cache,
+                value_cache=entry.value_cache,
+                offset=int(entry.offset),
+                key_scale_cache=entry.key_scale_cache.astype(mx.float32),
+                value_scale_cache=entry.value_scale_cache.astype(mx.float32),
+                block_size=int(entry.block_size),
+                num_blocks=int(entry.key_cache.shape[0]),
+                kv_quant_config=entry.kv_quant_config,
+                source_dtypes=tuple(entry._dtypes),
+                head_dims=(int(entry._shape[1]), int(entry._shape[2])),
+                layout="pages",
+            )
 
         def head_major(pages: Any, *, dtype: Any | None = None) -> Any:
             flat = pages.reshape(-1, heads, int(pages.shape[3]))
@@ -3347,9 +3596,35 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
         # same integers/scales the eager pages would hold for these rows
         # (rowwise quantizer, transpose-commutative) — one math for the
         # whole feature, no layout shuffle on the write path.
+        if self.layout == "pages":
+            self._update_pages(keys, values, steps, started)
+            return
         q_k, s_k = quantize_symmetric(keys, bits=bits)
         q_v, s_v = quantize_symmetric(values, bits=bits)
         offset = self.cache[2]
+        off_i = self._eager_inplace_offset(steps)
+        if off_i is not None:
+            # Eager in-place write (see _eager_inplace_offset): fresh snapshot
+            # buffers first, then donate each bank to its row assignment.
+            updates = ((0, q_k), (1, q_v), (3, s_k), (4, s_v))
+            snaps = [
+                mx.slice(self.cache[buf_idx], offset, axes=(2,), slice_size=update.shape)
+                for buf_idx, update in updates
+            ]
+            mx.eval(*snaps)
+            self.rollback_state[0] = offset
+            for slot, snap in enumerate(snaps, start=1):
+                self.rollback_state[slot] = snap
+            end = off_i + steps
+            for buf_idx, update in updates:
+                bank = self.cache[buf_idx]
+                self.cache[buf_idx] = None
+                bank[:, :, off_i:end, :] = update
+                self.cache[buf_idx] = bank
+            self.cache[2] = offset + steps
+            self.update_calls += 1
+            self.cache_write_time_s += time.perf_counter() - started
+            return
         self.rollback_state[0] = offset
         for slot, (buf_idx, update) in enumerate(
             ((0, q_k), (1, q_v), (3, s_k), (4, s_v)), start=1
@@ -3363,6 +3638,60 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
             self.cache[buf_idx] = mx.slice_update(
                 self.cache[buf_idx], update, offset, axes=(2,)
             )
+        self.cache[2] = offset + steps
+        self.update_calls += 1
+        self.cache_write_time_s += time.perf_counter() - started
+
+    def _flat_pages(self, slot: int) -> Any:
+        buf = self.cache[slot]
+        return buf.reshape(-1, int(buf.shape[2]), int(buf.shape[3]))
+
+    def _update_pages(self, keys: Any, values: Any, steps: int, started: float) -> None:
+        """Token-major write of ``steps`` rows (pages layout).
+
+        Same row math as ``VllmMetalPagedKVCache._write_tail``: quantize the
+        token-major (steps, H, D) window rowwise, then write rows
+        [offset, offset + steps) of the flat pages. Eager calls write in
+        place behind materialized snapshots; traced calls stay functional.
+        """
+        import mlx.core as mx
+
+        from .kv_quant import quantize_symmetric
+
+        bits = self.kv_bits
+        k_3d = keys[0].transpose(1, 0, 2)
+        v_3d = values[0].transpose(1, 0, 2)
+        q_k, s_k = quantize_symmetric(k_3d, bits=bits)
+        q_v, s_v = quantize_symmetric(v_3d, bits=bits)
+        updates = ((0, q_k), (1, q_v), (3, s_k), (4, s_v))
+        offset = self.cache[2]
+        off_i = self._eager_inplace_offset(steps)
+        if off_i is not None:
+            shapes = [self.cache[buf_idx].shape for buf_idx, _ in updates]
+            flats = [self._flat_pages(buf_idx) for buf_idx, _ in updates]
+            snaps = [
+                mx.slice(flat, offset, axes=(0,), slice_size=update.shape)
+                for flat, (_, update) in zip(flats, updates)
+            ]
+            mx.eval(*snaps)
+            self.rollback_state[0] = offset
+            for slot, snap in enumerate(snaps, start=1):
+                self.rollback_state[slot] = snap
+            for buf_idx, _ in updates:
+                self.cache[buf_idx] = None
+            for flat, shape, (buf_idx, update) in zip(flats, shapes, updates):
+                flat[off_i : off_i + steps] = update
+                self.cache[buf_idx] = flat.reshape(shape)
+        else:
+            self.rollback_state[0] = offset
+            for slot, (buf_idx, update) in enumerate(updates, start=1):
+                shape = self.cache[buf_idx].shape
+                flat = self._flat_pages(buf_idx)
+                self.rollback_state[slot] = mx.slice(
+                    flat, offset, axes=(0,), slice_size=update.shape
+                )
+                flat = mx.slice_update(flat, update, offset, axes=(0,))
+                self.cache[buf_idx] = flat.reshape(shape)
         self.cache[2] = offset + steps
         self.update_calls += 1
         self.cache_write_time_s += time.perf_counter() - started
@@ -3382,11 +3711,11 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
         if int(sliding_window) > 0:
             return None
         if (
-            _env_truthy("MTPLX_PAGED_TAILMASK_ELIDE")
+            _env_flag_default_m1("MTPLX_PAGED_TAILMASK_ELIDE")
             and isinstance(mask, mx.array)
             and mask.dtype == mx.bool_
             and int(mask.shape[-2]) == int(queries.shape[2])
-            and int(mask.shape[-1]) == int(self.cache[0].shape[2])
+            and int(mask.shape[-1]) == int(self.capacity)
         ):
             # Same elision as the bf16 adapter: make_mask emits the
             # capacity-wide tail-causal mask (row j sees keys <=
@@ -3402,6 +3731,16 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
             return None
         static_max_offset = self._static_attention_max_offset()
         started = time.perf_counter()
+        out = self._mma_attention(queries, scale=scale, mask=mask)
+        _trace_mma_route(self, queries, mask, out)
+        if out is not None:
+            self.paged_attention_calls += 1
+            self.attention_time_s += time.perf_counter() - started
+            return out
+        if self.layout != "bank":
+            # Only the MMA kernel reads token-major quantized pages; the
+            # attention hook falls back to the dequantized ``state``.
+            return None
         from .kernels.sdpa_gqa_packed_quant import sdpa_gqa_packed_tail_quant
 
         out = sdpa_gqa_packed_tail_quant(
@@ -3421,10 +3760,58 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
             self.attention_time_s += time.perf_counter() - started
         return out
 
+    def _mma_attention(self, queries: Any, *, scale: float, mask: Any) -> Any | None:
+        """M1-family MMA split-K kernel over the head-major quantized banks."""
+        if mask is not None and not (isinstance(mask, str) and mask == "causal"):
+            return None
+        if not _env_flag_default_m1("MTPLX_GQA_MMA"):
+            return None
+        if int(self.head_dims[0]) != int(self.head_dims[1]):
+            return None
+        from .kernels.sdpa_gqa_mma import sdpa_gqa_mma
+
+        buf = self.cache[0]
+        if self.layout == "pages":
+            heads = int(buf.shape[2])
+            packed = int(buf.shape[3])
+            strides = (packed, heads * packed)
+            s_strides = (1, heads)
+        else:
+            heads = int(buf.shape[1])
+            cap = int(buf.shape[2])
+            packed = int(buf.shape[3])
+            strides = (cap * packed, packed)
+            s_strides = (cap, 1)
+        return sdpa_gqa_mma(
+            queries=queries,
+            keys=buf,
+            values=self.cache[1],
+            offset=self.cache[2],
+            scale=float(scale),
+            num_kv_heads=heads,
+            k_strides=strides,
+            v_strides=strides,
+            ceiling=int(self._static_attention_max_offset() or self.capacity),
+            kv_bits=self.kv_bits,
+            k_scales=self.cache[3],
+            v_scales=self.cache[4],
+            s_strides=s_strides,
+            max_q_len=16,
+        )
+
     @property
     def state(self):
         from .kv_quant import dequantize_symmetric
 
+        if self.layout == "pages":
+            # Dequantize the flat token-major pages, then head-major (1, H, cap, D).
+            flat_k = dequantize_symmetric(
+                self._flat_pages(0), self._flat_pages(3), bits=self.kv_bits, head_dim=self.head_dims[0]
+            ).astype(self.source_dtypes[0])
+            flat_v = dequantize_symmetric(
+                self._flat_pages(1), self._flat_pages(4), bits=self.kv_bits, head_dim=self.head_dims[1]
+            ).astype(self.source_dtypes[1])
+            return flat_k.transpose(1, 0, 2)[None, ...], flat_v.transpose(1, 0, 2)[None, ...]
         keys = dequantize_symmetric(
             self.cache[0],
             self.cache[3],
@@ -3460,16 +3847,33 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
         self.num_blocks = int(promoted.num_blocks)
         self.source_dtypes = promoted.source_dtypes
         self.head_dims = promoted.head_dims
+        self.layout = promoted.layout
 
     def trim(self, n: int) -> int:
         import mlx.core as mx
 
         n = int(n)
         rollback = self.rollback_state
+        if self.layout == "pages":
+            return self._trim_pages(n)
         if (
             all(rollback[slot] is not None for slot in range(5))
             and int(rollback[1].shape[2]) == n
         ):
+            back_i = None
+            if _env_flag_default_m1("MTPLX_PAGED_ADAPTER_INPLACE_WRITE"):
+                try:
+                    back_i = int(rollback[0].item())
+                except Exception:
+                    back_i = None
+            if back_i is not None and 0 <= back_i and back_i + n <= int(self.capacity):
+                for slot, buf_idx in ((1, 0), (2, 1), (3, 3), (4, 4)):
+                    bank = self.cache[buf_idx]
+                    self.cache[buf_idx] = None
+                    bank[:, :, back_i : back_i + n, :] = rollback[slot]
+                    self.cache[buf_idx] = bank
+                self.cache[2] = rollback[0]
+                return n
             for slot, buf_idx in ((1, 0), (2, 1), (3, 3), (4, 4)):
                 self.cache[buf_idx] = mx.slice_update(
                     self.cache[buf_idx],
@@ -3477,6 +3881,44 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
                     rollback[0],
                     axes=(2,),
                 )
+            self.cache[2] = rollback[0]
+        else:
+            self.cache[2] = mx.maximum(
+                self.cache[2] - n,
+                mx.array(0, dtype=self.cache[2].dtype),
+            )
+        return n
+
+    def _trim_pages(self, n: int) -> int:
+        import mlx.core as mx
+
+        rollback = self.rollback_state
+        if (
+            all(rollback[slot] is not None for slot in range(5))
+            and int(rollback[1].shape[0]) == n
+        ):
+            back_i = None
+            if _env_flag_default_m1("MTPLX_PAGED_ADAPTER_INPLACE_WRITE"):
+                try:
+                    back_i = int(rollback[0].item())
+                except Exception:
+                    back_i = None
+            slots = ((1, 0), (2, 1), (3, 3), (4, 4))
+            if back_i is not None and 0 <= back_i and back_i + n <= int(self.capacity):
+                shapes = [self.cache[buf_idx].shape for _, buf_idx in slots]
+                flats = [self._flat_pages(buf_idx) for _, buf_idx in slots]
+                for _, buf_idx in slots:
+                    self.cache[buf_idx] = None
+                for flat, shape, (slot, buf_idx) in zip(flats, shapes, slots):
+                    flat[back_i : back_i + n] = rollback[slot]
+                    self.cache[buf_idx] = flat.reshape(shape)
+            else:
+                for slot, buf_idx in slots:
+                    shape = self.cache[buf_idx].shape
+                    flat = mx.slice_update(
+                        self._flat_pages(buf_idx), rollback[slot], rollback[0], axes=(0,)
+                    )
+                    self.cache[buf_idx] = flat.reshape(shape)
             self.cache[2] = rollback[0]
         else:
             self.cache[2] = mx.maximum(
@@ -3502,6 +3944,17 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
             kv_quant_config=self.kv_quant_config,
         )
         if self.cache[0] is None or self.cache[1] is None:
+            return paged
+        if self.layout == "pages":
+            # The leaves already are the stock pages: hand them back, no copy.
+            heads = int(self.cache[0].shape[2])
+            paged.key_cache = self.cache[0]
+            paged.value_cache = self.cache[1]
+            paged.key_scale_cache = self.cache[3]
+            paged.value_scale_cache = self.cache[4]
+            paged.offset = int(self.size())
+            paged._shape = (heads, int(self.head_dims[0]), int(self.head_dims[1]))
+            paged._dtypes = tuple(self.source_dtypes)
             return paged
         heads = int(self.cache[0].shape[1])
 
@@ -3536,6 +3989,7 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
         stats = super().paged_stats()
         stats["mode"] = "tensor_offset_quantized_paged"
         stats["kv_quant_bits"] = int(self.kv_bits)
+        stats["kv_quant_layout"] = str(self.layout)
         return stats
 
 
@@ -4042,6 +4496,9 @@ def install_vllm_metal_paged_attention_kv_cache(
         stats["turboquant_v_quant"] = str(turboquant_config.value_quant)
     if kv_quant_config is not None:
         stats["kv_quant_mode"] = str(kv_quant_config.normalized_mode)
+    # M1-family default (MTPLX_REPAGE_EVAL_PER_LAYER A/B): bound the repage
+    # transient to one layer of pages; see the per-entry comment below.
+    eval_per_layer = _env_flag_default_m1("MTPLX_REPAGE_EVAL_PER_LAYER")
     # Validate the optional dependency once at install time only for paths that
     # actually dispatch into the external vLLM-Metal ops. The packaged
     # mlx_vector_paged and sdpa_2pass_paged paths are in-tree and must survive a
@@ -4125,6 +4582,32 @@ def install_vllm_metal_paged_attention_kv_cache(
             turboquant_config=turboquant_config,
             kv_quant_config=kv_quant_config,
         )
+        if eval_per_layer:
+            # Materialize this layer's pages before the next layer allocates
+            # its own: the page buffers are allocated eagerly (zeros + eval)
+            # while the copy from the contiguous prefill KV stays lazy, so
+            # without this every layer's pages AND every layer's contiguous
+            # KV coexist until the caller's single eval (repage peak =
+            # weights + dense KV + paged KV; 256K fp16 ~17 GB of it).
+            import mlx.core as mx
+
+            new_entry = cache[idx]
+            mx.eval(
+                *[
+                    arr
+                    for arr in (
+                        new_entry.key_cache,
+                        new_entry.value_cache,
+                        new_entry.key_scale_cache,
+                        new_entry.value_scale_cache,
+                        new_entry.key_zero_cache,
+                    )
+                    if arr is not None
+                ]
+            )
+            entry = None
+            new_entry = None
+            stats["eval_per_layer"] = int(stats.get("eval_per_layer", 0)) + 1
         stats["entries"] = int(stats["entries"]) + 1
     return stats
 
