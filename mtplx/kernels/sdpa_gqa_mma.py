@@ -121,9 +121,12 @@ _SOURCE = r"""
 
     for (int n0 = k_begin; n0 < k_end; n0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        simdgroup_matrix<float, 8, 8> Sacc[KT * NRT];
+        // QKS independent partial accumulators per score tile split the
+        // D-long reduction so consecutive MMAs do not wait on each other
+        // (q8/q4: -15% / -23% per layer at 64K-256K on M1 Max; no gain fp16).
+        simdgroup_matrix<float, 8, 8> Sacc[KT * NRT * QKS];
         _Pragma("clang loop unroll(full)")
-        for (int i = 0; i < KT * NRT; ++i) {
+        for (int i = 0; i < KT * NRT * QKS; ++i) {
             Sacc[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
         }
         size_t kbase[KT];
@@ -162,8 +165,17 @@ _SOURCE = r"""
                 }
                 _Pragma("clang loop unroll(full)")
                 for (int rt = 0; rt < NRT; ++rt) {
-                    simdgroup_multiply_accumulate(Sacc[c * NRT + rt], A, B[rt], Sacc[c * NRT + rt]);
+                    const int si = ((kb % QKS) * KT + c) * NRT + rt;
+                    simdgroup_multiply_accumulate(Sacc[si], A, B[rt], Sacc[si]);
                 }
+            }
+        }
+        _Pragma("clang loop unroll(full)")
+        for (int part = 1; part < QKS; ++part) {
+            _Pragma("clang loop unroll(full)")
+            for (int i = 0; i < KT * NRT; ++i) {
+                Sacc[i].thread_elements()[0] += Sacc[part * KT * NRT + i].thread_elements()[0];
+                Sacc[i].thread_elements()[1] += Sacc[part * KT * NRT + i].thread_elements()[1];
             }
         }
         // S^T tile (key fm, rows fn, fn+1) -> Ss[row][key]
@@ -575,6 +587,7 @@ def sdpa_gqa_mma(
             ("QL", q_len),
             ("KQ", kv_bits),
             ("KT", 1),
+            ("QKS", 2 if kv_bits else 1),
         ],
         grid=(hk * 32, 4, splits),
         threadgroup=(32, 4, 1),
@@ -655,6 +668,7 @@ def sdpa_gqa_mma_prefill(
             ("QL", ql),
             ("KQ", 0),
             ("KT", 1),
+            ("QKS", 1),
         ],
         grid=(hk * 32, 4, blocks),
         threadgroup=(32, 4, 1),
