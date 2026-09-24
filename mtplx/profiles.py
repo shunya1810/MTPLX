@@ -46,6 +46,18 @@ PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
         # (2026-09-02 default): same per-launch A/B requirement, and
         # MTPLX_NAX_FLASH_ROUTE=0 must be an honest kill switch.
         "MTPLX_NAX_FLASH_ROUTE",
+        # M1/M2 verify-kernel selection.  These are deliberately operator
+        # overrides: the best M4 implementation depends on the Apple GPU
+        # generation and the served model's exact quantized shapes, so a
+        # profile must not silently erase an explicit A/B choice.
+        "MTPLX_NAX_M4_IMPL",
+        "MTPLX_VK_M4_NSG",
+        "MTPLX_VK_M6_NSG",
+        # Packed projection concatenation is mutually exclusive with the
+        # NAX verify lane.  Both switches must remain explicit A/B knobs so
+        # the compatibility/performance trade-off can be measured honestly.
+        "MTPLX_NAX_VERIFY",
+        "MTPLX_PACKED_PROJ_CONCATS",
         # Dense-decode context ceiling (2026-08-26): past it the auto layout
         # repages decode and the packed lane is structurally excluded — the
         # 147.4k decode cliff. Operators must be able to sweep it per launch.

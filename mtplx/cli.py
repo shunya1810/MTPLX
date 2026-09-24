@@ -1659,6 +1659,8 @@ def _cmd_verify_profile(args: argparse.Namespace) -> int:
         warmup=args.warmup,
         prompt_index=args.prompt_index,
         enable_thinking=False if args.disable_thinking else None,
+        context_tokens=args.context_tokens,
+        diagnostic_only=args.diagnostic_only,
     )
     if args.output:
         write_verify_profile(args.output, result)
@@ -4701,6 +4703,16 @@ def build_parser() -> argparse.ArgumentParser:
     profile_p.add_argument("--repeats", type=int, default=2)
     profile_p.add_argument("--warmup", type=int, default=1)
     profile_p.add_argument("--prompt-index", type=int, default=0)
+    profile_p.add_argument(
+        "--context-tokens",
+        type=int,
+        help="Prefill this many tokens before the diagnostic verify step",
+    )
+    profile_p.add_argument(
+        "--diagnostic-only",
+        action="store_true",
+        help="Skip the stock forward comparison and only collect synchronized section timings",
+    )
     profile_p.add_argument("--disable-thinking", action="store_true")
     profile_p.add_argument("--output")
     profile_p.set_defaults(func=_cmd_verify_profile)

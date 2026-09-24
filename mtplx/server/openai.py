@@ -20647,6 +20647,10 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "prefill_chunks",
     "paged_kv_capacity_tokens",
     "paged_kv_num_blocks",
+    # Full cache receipt (layout mode, bytes, dense/paged shapes, recurrent
+    # state bytes): the flattened paged_* fields above cannot tell a
+    # contiguous-dense-decode request from a paged one.
+    "owned_attn_kv",
     "paged_active_array_calls",
     "paged_active_array_time_s",
     "paged_turboquant",
@@ -26331,6 +26335,7 @@ def _run_generation(
             "partitioned_paged_calls_by_phase",
             "prefill_partitioned_paged_calls",
             "decode_partitioned_paged_calls",
+            "owned_attn_kv",
         ):
             if key in stats:
                 envelope[key] = stats[key]

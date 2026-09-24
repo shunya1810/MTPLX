@@ -2536,6 +2536,19 @@ class VllmMetalPagedKVCache:
                     queries, sliding_window=int(sliding_window)
                 )
                 self._kv_quant_route_offset = int(self.offset)
+                if _env_truthy("MTPLX_KV_QUANT_ROUTE_TRACE"):
+                    # Counters on this object do not survive verify
+                    # snapshot/restore (new cache objects), so the latch is
+                    # the durable receipt of which math path served decode.
+                    print(
+                        "mtplx_kv_quant_route "
+                        f"route={self._kv_quant_route} "
+                        f"bits={int(self.kv_quant_config.bits)} "
+                        f"offset={int(self.offset)} q_len={q_len} "
+                        f"phase={current_attention_phase()}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 if self._kv_quant_route == "kernel":
                     # The kernel owns this request's decode: any prefill-era
                     # bf16 mirror is dead weight, released exactly once,
@@ -3364,8 +3377,25 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
         impl_override: str | None = None,
     ):
         del impl_override
+        import mlx.core as mx
+
         if int(sliding_window) > 0:
             return None
+        if (
+            _env_truthy("MTPLX_PAGED_TAILMASK_ELIDE")
+            and isinstance(mask, mx.array)
+            and mask.dtype == mx.bool_
+            and int(mask.shape[-2]) == int(queries.shape[2])
+            and int(mask.shape[-1]) == int(self.cache[0].shape[2])
+        ):
+            # Same elision as the bf16 adapter: make_mask emits the
+            # capacity-wide tail-causal mask (row j sees keys <=
+            # offset_before_write + j), which is exactly the packed-quant
+            # kernel's built-in visibility (n <= n_kv - QL + j). Without it
+            # every eager (above-router) verify declines here and the
+            # attention hook falls back to ``cache.state`` — a full-context
+            # dequantize per layer per verify.
+            mask = None
         if mask is not None and not (isinstance(mask, str) and mask == "causal"):
             return None
         if int(queries.shape[0]) != 1:
@@ -4184,6 +4214,38 @@ def configure_mtp_attention_kv_cache(cache: list[Any]) -> dict[str, int | str]:
     return stats
 
 
+def _accumulate_unowned_cache_stats(aggregate: dict[str, Any], entry: Any) -> None:
+    """Byte/shape receipt for caches no MTPLX owner wraps.
+
+    The contiguous-dense-decode layout serves verify from the stock (or
+    TensorOffset) KVCache, which the paged/tail aggregates above never saw:
+    long-context rows reported ``bytes=0`` for the KV that actually held the
+    context. Recurrent (GDN) ArraysCache state is receipted separately so the
+    context-dependent and context-independent memory stay distinguishable.
+    """
+    keys = getattr(entry, "keys", None)
+    values = getattr(entry, "values", None)
+    if keys is not None and values is not None and hasattr(keys, "nbytes"):
+        aggregate["dense_entries"] = int(aggregate.get("dense_entries", 0)) + 1
+        aggregate["dense_bytes"] = int(aggregate.get("dense_bytes", 0)) + int(
+            keys.nbytes
+        ) + int(values.nbytes)
+        aggregate["dense_capacity"] = int(keys.shape[2])
+        aggregate["dense_shape"] = [int(x) for x in keys.shape]
+        aggregate["dense_dtype"] = str(keys.dtype)
+        aggregate["dense_class"] = type(entry).__name__
+        try:
+            aggregate["dense_offset"] = int(entry.offset)
+        except Exception:
+            pass
+        return
+    state = getattr(entry, "cache", None)
+    if isinstance(state, list):
+        total = sum(int(x.nbytes) for x in state if hasattr(x, "nbytes"))
+        aggregate["recurrent_entries"] = int(aggregate.get("recurrent_entries", 0)) + 1
+        aggregate["recurrent_bytes"] = int(aggregate.get("recurrent_bytes", 0)) + total
+
+
 def tail_owned_attention_kv_stats(cache: list[Any] | None) -> dict[str, Any]:
     aggregate: dict[str, Any] = {
         "enabled": 0,
@@ -4310,8 +4372,19 @@ def tail_owned_attention_kv_stats(cache: list[Any] | None) -> dict[str, Any]:
                 aggregate["turboquant_v_quant"] = str(stats["turboquant_v_quant"])
             if stats.get("kv_quant_mode"):
                 aggregate["kv_quant_mode"] = str(stats["kv_quant_mode"])
+            # Host-side (lazy graph build) timers, not GPU execution time:
+            # neither path synchronizes, so these bound Python/dispatch cost.
+            for key in ("cache_write_time_s", "attention_time_s"):
+                aggregate[key] = float(aggregate.get(key, 0.0)) + float(
+                    stats.get(key, 0.0)
+                )
+            for key in ("kv_quant_bank_rebuilds", "kv_quant_bank_extended_tokens"):
+                aggregate[key] = int(aggregate.get(key, 0)) + int(stats.get(key, 0))
+            if stats.get("kv_quant_route"):
+                aggregate["kv_quant_route"] = str(stats["kv_quant_route"])
             continue
         if not isinstance(entry, TailOwnedKVCache):
+            _accumulate_unowned_cache_stats(aggregate, entry)
             continue
         stats = entry.tail_owner_stats()
         aggregate["enabled"] = 1

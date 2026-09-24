@@ -157,20 +157,30 @@ def _attention_forward_profile(attn: Any, x: mx.array, mask: Any, cache: Any, ac
     )
     gate = gate.reshape(B, L, -1)
 
-    def prepare_qkv():
+    # The former single "attn_qkv_norm_rope_cache_s" section is split so a
+    # context-dependent cost can be pinned to norm, RoPE or the cache update
+    # (their sum equals the old section).
+    def norm_qkv():
         q = attn.q_norm(queries).transpose(0, 2, 1, 3)
         k = attn.k_norm(keys.reshape(B, L, attn.num_key_value_heads, -1)).transpose(0, 2, 1, 3)
         v = values.reshape(B, L, attn.num_key_value_heads, -1).transpose(0, 2, 1, 3)
-        if cache is not None:
-            q = attn.rope(q, offset=cache.offset)
-            k = attn.rope(k, offset=cache.offset)
-            k, v = cache.update_and_fetch(k, v)
-        else:
-            q = attn.rope(q)
-            k = attn.rope(k)
         return q, k, v
 
-    queries, keys, values = acc.time("attn_qkv_norm_rope_cache_s", prepare_qkv)
+    queries, keys, values = acc.time("attn_qk_norm_s", norm_qkv)
+
+    def rope_qk():
+        if cache is not None:
+            return attn.rope(queries, offset=cache.offset), attn.rope(keys, offset=cache.offset)
+        return attn.rope(queries), attn.rope(keys)
+
+    queries, keys = acc.time("attn_rope_s", rope_qk)
+    if cache is not None:
+        capacity_before = None if getattr(cache, "keys", None) is None else int(cache.keys.shape[2])
+        keys, values = acc.time(
+            "attn_cache_update_s", lambda: cache.update_and_fetch(keys, values)
+        )
+        if capacity_before is not None and int(cache.keys.shape[2]) != capacity_before:
+            acc.add("attn_cache_growth_events", 1.0)
     output = acc.time(
         "attn_sdpa_s",
         lambda: scaled_dot_product_attention(
@@ -232,10 +242,12 @@ def _profiled_forward(model: Any, inputs: mx.array, cache: Any) -> tuple[mx.arra
     return logits, {"sections": dict(acc.totals), "layers": acc.layers}
 
 
-def _prefill(rt: Any, prompt_ids: list[int]) -> Any:
+def _prefill(rt: Any, prompt_ids: list[int], *, chunk_tokens: int = 2048) -> Any:
     cache = rt.make_cache()
-    logits = rt.forward_ar(mx.array([prompt_ids]), cache=cache, return_hidden=False)
-    mx.eval(logits)
+    for start in range(0, len(prompt_ids), chunk_tokens):
+        chunk = prompt_ids[start : start + chunk_tokens]
+        logits = rt.forward_ar(mx.array([chunk]), cache=cache, return_hidden=False)
+        mx.eval(logits)
     return cache
 
 
@@ -258,6 +270,8 @@ def run_verify_profile(
     warmup: int = 1,
     prompt_index: int = 0,
     enable_thinking: bool | None = None,
+    context_tokens: int | None = None,
+    diagnostic_only: bool = False,
 ) -> dict[str, Any]:
     rt = load(model_path, mtp=True)
     prompts = load_prompt_suite(prompt_suite)
@@ -270,25 +284,48 @@ def run_verify_profile(
     )
     candidates = _candidate_tokens(rt.tokenizer, max(lengths))
 
+    if context_tokens is not None:
+        if context_tokens < 1:
+            raise ValueError("context_tokens must be positive")
+        context_ids = list(prompt_ids)
+        filler = _candidate_tokens(
+            rt.tokenizer,
+            max(context_tokens - len(context_ids), 1),
+        )
+        context_ids = (context_ids + filler)[:context_tokens]
+    else:
+        context_ids = prompt_ids
+
     rows = []
     for length in lengths:
         input_ids = mx.array([candidates[:length]])
-        stock_cache = _prefill(rt, prompt_ids)
-        stock_started = time.perf_counter()
-        stock_logits = rt.forward_ar(input_ids, cache=stock_cache, return_hidden=False)
-        mx.eval(stock_logits)
-        stock_elapsed = time.perf_counter() - stock_started
+        stock_elapsed = None
+        if not diagnostic_only:
+            stock_cache = _prefill(rt, context_ids)
+            stock_started = time.perf_counter()
+            stock_logits = rt.forward_ar(input_ids, cache=stock_cache, return_hidden=False)
+            mx.eval(stock_logits)
+            stock_elapsed = time.perf_counter() - stock_started
 
-        manual_cache = _prefill(rt, prompt_ids)
+        manual_cache = _prefill(rt, context_ids)
+        active_memory_before = (
+            int(mx.metal.get_active_memory()) if mx.metal.is_available() else None
+        )
+        if mx.metal.is_available():
+            mx.metal.reset_peak_memory()
         manual_started = time.perf_counter()
         manual_logits, first_profile = _profiled_forward(rt.model, input_ids, manual_cache)
         mx.eval(manual_logits)
         first_elapsed = time.perf_counter() - manual_started
-        max_abs_diff = _max_abs_diff(stock_logits, manual_logits)
+        max_abs_diff = (
+            _max_abs_diff(stock_logits, manual_logits)
+            if not diagnostic_only
+            else None
+        )
 
         repeat_profiles = []
         for repeat in range(warmup + repeats):
-            cache = _prefill(rt, prompt_ids)
+            cache = _prefill(rt, context_ids)
             started = time.perf_counter()
             logits, profile = _profiled_forward(rt.model, input_ids, cache)
             mx.eval(logits)
@@ -328,14 +365,24 @@ def run_verify_profile(
             ),
         }
         elapsed_mean = _mean([profile["elapsed_s"] for profile in repeat_profiles])
+        active_memory_after = (
+            int(mx.metal.get_active_memory()) if mx.metal.is_available() else None
+        )
+        peak_memory = (
+            int(mx.metal.get_peak_memory()) if mx.metal.is_available() else None
+        )
         rows.append(
             {
                 "tokens": length,
+                "context_tokens": len(context_ids),
                 "stock_elapsed_s": stock_elapsed,
                 "manual_first_elapsed_s": first_elapsed,
                 "manual_elapsed_mean_s": elapsed_mean,
                 "manual_over_stock_ratio": elapsed_mean / stock_elapsed if stock_elapsed else None,
                 "logit_max_abs_diff": max_abs_diff,
+                "active_memory_before_verify_bytes": active_memory_before,
+                "active_memory_after_verify_bytes": active_memory_after,
+                "peak_memory_bytes": peak_memory,
                 "section_means_s": section_means,
                 "layer_kind_means_s": layer_kind_means,
                 "first_profile_sections_s": first_profile["sections"],
@@ -351,6 +398,8 @@ def run_verify_profile(
         "prompt_category": case.category,
         "prompt_sha256": case.prompt_sha256,
         "prompt_tokens": len(prompt_ids),
+        "context_tokens": len(context_ids),
+        "diagnostic_only": diagnostic_only,
         "enable_thinking": enable_thinking,
         "lengths": lengths,
         "repeats": repeats,
