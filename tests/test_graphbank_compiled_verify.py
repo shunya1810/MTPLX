@@ -831,6 +831,9 @@ def test_kv_quant_bank_demote_restores_quantized_pages(monkeypatch):
     import mtplx.graphbank as graphbank_module
 
     monkeypatch.setattr(graphbank_module, "_PREWARM_DONE", True)
+    # Head-major bank layout (the M1 family defaults to the pages layout,
+    # covered by test_kv_quant_pages_adapter_demote_returns_same_pages).
+    monkeypatch.setenv("MTPLX_KV_QUANT_PAGES_ADAPTER", "0")
     rt = ToyQuantPagedRuntime(mode="q4")
     bank = CompiledVerifyBank(rt)
     cache = _prefill(rt, [0, 1, 2])
@@ -854,6 +857,41 @@ def test_kv_quant_bank_demote_restores_quantized_pages(monkeypatch):
     )
     assert np.array_equal(bank_prefix, pages_prefix)
     # The restored eager cache keeps working: append + attention arrays.
+    restored.update_without_fetch(
+        mx.random.normal((1, 1, 2, 64), dtype=mx.float32),
+        mx.random.normal((1, 1, 2, 64), dtype=mx.float32),
+    )
+    assert int(restored.offset) == 8
+
+
+def test_kv_quant_pages_adapter_demote_returns_same_pages(monkeypatch):
+    import mtplx.graphbank as graphbank_module
+
+    monkeypatch.setattr(graphbank_module, "_PREWARM_DONE", True)
+    monkeypatch.setenv("MTPLX_GQA_MMA", "1")
+    monkeypatch.setenv("MTPLX_KV_QUANT_PAGES_ADAPTER", "1")
+    rt = ToyQuantPagedRuntime(mode="q4")
+    bank = CompiledVerifyBank(rt)
+    cache = _prefill(rt, [0, 1, 2])
+    bank.forward_ar_capture(mx.array([VERIFY_WINDOWS[0]]), cache=cache)
+    adapter = cache[1]
+    assert isinstance(adapter, TensorOffsetQuantizedPagedKVCache)
+    assert adapter.layout == "pages"
+    heads = int(adapter.cache[0].shape[2])
+    pages_before = np.array(
+        adapter.cache[0].reshape(-1, heads, adapter.cache[0].shape[3])[:6]
+    )
+
+    count = bank.demote(cache)
+
+    assert count == 1
+    restored = cache[1]
+    assert isinstance(restored, VllmMetalPagedKVCache)
+    assert int(restored.offset) == 6
+    pages_after = np.array(
+        restored.key_cache.reshape(-1, heads, restored.key_cache.shape[3])[:6]
+    )
+    assert np.array_equal(pages_before, pages_after)
     restored.update_without_fetch(
         mx.random.normal((1, 1, 2, 64), dtype=mx.float32),
         mx.random.normal((1, 1, 2, 64), dtype=mx.float32),

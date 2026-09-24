@@ -54,6 +54,10 @@ def _apply_product_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE", "auto")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE_DENSE", "2048")
     monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE_REPAGE", "2048")
+    # Pin the GPU-family gate off: the M1 long-context chunk cap is covered
+    # by its own tests below, independent of the host running the suite.
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "0")
+    monkeypatch.delenv("MTPLX_PREFILL_CHUNK_SIZE_LONG_CONTEXT", raising=False)
 
 
 @pytest.mark.parametrize("context_tokens", [32_768, 65_536, 131_072])
@@ -75,6 +79,31 @@ def test_prefill_chunk_repage_uses_2048_above_128k(
     monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", str(context_tokens))
 
     assert _sustained_prefill_layout() == "contiguous_then_repage"
+    assert _prefill_chunk_size() == 2048
+
+
+@pytest.mark.parametrize(
+    ("context_tokens", "expected"),
+    [(131_072, 2048), (163_840, 2048), (163_841, 512), (259_000, 512)],
+)
+def test_m1_long_context_prefill_chunk_cap(
+    monkeypatch: pytest.MonkeyPatch, context_tokens: int, expected: int
+) -> None:
+    """M1 family: head_dim-256 prefill score materialization OOMs 256K at 2048."""
+    _apply_product_env(monkeypatch)
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "1")
+    monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", str(context_tokens))
+
+    assert _prefill_chunk_size() == expected
+
+
+def test_long_context_prefill_chunk_cap_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    _apply_product_env(monkeypatch)
+    monkeypatch.setenv("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", "200000")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE_LONG_CONTEXT", "1024")
+    assert _prefill_chunk_size() == 1024
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "1")
+    monkeypatch.setenv("MTPLX_PREFILL_CHUNK_SIZE_LONG_CONTEXT", "0")
     assert _prefill_chunk_size() == 2048
 
 
