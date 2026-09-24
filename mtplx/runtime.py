@@ -826,7 +826,10 @@ def load(
     # Laguna skips the qwen3-next kernel stack entirely; its own env-gated
     # fused lanes install right before runtime construction below.
     if not _is_laguna_s_2_1_mlx_4bit_config(config):
-        from .attention_split import configure_split_full_attention
+        from .attention_split import (
+            configure_mtp_draft_attention,
+            configure_split_full_attention,
+        )
         from .moe_packed_projections import (
             configure_moe_packed_projections,
             moe_pack_gate_up_enabled,
@@ -834,6 +837,10 @@ def load(
         from .native_mlp import configure_native_mlp
 
         configure_split_full_attention(model)
+        # After MTP injection: the draft head's full attention (M1 MMA route).
+        mtp_attn_report = configure_mtp_draft_attention(model)
+        if mtp_attn_report.get("enabled"):
+            logger.info("[mtp-draft-attn] %s", mtp_attn_report)
         configure_native_mlp(model)
         from .dense_mrope import configure_dense_mrope
 

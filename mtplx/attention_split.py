@@ -22,6 +22,14 @@ def _env_enabled(name: str, *, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _gqa_mma_enabled() -> bool:
+    """MMA split-K verify attention (kernels/sdpa_gqa_mma): M1-family default,
+    ``MTPLX_GQA_MMA`` = 1/0 overrides (see cache_state._env_flag_default_m1)."""
+    from .cache_state import _env_flag_default_m1
+
+    return _env_flag_default_m1("MTPLX_GQA_MMA")
+
+
 # F23b (2026-08-16): packed-GQA route declines. Counted only when the lane
 # is enabled AND the call is a verify-shaped dense-cache window (q_len 2..4,
 # cache present, blockwise/paged lanes not owning attention) yet the route
@@ -525,13 +533,39 @@ def _install_split_attention_hook(attn: Any) -> bool:
                     scale=self.scale,
                 )
             else:
-                output = sdpa_gqa_packed_tail(
-                    queries=queries,
-                    keys=cache.keys,
-                    values=cache.values,
-                    offset=cache.offset,
-                    scale=self.scale,
-                )
+                output = None
+                if _gqa_mma_enabled():
+                    # M1-family MMA split-K kernel (kernels/sdpa_gqa_mma): same
+                    # tail-causal contract and full-capacity buffers as the
+                    # packed kernel; bails (None) fall through to it.
+                    from .kernels.sdpa_gqa_mma import sdpa_gqa_mma
+
+                    capacity = int(cache.keys.shape[2])
+                    head_dim = int(cache.keys.shape[3])
+                    output = sdpa_gqa_mma(
+                        queries=queries,
+                        keys=cache.keys,
+                        values=cache.values,
+                        offset=cache.offset,
+                        scale=self.scale,
+                        num_kv_heads=int(cache.keys.shape[1]),
+                        k_strides=(capacity * head_dim, head_dim),
+                        v_strides=(capacity * int(cache.values.shape[3]), int(cache.values.shape[3])),
+                        ceiling=capacity,
+                        max_q_len=8,
+                    )
+                    if output is not None:
+                        self._mtplx_gqa_mma_calls = (
+                            int(getattr(self, "_mtplx_gqa_mma_calls", 0)) + 1
+                        )
+                if output is None:
+                    output = sdpa_gqa_packed_tail(
+                        queries=queries,
+                        keys=cache.keys,
+                        values=cache.values,
+                        offset=cache.offset,
+                        scale=self.scale,
+                    )
             if output is not None:
                 self._mtplx_gqa_packed_sdpa_calls = (
                     int(getattr(self, "_mtplx_gqa_packed_sdpa_calls", 0)) + 1
@@ -615,20 +649,102 @@ def _install_split_attention_hook(attn: Any) -> bool:
                 cached_prefix_len=cached_prefix_len,
             )
         else:
-            output = scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                cache=cache,
-                scale=self.scale,
-                mask=mask,
-            )
+            output = None
+            if getattr(self, "_mtplx_mma_draft_enabled", False):
+                output = _mma_draft_attention(self, queries, cache, mask)
+            if output is None:
+                output = scaled_dot_product_attention(
+                    queries,
+                    keys,
+                    values,
+                    cache=cache,
+                    scale=self.scale,
+                    mask=mask,
+                )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(attention_gate(output, gate))
 
     cls.__call__ = split_call
     cls._mtplx_split_full_attention_installed = True
     return True
+
+
+def _mma_draft_attention(attn: Any, queries: mx.array, cache: Any, mask: Any):
+    """MTP draft-head attention on the M1 MMA kernel, or None for stock SDPA.
+
+    The native MTP layer attends over the WHOLE committed history (turbo
+    ``MTPLX_MTP_HISTORY_POLICY=committed``) through a stock ``KVCache`` with
+    q_len 1..4 and mask None/"causal", where fused SDPA measured 16.7 ms per
+    call at 256K on M1 Max vs 3.3 ms for sdpa_gqa_mma (2026-09-24). Only the
+    dense stock container with a python-int offset is served; anything else
+    returns None.
+    """
+    if mask is not None and not (isinstance(mask, str) and mask == "causal"):
+        return None
+    k_buf = getattr(cache, "keys", None)
+    v_buf = getattr(cache, "values", None)
+    offset = getattr(cache, "offset", None)
+    if k_buf is None or v_buf is None or not isinstance(offset, int):
+        return None
+    if k_buf.ndim != 4 or v_buf.ndim != 4:
+        return None
+    capacity = int(k_buf.shape[2])
+    if offset < int(getattr(attn, "_mtplx_mma_draft_threshold", 4096)) or offset > capacity:
+        return None
+    from .kernels.sdpa_gqa_mma import sdpa_gqa_mma
+
+    head_dim = int(k_buf.shape[3])
+    v_dim = int(v_buf.shape[3])
+    out = sdpa_gqa_mma(
+        queries=queries,
+        keys=k_buf,
+        values=v_buf,
+        offset=offset,
+        scale=attn.scale,
+        num_kv_heads=int(k_buf.shape[1]),
+        k_strides=(capacity * head_dim, head_dim),
+        v_strides=(int(v_buf.shape[2]) * v_dim, v_dim),
+        ceiling=capacity,
+        max_q_len=5,
+    )
+    if out is not None:
+        attn._mtplx_mma_draft_calls = int(getattr(attn, "_mtplx_mma_draft_calls", 0)) + 1
+    return out
+
+
+def configure_mtp_draft_attention(model: Any) -> dict[str, int]:
+    """Route the native MTP head's full attention through the MMA kernel.
+
+    M1-family default (``MTPLX_GQA_MMA_DRAFT`` = 1/0 overrides). Only flips
+    the hook's master switch plus the draft flag on the MTP attention
+    instances, so every other hook route stays off for them.
+    """
+    from .cache_state import _env_flag_default_m1
+
+    stats = {"layers": 0, "enabled": 0}
+    text_model = getattr(model, "language_model", model)
+    mtp = getattr(text_model, "mtp", None)
+    if mtp is None:
+        inner = getattr(text_model, "model", None)
+        mtp = getattr(inner, "mtp", None)
+    layers = getattr(mtp, "layers", None) or []
+    enabled = _env_flag_default_m1("MTPLX_GQA_MMA_DRAFT")
+    threshold = int(os.environ.get("MTPLX_GQA_MMA_DRAFT_THRESHOLD", "4096") or "4096")
+    for layer in layers:
+        attn = getattr(layer, "self_attn", None)
+        if attn is None or getattr(layer, "is_linear", False):
+            continue
+        if not _attention_has_gated_q_proj(attn):
+            continue
+        stats["layers"] += 1
+        if not enabled:
+            continue
+        _install_split_attention_hook(attn)
+        attn._mtplx_split_full_attention_enabled = True
+        attn._mtplx_mma_draft_enabled = True
+        attn._mtplx_mma_draft_threshold = threshold
+        stats["enabled"] += 1
+    return stats
 
 
 def _full_attention_layers(model: Any):
