@@ -1499,6 +1499,10 @@ def _paged_kernel_bucket_eligible(entry: Any, length: int, bucket: int) -> bool:
         head_dim = int(entry.head_dims[0])
         if head_dim not in (64, 128, 256) or int(entry.head_dims[1]) != head_dim:
             return False
+        if getattr(entry, "layout", "bank") == "pages":
+            # Token-major pages are served by the MMA kernel only (q_len <= 16
+            # in <=4-row chunks, no static block geometry).
+            return length <= 16
         from .kernels.sdpa_gqa_packed_quant import _static_blocks
 
         blocks = _static_blocks(int(entry.capacity), int(bucket) or None)
@@ -1611,6 +1615,23 @@ _FIXED_M4_DONATION_PROBE = _FIXED_M4_DONATION_PROBE_RAW in (
     "1", "true", "yes", "on", "all"
 )
 _FIXED_M4_DONATION_PROBE_ALL = _FIXED_M4_DONATION_PROBE_RAW == "all"
+
+
+def _paged_compiled_verify_unfenced() -> bool:
+    """Lift the context router for PAGED adapters (M1-family default).
+
+    ``_last_context_estimate`` is only set from entries with a ``capacity``
+    (the paged/quantized adapters): dense ``TensorOffsetKVCache`` requests
+    were never fenced and already run compiled at 128K. On M1 Max the fence
+    turned every paged verify above 32,768 tokens eager, and the eager path
+    pays per-call graph construction plus non-donated buffer writes: 34K q8
+    146 ms eager vs 138 ms compiled per verify, identical temperature-0 text
+    (2026-09-24). ``MTPLX_PAGED_COMPILED_VERIFY_UNFENCED`` = 1/0 overrides
+    the M1 gate.
+    """
+    from .cache_state import _env_flag_default_m1
+
+    return _env_flag_default_m1("MTPLX_PAGED_COMPILED_VERIFY_UNFENCED")
 
 
 def _compiled_verify_boundary() -> str:
@@ -3476,7 +3497,11 @@ class CompiledVerifyBank:
                     reason="capacity_overflow",
                 )
             max_ctx = _compiled_verify_max_context()
-            if max_ctx and getattr(self, "_last_context_estimate", 0) > max_ctx:
+            if (
+                max_ctx
+                and getattr(self, "_last_context_estimate", 0) > max_ctx
+                and not _paged_compiled_verify_unfenced()
+            ):
                 # Context-scaled router: compiled verify is proven bit-exact
                 # and +4.8% only up to ~6k ctx; beyond, eager wins and the
                 # exactness corpus has no coverage. Fall back per call.
@@ -3726,6 +3751,17 @@ class CompiledVerifyBank:
             if max_context is not None
             else _compiled_verify_max_context()
         )
+        if (
+            boundary > 0
+            and max_context is None
+            and int(natural) > _next_pow2(boundary + length + 512)
+            and _paged_compiled_verify_unfenced()
+        ):
+            # Paged router lifted and this call is above it: prewarm the
+            # natural bucket like the router-disabled case instead of
+            # skipping it as unreachable. Below the router the ladder walk
+            # is unchanged.
+            boundary = 0
         if boundary <= 0:
             # Router disabled: only the natural bucket is reachable cheaply;
             # deeper buckets appear at unbounded context growth and warming
@@ -4329,6 +4365,7 @@ class CompiledVerifyBank:
                         source_dtypes=entry.source_dtypes,
                         head_dims=entry.head_dims,
                         rope_delta=entry.rope_delta,
+                        layout=getattr(entry, "layout", "bank"),
                     )
                 else:
                     twin = TensorOffsetVllmMetalPagedKVCache(
@@ -4924,6 +4961,7 @@ class CompiledVerifyBank:
                         kv_quant_config=entry.kv_quant_config,
                         source_dtypes=entry.source_dtypes,
                         head_dims=entry.head_dims,
+                        layout=getattr(entry, "layout", "bank"),
                     )
                 else:
                     twin = TensorOffsetVllmMetalPagedKVCache(
