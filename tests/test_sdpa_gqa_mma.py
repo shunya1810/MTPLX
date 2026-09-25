@@ -162,3 +162,26 @@ def test_prefill_over_q8_pages_matches_dequantized_reference(prefix, q_len):
     ref = mx.softmax(scores, axis=-1) @ vd
     err = mx.max(mx.abs(out.astype(mx.float32) - ref)).item()
     assert err < 2e-2, err
+
+
+@pytest.mark.parametrize("positions,simdgroups", [(5, 4), (4, 8), (6, 8)])
+def test_prefill_row_geometries_match_the_default(positions, simdgroups):
+    from mtplx.kernels.sdpa_gqa_mma import sdpa_gqa_mma_prefill
+
+    hk, hq, d, prefix, q_len = 4, 24, 256, 700, 45
+    cap = prefix + q_len + 16
+    k = mx.random.normal((1, hk, cap, d), key=mx.random.key(4)).astype(mx.float16)
+    v = mx.random.normal((1, hk, cap, d), key=mx.random.key(5)).astype(mx.float16)
+    q = (mx.random.normal((1, hq, q_len, d), key=mx.random.key(6)) * 0.5).astype(mx.float16)
+
+    def run(ql, nsg):
+        return sdpa_gqa_mma_prefill(
+            queries=q, keys=k, values=v, prefix=prefix, scale=d ** -0.5,
+            num_kv_heads=hk, block_positions=ql, simdgroups=nsg,
+        )
+
+    ref = run(4, 4)
+    out = run(positions, simdgroups)
+    assert out is not None and ref is not None
+    err = mx.max(mx.abs(out.astype(mx.float32) - ref.astype(mx.float32))).item()
+    assert err < 1e-2, err

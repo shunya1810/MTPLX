@@ -331,6 +331,11 @@ def _prefill_source() -> str:
     the two kernels share one inner loop.
     """
     s = _SOURCE
+    # Simdgroups per threadgroup come from the template (4 or 8): more
+    # simdgroups hold more query rows (softmax: 4 lanes per row) per K/V
+    # stream at the same threadgroup memory per row.
+    s = _rep(s, """    constexpr int NSG = 4;
+""", "")
     s = _rep(s, """    const int split = threadgroup_position_in_grid.z;""",
              """    const int qb = threadgroup_position_in_grid.z;
     const int L_ = q_total;""")
@@ -614,6 +619,7 @@ def sdpa_gqa_mma_prefill(
     scale: float,
     num_kv_heads: int,
     block_positions: int = 4,
+    simdgroups: int = 4,
 ) -> mx.array | None:
     """Causal prefill attention of ``queries`` [1, Hq, L, D] over dense K/V.
 
@@ -638,7 +644,8 @@ def sdpa_gqa_mma_prefill(
     if hk <= 0 or hq % hk or int(keys.shape[1]) != hk:
         return _bail("gqa_heads")
     ql = int(block_positions)
-    if ql < 1 or (hq // hk) * ql > 32:
+    nsg = int(simdgroups)
+    if nsg not in (4, 8) or ql < 1 or (hq // hk) * ql > 8 * nsg:
         return _bail("rows")
     if queries.dtype not in (mx.float16, mx.bfloat16):
         return _bail("query_dtype")
@@ -669,9 +676,10 @@ def sdpa_gqa_mma_prefill(
             ("KQ", 0),
             ("KT", 1),
             ("QKS", 1),
+            ("NSG", nsg),
         ],
-        grid=(hk * 32, 4, blocks),
-        threadgroup=(32, 4, 1),
+        grid=(hk * 32, nsg, blocks),
+        threadgroup=(32, nsg, 1),
         output_shapes=[queries.shape],
         output_dtypes=[queries.dtype],
     )
@@ -746,6 +754,7 @@ def sdpa_gqa_mma_prefill_q8_pages(
             ("KQ", 8),
             ("KT", 1),
             ("QKS", 1),
+            ("NSG", 4),
         ],
         grid=(hk * 32, 4, blocks),
         threadgroup=(32, 4, 1),

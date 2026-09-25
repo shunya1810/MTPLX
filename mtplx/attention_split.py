@@ -719,6 +719,12 @@ def _mma_prefill_attention(attn: Any, queries: mx.array, cache: Any, mask: Any):
         return None
     from .kernels.sdpa_gqa_mma import sdpa_gqa_mma_prefill
 
+    # 5 query positions x 8 simdgroups (30 rows per K/V stream): M1 Max one
+    # layer, chunk 2048 after 64K/128K/256K cached keys: 577/1212/2392 ms at
+    # the kernel's 4x4 default, 575/1171/2312 ms here; wider rows (36) or
+    # 4 simdgroups at 30 rows lose 19-38% (register pressure).
+    positions = int(os.environ.get("MTPLX_GQA_MMA_PREFILL_POSITIONS", "5") or "5")
+    simdgroups = int(os.environ.get("MTPLX_GQA_MMA_PREFILL_SIMDGROUPS", "8") or "8")
     out = sdpa_gqa_mma_prefill(
         queries=queries,
         keys=k_buf,
@@ -726,6 +732,8 @@ def _mma_prefill_attention(attn: Any, queries: mx.array, cache: Any, mask: Any):
         prefix=prefix,
         scale=attn.scale,
         num_kv_heads=int(k_buf.shape[1]),
+        block_positions=positions,
+        simdgroups=simdgroups,
     )
     if out is not None:
         attn._mtplx_mma_prefill_calls = int(getattr(attn, "_mtplx_mma_prefill_calls", 0)) + 1
