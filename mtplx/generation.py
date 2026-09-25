@@ -3744,6 +3744,11 @@ class GenerationFinalState:
     prompt_boundary_logits: Any | None = None
     prompt_boundary_hidden: Any | None = None
     prompt_boundary_extra_state: dict[str, Any] | None = None
+    # GDN boundary records of the prompt this generation decoded from
+    # (captured by its prefill or inherited from the restored entry). They
+    # describe token prefixes of the prompt, so they stay valid for the
+    # generation-final entry, whose tokens extend the prompt.
+    prompt_gdn_boundaries: list[Any] | None = None
 
 
 def _finish_reason_from_tokens(
@@ -8653,6 +8658,9 @@ def generate_ar(
                 safe_to_commit=True,
                 finish_reason=finish_reason,
                 mtp_history_policy=prompt_state.mtp_history_policy,
+                prompt_gdn_boundaries=list(
+                    getattr(prompt_state, "gdn_boundaries", None) or []
+                ),
             )
         except Exception as exc:  # capture only — never lose a finished response
             final_state = None
@@ -15310,6 +15318,9 @@ def generate_mtpk(
             # and the bank must hand the next turn a base that matches the
             # committed cache it stores.
             mtp_history_position_base=int(mtp_history_position_base),
+            prompt_gdn_boundaries=list(
+                getattr(prompt_state, "gdn_boundaries", None) or []
+            ),
         )
     reject_path_counts, repair_time_by_reject_depth = _reject_repair_breakdown(events)
     _forkev_snapshot: dict[str, object] = {}

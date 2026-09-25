@@ -23086,13 +23086,27 @@ def _generation_final_bank_values(
                 None,
             ),
         }
-    return {
+    values = {
         "token_ids": [int(token) for token in final_token_ids],
         "cache": final_state.final_trunk_cache,
         "logits": final_state.final_logits,
         "hidden": final_state.final_hidden,
         "extra_state": getattr(final_state, "extra_state", None),
     }
+    # The prompt's own GDN boundaries. Without them the bank can only borrow
+    # records from a stored entry that is a prefix of these tokens; once the
+    # prompt entry has been evicted (long prompts, where each entry is
+    # several GB), an entry banked after a boundary restore stored none, and
+    # the next request with the same prompt fell back to a cold prefill.
+    boundaries = list(getattr(final_state, "prompt_gdn_boundaries", None) or [])
+    prompt_len = len(prompt_ids)
+    if boundaries and list(final_token_ids[:prompt_len]) == [
+        int(token) for token in prompt_ids
+    ]:
+        values["gdn_boundaries"] = [
+            record for record in boundaries if int(record[0]) <= prompt_len
+        ]
+    return values
 
 
 def _store_generation_final_history_snapshot(
