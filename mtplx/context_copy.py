@@ -1,6 +1,7 @@
 """Context-copy (prompt-lookup) speculative drafting for the MTP decode loop.
 
-Enabled by default; MTPLX_CONTEXT_COPY set to 0, false, or off disables it. When the
+Enabled by default (off by default on the M1 GPU family, see context_copy_enabled);
+MTPLX_CONTEXT_COPY set to 0, false, or off disables it. When the
 tail of the generated stream matches an n-gram that occurs in the PROMPT, the prompt
 continuation is proposed verbatim as a block (up to MTPLX_CONTEXT_COPY_K tokens, with
 shorter blocks for weaker matches) and verified in one forward pass through the
@@ -36,8 +37,23 @@ import os
 
 
 def context_copy_enabled() -> bool:
-    """Enabled by default. MTPLX_CONTEXT_COPY set to 0, false, or off disables it."""
-    return (os.environ.get("MTPLX_CONTEXT_COPY") or "").strip() not in {"0", "false", "off"}
+    """Enabled by default, except on the M1 GPU family.
+
+    MTPLX_CONTEXT_COPY set to 0, false, or off disables it; any other value
+    enables it. Unset, it follows the M1-family gate (cache_state
+    m1_long_context_defaults, MTPLX_M1_LONG_CONTEXT forces it): off on M1,
+    where a misfired copy block verifies through the 32-row matmul tile path
+    at ~3x the q_len-4 round, so on conversational turns the lane costs more
+    than it commits (2026-09-26 M1 Max: copy off +7-9% at 8K/64K and
+    +9-25% at 128K on turns 2-3, turn 1 unchanged, outputs identical at
+    8K/64K).
+    """
+    raw = (os.environ.get("MTPLX_CONTEXT_COPY") or "").strip()
+    if raw:
+        return raw not in {"0", "false", "off"}
+    from .cache_state import m1_long_context_defaults
+
+    return not m1_long_context_defaults()
 
 
 def context_copy_batched_enabled() -> bool:

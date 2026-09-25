@@ -133,6 +133,9 @@ def _expected_cycle(start: int, length: int) -> list[int]:
 
 
 def _run(monkeypatch, *, max_tokens: int = 220, **env: str):
+    # The copy lane is off by default on the M1 GPU family; these runs assume
+    # the lane's non-M1 default (on) unless a test says otherwise.
+    env.setdefault("MTPLX_CONTEXT_COPY", "1")
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     return generate_mtpk(

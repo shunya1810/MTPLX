@@ -134,6 +134,9 @@ def _clean_env(monkeypatch) -> None:
         "MTPLX_DROP_EVENTS",
     ):
         monkeypatch.delenv(name, raising=False)
+    # The lane is off by default on the M1 GPU family (context_copy_enabled);
+    # these tests exercise the lane itself, so turn it on explicitly.
+    monkeypatch.setenv("MTPLX_CONTEXT_COPY", "1")
 
 
 # --- full-accept copy rounds (mod-8 cycle, prompt continuation agrees) ---

@@ -117,8 +117,10 @@ _LANE_ENV = (
 def _lanes(monkeypatch):
     for name in _LANE_ENV:
         monkeypatch.delenv(name, raising=False)
-    # Copy rounds are on by default; only the n-gram floor is lowered so a
-    # 145-token prompt can force one.
+    # Copy rounds are on by default except on the M1 GPU family, so turn them
+    # on explicitly; the n-gram floor is lowered so a 145-token prompt can
+    # force one.
+    monkeypatch.setenv("MTPLX_CONTEXT_COPY", "1")
     monkeypatch.setenv("MTPLX_CONTEXT_COPY_NGMIN", "2")
 
 

@@ -26,6 +26,8 @@ def _clear_ramp_env(monkeypatch):
         "MTPLX_CONTEXT_COPY_K",
     ):
         monkeypatch.delenv(key, raising=False)
+    # Off by default on the M1 GPU family; RAMP rides on the copy lane.
+    monkeypatch.setenv("MTPLX_CONTEXT_COPY", "1")
 
 
 def test_ramp_off_is_inert(monkeypatch):
