@@ -2,6 +2,8 @@
 
 English | [日本語](README.ja.md)
 
+To run this branch's server yourself, see [Usage](../../m1max-longctx/USAGE.md).
+
 Before/after measurement of the `m1max-longctx` branch against upstream MTPLX on a
 MacBook Pro M1 Max with 64 GB, serving **Qwen3.8-27B-MTPLX-Optimized-Speed (FP16)**
 with MTP depth 3 through MTPLX's own OpenAI-compatible HTTP server (`mtplx serve`). Both commits run with their default

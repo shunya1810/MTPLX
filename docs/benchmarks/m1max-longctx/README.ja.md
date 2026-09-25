@@ -2,6 +2,8 @@
 
 [English](README.md) | 日本語
 
+このブランチのサーバーを手元で動かす方法は [使い方](../../m1max-longctx/USAGE.ja.md) にあります。
+
 `m1max-longctx` ブランチと upstream の MTPLX を、MacBook Pro M1 Max（64 GB）で比べた計測です。
 モデルは **Qwen3.8-27B-MTPLX-Optimized-Speed（FP16）**、MTP depth 3 です。
 計測は、MTPLX 本体の OpenAI 互換 HTTP サーバー（`mtplx serve`）にリクエストを送る形で行いました。
