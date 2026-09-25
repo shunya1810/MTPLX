@@ -40,13 +40,15 @@ def env_enabled(name: str, *, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def paged_kv_quant_mode_from_env() -> str:
-    """The single parse of the paged-KV-quant env pair, canonicalized.
+AUTO_THRESHOLD_ENV = "MTPLX_PAGED_KV_QUANT_AUTO_THRESHOLD"
+DEFAULT_AUTO_THRESHOLD_TOKENS = 131072
 
-    Returns one of ``off``/``q8``/``q4``. Every reader goes through
-    :func:`~mtplx.runtime_options.normalize_paged_kv_quantization`, so
-    spellings like ``8``/``8bit``/``uint8`` cannot normalize in one reader,
-    raise in a second, and fall through to the wrong KV layout in a third.
+
+def paged_kv_quant_setting_from_env() -> str:
+    """The configured mode, canonicalized: ``off``/``q8``/``q4``/``auto``.
+
+    Launchers and reports read this; the KV layout readers use
+    :func:`paged_kv_quant_mode_from_env`, which resolves ``auto`` per request.
     """
 
     from mtplx.runtime_options import normalize_paged_kv_quantization
@@ -57,6 +59,49 @@ def paged_kv_quant_mode_from_env() -> str:
         or ""
     )
     return str(normalize_paged_kv_quantization(raw))
+
+
+def auto_threshold_tokens() -> int:
+    raw = os.environ.get(AUTO_THRESHOLD_ENV, "").strip()
+    try:
+        return max(1, int(raw)) if raw else DEFAULT_AUTO_THRESHOLD_TOKENS
+    except ValueError:
+        return DEFAULT_AUTO_THRESHOLD_TOKENS
+
+
+def resolve_auto_mode(context_tokens: int) -> str:
+    """``auto``: q8 from the threshold up, off below it.
+
+    M1 Max, Qwen3.8-27B, published bench (docs/benchmarks/m1max-longctx): at
+    128K q8 decodes 18.9 tok/s vs 16.7 for fp16 with a 34.1 vs 40.7 GB peak;
+    at 256K fp16's 56.7 GB peak passes the 55.7 GB recommended working set
+    while q8 stays at 41.7 GB. Below 64K fp16 is as fast or faster and keeps
+    the unquantized output.
+    """
+
+    return "q8" if int(context_tokens) >= auto_threshold_tokens() else "off"
+
+
+def paged_kv_quant_mode_from_env() -> str:
+    """The single parse of the paged-KV-quant env pair, canonicalized.
+
+    Returns one of ``off``/``q8``/``q4``. Every reader goes through
+    :func:`~mtplx.runtime_options.normalize_paged_kv_quantization`, so
+    spellings like ``8``/``8bit``/``uint8`` cannot normalize in one reader,
+    raise in a second, and fall through to the wrong KV layout in a third.
+    ``auto`` resolves against the current request's prompt length
+    (``MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS``, set before its prefill), so
+    every reader within one request sees the same mode.
+    """
+
+    mode = paged_kv_quant_setting_from_env()
+    if mode == "auto":
+        try:
+            context = int(os.environ.get("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS") or 0)
+        except ValueError:
+            context = 0
+        return resolve_auto_mode(context)
+    return mode
 
 
 def config_from_env() -> PagedKVQuantConfig | None:

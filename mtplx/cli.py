@@ -850,11 +850,14 @@ def _add_paged_kv_quant_args(parser: argparse.ArgumentParser) -> None:
         "--paged-kv-quant",
         "--kv-quant",
         dest="paged_kv_quantization",
-        metavar="{off,q8,q4}",
+        metavar="{off,q8,q4,auto}",
         type=_kv_quant_arg,
         default=None,
         help=(
-            "Paged KV cache quantization mode. off is default; q8/q4 opt into "
+            "Paged KV cache quantization mode. auto (the M1-family default "
+            "when nothing is set) uses q8 for prompts of "
+            "MTPLX_PAGED_KV_QUANT_AUTO_THRESHOLD (131072) tokens or more and "
+            "off below; off is the default elsewhere; q8/q4 opt into "
             "the same runtime switch used by the app when the selected model "
             "supports it. Contract: decode-memory feature routed once per "
             "request from its starting offset. q8 at/past the two-pass "

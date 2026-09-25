@@ -156,7 +156,7 @@ from mtplx.server_urls import (
     local_url_for_bind,
     network_url_for_bind,
 )
-from mtplx.kv_quant import paged_kv_quant_mode_from_env
+from mtplx.kv_quant import paged_kv_quant_setting_from_env
 from mtplx.runtime_options import (
     generate_api_key_file,
     normalize_paged_kv_quantization,
@@ -9577,7 +9577,18 @@ def _resolve_runtime_options_on_args(
             # flag to an explicit "off" here used to clobber that env in the
             # rebuilt child argv/env, killing the toggle engine-wide. An
             # explicit flag still wins over the environment.
-            kv_mode = paged_kv_quant_mode_from_env()
+            kv_mode = paged_kv_quant_setting_from_env()
+            if not (
+                os.environ.get("MTPLX_VLLM_METAL_PAGED_KV_QUANT")
+                or os.environ.get("MTPLX_PAGED_KV_QUANT")
+            ):
+                # Nothing chosen anywhere: the M1 family serves long prompts
+                # with q8 KV ("auto", resolved per request by prompt length;
+                # see mtplx.kv_quant.resolve_auto_mode). Elsewhere stays off.
+                from mtplx.cache_state import m1_long_context_defaults
+
+                if m1_long_context_defaults():
+                    kv_mode = "auto"
     except ValueError as exc:
         printer(f"error: {exc}")
         return 2

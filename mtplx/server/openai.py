@@ -3140,9 +3140,15 @@ class ServerState:
                     getattr(args, "backend_id", None)
                 ),
             )
+            # auto only ever resolves to q8 (mtplx.kv_quant.resolve_auto_mode).
+            required_mode = (
+                "q8"
+                if args.paged_kv_quantization == "auto"
+                else args.paged_kv_quantization
+            )
             if not (
                 kv_policy.supported
-                and args.paged_kv_quantization in kv_policy.modes
+                and required_mode in kv_policy.modes
             ):
                 LOGGER.warning(
                     "paged KV quantization %r is not supported for this model "
@@ -18107,6 +18113,16 @@ def _paged_kv_quantization_detail() -> dict[str, Any]:
     mode = _effective_paged_kv_quantization()
     if mode == "off":
         return {"mode": "off"}
+    if mode == "auto":
+        from mtplx.kv_quant import auto_threshold_tokens
+
+        return {
+            "mode": "auto",
+            "threshold_tokens": auto_threshold_tokens(),
+            "below_threshold": "off",
+            "at_or_above_threshold": "q8",
+            "contract": "resolved once per request from its prompt length",
+        }
     q8_kernel_enabled = (
         os.environ.get("MTPLX_KV_QUANT_2PASS_KERNEL") or "1"
     ).strip().lower() in {"1", "true", "yes", "on"}
@@ -38403,11 +38419,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--paged-kv-quant",
         "--kv-quant",
         dest="paged_kv_quantization",
-        metavar="{off,q8,q4}",
+        metavar="{off,q8,q4,auto}",
         # Canonical, not raw: the runtime readers only understand
         # off/q8/q4, so an env-supplied "uint8" must arrive here as "q8".
         default=_effective_paged_kv_quantization(),
-        help="Paged KV cache quantization mode: off, q8, or q4.",
+        help="Paged KV cache quantization mode: off, q8, q4, or auto (q8 from MTPLX_PAGED_KV_QUANT_AUTO_THRESHOLD prompt tokens up).",
     )
     parser.add_argument(
         "--warmup-tokens",
