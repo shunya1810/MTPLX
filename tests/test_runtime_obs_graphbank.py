@@ -220,6 +220,8 @@ def test_ladder_extends_and_dedupes_buckets(monkeypatch, _fresh_module_state):
 
 
 def test_ladder_skips_walk_above_router(monkeypatch, _fresh_module_state):
+    # The fenced router (non-M1 default); pinned so an M1 host tests it too.
+    monkeypatch.setenv("MTPLX_PAGED_COMPILED_VERIFY_UNFENCED", "0")
     input_ids = mx.array([[1, 2]])
     bank, cache, compiled = _ladder_bank(
         monkeypatch, capacity=262144, natural=16384
@@ -228,6 +230,22 @@ def test_ladder_skips_walk_above_router(monkeypatch, _fresh_module_state):
     assert compiled == []  # natural 16384 > ceiling 8192: nothing compiled
     assert report["skipped"] == ["context_above_router"]
     assert report["complete"] is False
+
+
+def test_ladder_prewarms_natural_bucket_when_router_unfenced(
+    monkeypatch, _fresh_module_state
+):
+    # M1 default: paged verify stays compiled above the router, so the walk
+    # runs as with the router disabled (natural bucket up to the next pow2
+    # ceiling) instead of skipping.
+    monkeypatch.setenv("MTPLX_PAGED_COMPILED_VERIFY_UNFENCED", "1")
+    input_ids = mx.array([[1, 2]])
+    bank, cache, compiled = _ladder_bank(
+        monkeypatch, capacity=262144, natural=16384
+    )
+    report = bank.prewarm_ladder(cache, input_ids)
+    assert compiled == [16384, 32768]
+    assert "context_above_router" not in report["skipped"]
 
 
 def test_dense_cache_walk_is_complete_noop(_fresh_module_state, monkeypatch):
