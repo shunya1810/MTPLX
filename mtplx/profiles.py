@@ -53,11 +53,6 @@ PROFILE_ENV_USER_OVERRIDE_KEYS = frozenset(
         "MTPLX_NAX_M4_IMPL",
         "MTPLX_VK_M4_NSG",
         "MTPLX_VK_M6_NSG",
-        # Packed projection concatenation is mutually exclusive with the
-        # NAX verify lane.  Both switches must remain explicit A/B knobs so
-        # the compatibility/performance trade-off can be measured honestly.
-        "MTPLX_NAX_VERIFY",
-        "MTPLX_PACKED_PROJ_CONCATS",
         # Dense-decode context ceiling (2026-08-26): past it the auto layout
         # repages decode and the packed lane is structurally excluded — the
         # 147.4k decode cliff. Operators must be able to sweep it per launch.
