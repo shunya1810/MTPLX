@@ -1,0 +1,218 @@
+{
+ "description": "Baseline = upstream MTPLX main 1de2b1c with defaults. Optimized = shunya1810/MTPLX m1max-longctx 66910a1 with defaults (the M1 long-context changes auto-enable on applegpu_g13*).",
+ "arms": {
+  "baseline": {
+   "commit": "1de2b1c",
+   "label": "upstream 1de2b1c (default)",
+   "env": {}
+  },
+  "optimized": {
+   "commit": "66910a1",
+   "label": "m1max-longctx 66910a1 (default)",
+   "env": {}
+  }
+ },
+ "contexts": {
+  "2k": {
+   "prompt": "telemetry",
+   "target_tokens": 2048,
+   "timeout_s": 600
+  },
+  "4k": {
+   "prompt": "telemetry",
+   "target_tokens": 4096,
+   "timeout_s": 600
+  },
+  "8k": {
+   "prompt": "telemetry",
+   "target_tokens": 8192,
+   "timeout_s": 900
+  },
+  "16k": {
+   "prompt": "telemetry",
+   "target_tokens": 16384,
+   "timeout_s": 1200
+  },
+  "32k": {
+   "prompt": "telemetry",
+   "target_tokens": 32768,
+   "timeout_s": 1800
+  },
+  "64k": {
+   "prompt": "telemetry",
+   "target_tokens": 65536,
+   "timeout_s": 3600
+  },
+  "128k": {
+   "prompt": "telemetry",
+   "target_tokens": 131072,
+   "timeout_s": 7200
+  },
+  "256k": {
+   "prompt": "telemetry",
+   "target_tokens": 259000,
+   "timeout_s": 18000,
+   "requests": 1
+  }
+ },
+ "max_tokens": 256,
+ "requests": 3,
+ "cooldown_s": 60,
+ "order": [
+  {
+   "context": "2k",
+   "kv": "off",
+   "arm": "baseline"
+  },
+  {
+   "context": "2k",
+   "kv": "off",
+   "arm": "optimized"
+  },
+  {
+   "context": "2k",
+   "kv": "q8",
+   "arm": "optimized"
+  },
+  {
+   "context": "2k",
+   "kv": "q8",
+   "arm": "baseline"
+  },
+  {
+   "context": "4k",
+   "kv": "off",
+   "arm": "baseline"
+  },
+  {
+   "context": "4k",
+   "kv": "off",
+   "arm": "optimized"
+  },
+  {
+   "context": "4k",
+   "kv": "q8",
+   "arm": "optimized"
+  },
+  {
+   "context": "4k",
+   "kv": "q8",
+   "arm": "baseline"
+  },
+  {
+   "context": "8k",
+   "kv": "off",
+   "arm": "baseline"
+  },
+  {
+   "context": "8k",
+   "kv": "off",
+   "arm": "optimized"
+  },
+  {
+   "context": "8k",
+   "kv": "q8",
+   "arm": "optimized"
+  },
+  {
+   "context": "8k",
+   "kv": "q8",
+   "arm": "baseline"
+  },
+  {
+   "context": "16k",
+   "kv": "off",
+   "arm": "baseline"
+  },
+  {
+   "context": "16k",
+   "kv": "off",
+   "arm": "optimized"
+  },
+  {
+   "context": "16k",
+   "kv": "q8",
+   "arm": "optimized"
+  },
+  {
+   "context": "16k",
+   "kv": "q8",
+   "arm": "baseline"
+  },
+  {
+   "context": "32k",
+   "kv": "off",
+   "arm": "baseline"
+  },
+  {
+   "context": "32k",
+   "kv": "off",
+   "arm": "optimized"
+  },
+  {
+   "context": "32k",
+   "kv": "q8",
+   "arm": "optimized"
+  },
+  {
+   "context": "32k",
+   "kv": "q8",
+   "arm": "baseline"
+  },
+  {
+   "context": "64k",
+   "kv": "off",
+   "arm": "baseline"
+  },
+  {
+   "context": "64k",
+   "kv": "off",
+   "arm": "optimized"
+  },
+  {
+   "context": "64k",
+   "kv": "q8",
+   "arm": "optimized"
+  },
+  {
+   "context": "64k",
+   "kv": "q8",
+   "arm": "baseline"
+  },
+  {
+   "context": "128k",
+   "kv": "off",
+   "arm": "baseline"
+  },
+  {
+   "context": "128k",
+   "kv": "off",
+   "arm": "optimized"
+  },
+  {
+   "context": "128k",
+   "kv": "q8",
+   "arm": "optimized"
+  },
+  {
+   "context": "128k",
+   "kv": "q8",
+   "arm": "baseline"
+  },
+  {
+   "context": "256k",
+   "kv": "q8",
+   "arm": "optimized"
+  },
+  {
+   "context": "256k",
+   "kv": "off",
+   "arm": "optimized"
+  },
+  {
+   "context": "256k",
+   "kv": "q4",
+   "arm": "optimized"
+  }
+ ]
+}

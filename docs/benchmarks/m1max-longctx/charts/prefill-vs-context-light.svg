@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 470" width="900" height="470" role="img" aria-label="Prefill throughput vs prompt length" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="900" height="470" rx="8" fill="#fcfcfb"/>
+<text x="20" y="30" fill="#0b0b0b" font-size="16" font-weight="600">Prefill throughput vs prompt length</text>
+<text x="20" y="50" fill="#52514e" font-size="12">prompt tokens / server prompt-eval time, cold request · higher is better</text>
+<line x1="20" x2="42" y1="74" y2="74" stroke="#2a78d6" stroke-width="2" stroke-dasharray="none"/>
+<circle cx="31.0" cy="74.0" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="48" y="78" fill="#52514e" font-size="12">optimized fp16 KV</text>
+<line x1="164.8" x2="186.8" y1="74" y2="74" stroke="#2a78d6" stroke-width="2" stroke-dasharray="6 4"/>
+<circle cx="175.8" cy="74.0" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="192.8" y="78" fill="#52514e" font-size="12">optimized q8 KV</text>
+<line x1="296.8" x2="318.8" y1="74" y2="74" stroke="#eb6834" stroke-width="2" stroke-dasharray="none"/>
+<circle cx="307.8" cy="74.0" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="324.8" y="78" fill="#52514e" font-size="12">baseline fp16 KV</text>
+<line x1="435.20000000000005" x2="457.20000000000005" y1="74" y2="74" stroke="#eb6834" stroke-width="2" stroke-dasharray="6 4"/>
+<circle cx="446.2" cy="74.0" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<text x="463.20000000000005" y="78" fill="#52514e" font-size="12">baseline q8 KV</text>
+<path d="M571.8 68.0 L577.8 74.0 L571.8 80.0 L565.8 74.0Z" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="588.8000000000001" y="78" fill="#52514e" font-size="12">optimized q4 KV (256K)</text>
+<line x1="70" x2="670" y1="418.0" y2="418.0" stroke="#e4e3de"/><text x="62" y="422.0" fill="#52514e" font-size="11" text-anchor="end">0</text>
+<line x1="70" x2="670" y1="339.5" y2="339.5" stroke="#e4e3de"/><text x="62" y="343.5" fill="#52514e" font-size="11" text-anchor="end">50</text>
+<line x1="70" x2="670" y1="261.0" y2="261.0" stroke="#e4e3de"/><text x="62" y="265.0" fill="#52514e" font-size="11" text-anchor="end">100</text>
+<line x1="70" x2="670" y1="182.5" y2="182.5" stroke="#e4e3de"/><text x="62" y="186.5" fill="#52514e" font-size="11" text-anchor="end">150</text>
+<line x1="70" x2="670" y1="104.0" y2="104.0" stroke="#e4e3de"/><text x="62" y="108.0" fill="#52514e" font-size="11" text-anchor="end">200</text>
+<line x1="70" x2="670" y1="418" y2="418" stroke="#8a8983"/>
+<text x="70.0" y="436" fill="#52514e" font-size="11" text-anchor="middle">2K</text>
+<text x="156.0" y="436" fill="#52514e" font-size="11" text-anchor="middle">4K</text>
+<text x="242.0" y="436" fill="#52514e" font-size="11" text-anchor="middle">8K</text>
+<text x="327.7" y="436" fill="#52514e" font-size="11" text-anchor="middle">16K</text>
+<text x="413.7" y="436" fill="#52514e" font-size="11" text-anchor="middle">32K</text>
+<text x="499.6" y="436" fill="#52514e" font-size="11" text-anchor="middle">64K</text>
+<text x="585.6" y="436" fill="#52514e" font-size="11" text-anchor="middle">128K</text>
+<text x="670.0" y="436" fill="#52514e" font-size="11" text-anchor="middle">256K</text>
+<text x="370.0" y="460" fill="#52514e" font-size="11" text-anchor="middle">prompt length (tokens, log scale)</text>
+<text transform="translate(18 261.0) rotate(-90)" fill="#52514e" font-size="11" text-anchor="middle">prefill tok/s</text>
+<polyline fill="none" stroke="#2a78d6" stroke-width="2" stroke-linejoin="round" points="70.0,183.0 156.0,183.4 242.0,188.1 327.7,196.5 413.7,211.5 499.6,242.0 585.6,278.6 670.0,328.3"/>
+<circle cx="70.0" cy="183.0" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="156.0" cy="183.4" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="242.0" cy="188.1" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="327.7" cy="196.5" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="413.7" cy="211.5" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="499.6" cy="242.0" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="585.6" cy="278.6" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="670.0" cy="328.3" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<polyline fill="none" stroke="#2a78d6" stroke-width="2" stroke-dasharray="6 4" stroke-linejoin="round" points="70.0,185.2 156.0,187.2 242.0,190.5 327.7,197.0 413.7,211.8 499.6,242.2 585.6,278.9 670.0,328.1"/>
+<circle cx="70.0" cy="185.2" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="156.0" cy="187.2" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="242.0" cy="190.5" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="327.7" cy="197.0" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="413.7" cy="211.8" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="499.6" cy="242.2" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="585.6" cy="278.9" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="670.0" cy="328.1" r="4.5" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<polyline fill="none" stroke="#eb6834" stroke-width="2" stroke-linejoin="round" points="70.0,183.6 156.0,184.8 242.0,202.5 327.7,199.1 413.7,211.2 499.6,249.7 585.6,306.0"/>
+<circle cx="70.0" cy="183.6" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="156.0" cy="184.8" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="242.0" cy="202.5" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="327.7" cy="199.1" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="413.7" cy="211.2" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="499.6" cy="249.7" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="585.6" cy="306.0" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<polyline fill="none" stroke="#eb6834" stroke-width="2" stroke-dasharray="6 4" stroke-linejoin="round" points="70.0,183.4 156.0,187.5 242.0,190.7 327.7,197.0 413.7,211.9 499.6,250.4 585.6,306.0"/>
+<circle cx="70.0" cy="183.4" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="156.0" cy="187.5" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="242.0" cy="190.7" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="327.7" cy="197.0" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="413.7" cy="211.9" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="499.6" cy="250.4" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="585.6" cy="306.0" r="4.5" fill="#eb6834" stroke="#fcfcfb" stroke-width="2"/>
+<path d="M670.0 322.2 L676.0 328.2 L670.0 334.2 L664.0 328.2Z" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="595.6" y="310.0" fill="#0b0b0b" font-size="11" font-weight="600">baseline q8 71</text>
+<text x="595.6" y="325.0" fill="#0b0b0b" font-size="11" font-weight="600">baseline fp16 71</text>
+<text x="680.0" y="340.0" fill="#0b0b0b" font-size="11" font-weight="600">optimized q8 57</text>
+<text x="680.0" y="355.0" fill="#0b0b0b" font-size="11" font-weight="600">optimized fp16 57</text>
+</svg>
