@@ -2206,6 +2206,45 @@ class VllmMetalPagedKVCache:
         if keys is not None and values is not None:
             self._load_contiguous_state(keys, values, int(keys.shape[2]))
 
+    def compact_snapshot_state(self) -> dict[str, Any] | None:
+        """Quantized K/V at their stored precision, for SessionBank snapshots.
+
+        ``state`` dequantizes to the source dtype (and builds the bf16 mirror
+        for q8), so a banked q8 prompt cost twice its live KV: 10.4 GB for a
+        128K entry, and a 256K entry passed the per-session cap and was never
+        banked at all. The compact form keeps the integers and fp32 scales of
+        the first ``offset`` rows, head-major (1, H, T, P) like a dense KV
+        state so SSD prefix decode slices the same token axis. Restores
+        dequantize it (``dense_state_from_compact``); the requantize that
+        follows in a q8 request reproduces the same integers.
+        """
+        if not _compact_kv_snapshot_enabled():
+            return None
+        if not self.kv_quant or self.turboquant:
+            return None
+        if self.key_cache is None or self.value_cache is None or self.offset <= 0:
+            return None
+        if self.key_scale_cache is None or self.value_scale_cache is None:
+            return None
+        if self._shape is None or self._dtypes is None:
+            return None
+        rows = int(self.offset)
+
+        def head_major(buf: Any) -> Any:
+            flat = buf.reshape(-1, int(buf.shape[2]), int(buf.shape[3]))[:rows]
+            return flat.transpose(1, 0, 2)[None, ...]
+
+        return {
+            COMPACT_KV_FORMAT_KEY: COMPACT_KV_FORMAT,
+            "bits": int(self.kv_quant_config.bits),
+            "head_dims": [int(self._shape[1]), int(self._shape[2])],
+            "dtypes": [str(dtype).rsplit(".", 1)[-1] for dtype in self._dtypes],
+            "keys": head_major(self.key_cache),
+            "values": head_major(self.value_cache),
+            "key_scales": head_major(self.key_scale_cache),
+            "value_scales": head_major(self.value_scale_cache),
+        }
+
     @property
     def meta_state(self) -> tuple[str, ...]:
         return (str(self.block_size), str(self.num_blocks), str(self.offset))
@@ -3927,6 +3966,32 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
             )
         return n
 
+    def compact_snapshot_state(self) -> dict[str, Any] | None:
+        """Same compact form as ``VllmMetalPagedKVCache.compact_snapshot_state``.
+
+        The bank layout already is head-major (1, H, capacity, P): the
+        snapshot is the first ``size()`` rows of each leaf, no transpose.
+        """
+        if not _compact_kv_snapshot_enabled():
+            return None
+        if self.cache[0] is None or self.cache[1] is None:
+            return None
+        if self.layout == "pages":
+            return self.to_paged_cache().compact_snapshot_state()
+        rows = int(self.size())
+        if rows <= 0:
+            return None
+        return {
+            COMPACT_KV_FORMAT_KEY: COMPACT_KV_FORMAT,
+            "bits": int(self.kv_bits),
+            "head_dims": [int(self.head_dims[0]), int(self.head_dims[1])],
+            "dtypes": [str(dtype).rsplit(".", 1)[-1] for dtype in self.source_dtypes],
+            "keys": self.cache[0][:, :, :rows, :],
+            "values": self.cache[1][:, :, :rows, :],
+            "key_scales": self.cache[3][:, :, :rows, :],
+            "value_scales": self.cache[4][:, :, :rows, :],
+        }
+
     def to_paged_cache(self) -> "VllmMetalPagedKVCache":
         """Restore a stock quantized ``VllmMetalPagedKVCache`` (banks -> pages).
 
@@ -4899,9 +4964,53 @@ def _clone_tree(value: Any) -> Any:
     return value
 
 
+COMPACT_KV_FORMAT_KEY = "__mtplx_compact_kv__"
+COMPACT_KV_FORMAT = "paged_kvq_head_major_v1"
+
+
+def _compact_kv_snapshot_enabled() -> bool:
+    """``MTPLX_SESSION_BANK_COMPACT_KV`` (default on): bank quantized KV as-is."""
+    raw = os.environ.get("MTPLX_SESSION_BANK_COMPACT_KV", "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def is_compact_kv_state(value: Any) -> bool:
+    return isinstance(value, dict) and value.get(COMPACT_KV_FORMAT_KEY) == COMPACT_KV_FORMAT
+
+
+def dense_state_from_compact(value: dict[str, Any]) -> tuple[Any, Any]:
+    """(keys, values) in the source dtype, (1, H, T, D), from a compact state."""
+    import mlx.core as mx
+
+    from .kv_quant import dequantize_symmetric
+
+    bits = int(value["bits"])
+    head_dims = [int(d) for d in value["head_dims"]]
+    dtypes = [getattr(mx, str(name)) for name in value["dtypes"]]
+    keys = dequantize_symmetric(
+        value["keys"], value["key_scales"], bits=bits, head_dim=head_dims[0]
+    ).astype(dtypes[0])
+    values = dequantize_symmetric(
+        value["values"], value["value_scales"], bits=bits, head_dim=head_dims[1]
+    ).astype(dtypes[1])
+    return keys, values
+
+
+def _snapshot_state(entry: Any, *, lazy: bool) -> Any:
+    compact = getattr(entry, "compact_snapshot_state", None)
+    if callable(compact):
+        state = compact()
+        if state is not None:
+            # Fresh slice/transpose expressions over the live pages: nothing
+            # aliases a buffer the cache can write in place.
+            return state
+    state = getattr(entry, "state", None)
+    return _lazy_state_view(state) if lazy else _clone_tree(state)
+
+
 def snapshot_cache(cache: list[Any]) -> CacheSnapshot:
     return CacheSnapshot(
-        states=tuple(_clone_tree(getattr(c, "state", None)) for c in cache),
+        states=tuple(_snapshot_state(c, lazy=False) for c in cache),
         meta_states=tuple(_clone_tree(getattr(c, "meta_state", None)) for c in cache),
     )
 
@@ -4940,11 +5049,7 @@ def snapshot_cache_lazy_hybrid(cache: list[Any]) -> CacheSnapshot:
     states = []
     meta_states = []
     for entry in cache:
-        state = getattr(entry, "state", None)
-        if _is_trimmable(entry):
-            states.append(_lazy_state_view(state))
-        else:
-            states.append(_clone_tree(state))
+        states.append(_snapshot_state(entry, lazy=_is_trimmable(entry)))
         meta_states.append(_clone_tree(getattr(entry, "meta_state", None)))
     return CacheSnapshot(states=tuple(states), meta_states=tuple(meta_states))
 
@@ -5036,6 +5141,10 @@ def _restore_state_preserving_container(entry: Any, state: Any, *, clone: bool =
     # divergence copy (COW rules pinned by tests/test_lazy_snapshot_cow.py).
     # Containers with replace_state (owned recurrent) copy into owned buffers
     # and must always receive a full clone they are free to consume.
+    if is_compact_kv_state(state):
+        # Dequantized into fresh arrays: nothing aliases the bank entry.
+        entry.state = dense_state_from_compact(state)
+        return
     cloned = _clone_tree(state) if clone else _lazy_state_view(state)
     if hasattr(entry, "replace_state"):
         entry.replace_state(cloned)
