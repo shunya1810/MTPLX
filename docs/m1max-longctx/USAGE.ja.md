@@ -5,14 +5,13 @@
 `m1max-longctx` ブランチは、M1 Max で長い context を扱うための変更を upstream の MTPLX に足したものです（変更点と計測は [ベンチマーク](../benchmarks/m1max-longctx/README.ja.md)）。
 ここでは、このブランチのサーバーを手元で起動して使う方法を説明します。
 
-## MTPLX アプリとの関係
+## 使い方は2通り
 
-- MTPLX アプリ（`/Applications/MTPLX.app`）は、アプリに同梱された upstream のリリース版を、アプリ専用の Python 環境（`~/Library/Application Support/MTPLX/runtime-venv`）で動かします。**アプリからこのブランチは使われません。**
-- アプリには、外部で起動したサーバーにつなぐ機能がありません。設定のポートが使われていると、アプリは別のポートで自分のサーバーを起動します。
-- アプリの実行環境をこのブランチに差し替える方法は検証していません。アプリは同梱の版を入れ直すことがあるので、差し替えはおすすめしません。
+- **MTPLX アプリで使う**: アプリの開発者向けの仕組み（ソースのチェックアウトをエンジンとして使う）で、アプリの画面からこのブランチを動かします（下の「アプリで動かす」）
+- **サーバーだけを起動する**: コマンドでサーバーを起動し、サーバー自身のチャット画面か OpenAI 互換の API から使います（下の「サーバーだけを起動する」）
 
-このブランチを使うときは、アプリを終了し、下の手順でサーバーを起動します。サーバー自身がブラウザのチャット画面と OpenAI 互換の API を持っているので、アプリがなくても使えます。
-アプリに戻るときは、このサーバーを止めてからアプリを開いてください。
+どちらも、アプリの実行環境（`~/Library/Application Support/MTPLX/runtime-venv`）の Python を使い、このリポジトリの `mtplx` を読ませます。
+アプリを普通に開いたときは、これまでどおりアプリ同梱の upstream のリリース版で動きます。
 
 ## 用意するもの
 
@@ -22,14 +21,51 @@
 
 依存関係を自分の venv に入れて動かす方法は検証していません。
 
-## 起動
-
 ```bash
 git clone -b m1max-longctx https://github.com/shunya1810/MTPLX.git
 cd MTPLX
 ```
 
-MTPLX アプリが動いていれば終了します（GPU とメモリを約 20 GB 使うため、2つ同時には動かせません）。
+以下のコマンドは、この `MTPLX` ディレクトリで実行します。
+
+## アプリで動かす
+
+アプリには、環境変数 `MTPLX_APP_ALLOW_SOURCE_WRAPPER=1` と `MTPLX_APP_SOURCE_WRAPPER_PATH=<リポジトリ>/bin/mtplx` を渡すと、アプリ専用の実行環境より優先してそのラッパーでエンジンを起動する仕組みがあります（`apps/MTPLXApp/Sources/MTPLXAppCore/Services/MTPLXCommandBuilder.swift`）。
+`bin/mtplx` は、`~/Library/Application Support/MTPLX/runtime.env` に書いた `MTPLX_RUNTIME_VENV_PY` の Python で、このリポジトリの `mtplx` を動かします。
+
+[`scripts/open-mtplx-app-with-checkout.command`](../../scripts/open-mtplx-app-with-checkout.command) がこれをまとめて行います（Finder からダブルクリックでも実行できます）。
+
+1. `runtime.env` がなければ、アプリの実行環境の Python を指す1行を書く
+2. アプリが動いていれば終了し、残っている MTPLX のサーバーを止める（アプリは前回のサーバーが残っていると、それを引き継ぐため）
+3. 2つの環境変数を付けてアプリを開く
+
+アプリが開いたら、アプリの画面でエンジンを開始してください。
+手で行う場合は次のとおりです。
+
+```bash
+printf 'MTPLX_RUNTIME_VENV_PY="%s"\n' "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" \
+  > "$HOME/Library/Application Support/MTPLX/runtime.env"
+open -a /Applications/MTPLX.app \
+  --env MTPLX_APP_ALLOW_SOURCE_WRAPPER=1 \
+  --env MTPLX_APP_SOURCE_WRAPPER_PATH="$PWD/bin/mtplx"
+```
+
+確かめ方: エンジンのプロセスの環境変数に、このリポジトリを指す `PYTHONPATH` があれば、このブランチで動いています。
+
+```bash
+ps eww -p "$(pgrep -f mtplx.server.openai | head -1)" -o command= | grep -o 'PYTHONPATH=[^ ]*'
+```
+
+注意:
+
+- アプリの設定（context window、SSD キャッシュ、KV の量子化など）がそのまま使われます。128K / 256K を使うなら、設定で context window を 262,144 に上げ、SSD キャッシュを on にしてください
+- KV の量子化: アプリの選択肢は off / q8 / q4 で、`auto` はありません。アプリは off のときにエンジンへ何も渡さないので、このブランチでは off を選ぶと M1 系では `auto`（131,072 トークン以上だけ q8）になります（アプリのコードから読み取った動作で、画面からは未確認）。q8 を選ぶと全長で q8 です
+- リポジトリの作業ツリーの内容がそのまま動きます。別のブランチに切り替えると、次にエンジンを起動したときにその内容で動きます
+- 元に戻すには、アプリを終了し、`runtime.env` を消して、アプリを普通に開きます
+
+## サーバーだけを起動する
+
+MTPLX アプリが動いていれば終了します（エンジンは GPU とメモリを約 20 GB 使うため、2つ同時には動かせません）。
 
 ```bash
 PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli serve \

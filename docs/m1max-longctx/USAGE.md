@@ -5,14 +5,13 @@
 The `m1max-longctx` branch adds long-context changes for the M1 Max on top of upstream MTPLX (changes and measurements: [benchmark](../benchmarks/m1max-longctx/README.md)).
 This page shows how to start this branch's server locally and use it.
 
-## Relation to the MTPLX app
+## Two ways to use it
 
-- The MTPLX app (`/Applications/MTPLX.app`) runs the upstream release bundled with the app, in its own Python environment (`~/Library/Application Support/MTPLX/runtime-venv`). **The app does not use this branch.**
-- The app cannot attach to a server started outside it. If its configured port is taken, it starts its own server on another port.
-- Swapping the app's runtime for this branch has not been tested, and the app may reinstall its bundled version, so it is not recommended.
+- **In the MTPLX app**: the app's developer hook (a source checkout as the engine) runs this branch behind the app's own UI (see "Run it in the app")
+- **Server only**: start the server from the command line and use its own chat page or the OpenAI-compatible API (see "Server only")
 
-To use this branch, quit the app and start the server as below. The server has its own browser chat page and an OpenAI-compatible API, so the app is not needed.
-To go back to the app, stop this server and open the app.
+Both use the Python of the app's runtime (`~/Library/Application Support/MTPLX/runtime-venv`) and load `mtplx` from this checkout.
+Opening the app normally still runs the upstream release bundled with the app.
 
 ## Requirements
 
@@ -22,14 +21,50 @@ To go back to the app, stop this server and open the app.
 
 Installing the dependencies into your own venv has not been tested.
 
-## Start
-
 ```bash
 git clone -b m1max-longctx https://github.com/shunya1810/MTPLX.git
 cd MTPLX
 ```
 
-Quit the MTPLX app if it is running (the server uses the GPU and about 20 GB of memory; two cannot run side by side).
+Run the commands below from this `MTPLX` directory.
+
+## Run it in the app
+
+Given `MTPLX_APP_ALLOW_SOURCE_WRAPPER=1` and `MTPLX_APP_SOURCE_WRAPPER_PATH=<checkout>/bin/mtplx`, the app starts its engine through that wrapper ahead of its own runtime (`apps/MTPLXApp/Sources/MTPLXAppCore/Services/MTPLXCommandBuilder.swift`).
+`bin/mtplx` runs this checkout's `mtplx` with the Python named by `MTPLX_RUNTIME_VENV_PY` in `~/Library/Application Support/MTPLX/runtime.env`.
+
+[`scripts/open-mtplx-app-with-checkout.command`](../../scripts/open-mtplx-app-with-checkout.command) does all of it (it also runs from Finder with a double click):
+
+1. writes `runtime.env` pointing at the app runtime's Python, if it does not exist
+2. quits the app if it is running and stops any MTPLX server left behind (the app adopts a server from its previous run)
+3. opens the app with the two variables
+
+Then start the engine in the app. By hand:
+
+```bash
+printf 'MTPLX_RUNTIME_VENV_PY="%s"\n' "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" \
+  > "$HOME/Library/Application Support/MTPLX/runtime.env"
+open -a /Applications/MTPLX.app \
+  --env MTPLX_APP_ALLOW_SOURCE_WRAPPER=1 \
+  --env MTPLX_APP_SOURCE_WRAPPER_PATH="$PWD/bin/mtplx"
+```
+
+To check: the engine process carries a `PYTHONPATH` pointing at this checkout when it runs this branch.
+
+```bash
+ps eww -p "$(pgrep -f mtplx.server.openai | head -1)" -o command= | grep -o 'PYTHONPATH=[^ ]*'
+```
+
+Notes:
+
+- The app's settings (context window, SSD cache, KV quantization, ...) apply as usual. For 128K / 256K, raise the context window to 262,144 and turn the SSD cache on
+- KV quantization: the app offers off / q8 / q4, no `auto`. The app passes nothing to the engine for off, so with this branch off becomes `auto` on the M1 family (q8 only for prompts of 131,072 tokens or more); read from the app's code, not tried from the UI. q8 means q8 at every length
+- The engine runs the checkout's working tree: switching branches changes what the next engine start runs
+- To go back, quit the app, delete `runtime.env`, and open the app normally
+
+## Server only
+
+Quit the MTPLX app if it is running (an engine uses the GPU and about 20 GB of memory; two cannot run side by side).
 
 ```bash
 PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli serve \
