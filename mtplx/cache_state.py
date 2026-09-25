@@ -910,6 +910,7 @@ class VllmMetalPagedKVCache:
         self.kv_quant = kv_quant_config is not None
         self._shape: tuple[int, int, int] | None = None
         self._dtypes: tuple[Any, Any] | None = None
+        self.mma_prefill_q8_calls = 0
         self.update_calls = 0
         self.paged_attention_calls = 0
         self.partitioned_attention_calls = 0
@@ -1934,6 +1935,47 @@ class VllmMetalPagedKVCache:
         values = memo["mirror_v"][:offset].transpose(1, 0, 2)[None, ...]
         return keys, values
 
+    def _mma_prefill_q8(
+        self,
+        queries: Any,
+        *,
+        scale: float,
+        sliding_window: int,
+        mask: Any | None,
+    ) -> Any | None:
+        """Causal prefill window over the q8 pages on the MMA kernel, or None.
+
+        M1-family default with the MMA prefill (``MTPLX_GQA_MMA_PREFILL``);
+        ``MTPLX_KV_QUANT_MMA_PREFILL`` = 1/0 overrides.
+        """
+        if not (
+            _env_flag_default_m1("MTPLX_GQA_MMA_PREFILL")
+            and _env_flag_default_m1("MTPLX_KV_QUANT_MMA_PREFILL")
+        ):
+            return None
+        if self.turboquant or int(self.kv_quant_config.bits) != 8:
+            return None
+        if int(sliding_window) > 0:
+            return None
+        if mask is not None and not (isinstance(mask, str) and mask == "causal"):
+            return None
+        if self.key_cache is None or self.key_scale_cache is None:
+            return None
+        prefix = int(self.offset) - int(queries.shape[2])
+        if prefix < 0:
+            return None
+        from .kernels.sdpa_gqa_mma import sdpa_gqa_mma_prefill_q8_pages
+
+        return sdpa_gqa_mma_prefill_q8_pages(
+            queries=queries,
+            key_pages=self.key_cache,
+            value_pages=self.value_cache,
+            key_scales=self.key_scale_cache,
+            value_scales=self.value_scale_cache,
+            prefix=prefix,
+            scale=float(scale),
+        )
+
     def _large_q_split_sdpa_fallback(
         self,
         queries: Any,
@@ -2244,6 +2286,66 @@ class VllmMetalPagedKVCache:
             "key_scales": head_major(self.key_scale_cache),
             "value_scales": head_major(self.value_scale_cache),
         }
+
+    def load_compact_snapshot_state(self, state: dict[str, Any]) -> bool:
+        """Install a compact snapshot's integers and scales as live pages.
+
+        The dense restore of a 256K q8 entry materialized ~17 GB of fp16 KV
+        only for the repage to quantize it again (warm-turn peak 52.6 GB on a
+        64 GB M1 Max). Loading the stored integers directly keeps the restore
+        at the entry's own size. Returns False (nothing changed) when this
+        cache cannot hold the state as-is.
+        """
+        import mlx.core as mx
+
+        if not self.kv_quant or self.turboquant or self.kv_quant_config is None:
+            return False
+        if int(self.kv_quant_config.bits) != int(state["bits"]):
+            return False
+        keys = state["keys"]
+        rows = int(keys.shape[2])
+        heads = int(keys.shape[1])
+        if rows <= 0 or int(keys.shape[0]) != 1:
+            return False
+        dtypes = [getattr(mx, str(name)) for name in state["dtypes"]]
+        head_dims = [int(d) for d in state["head_dims"]]
+        self._invalidate_dequant_memo()
+        self._invalidate_quant_bank()
+        self._reset_kv_quant_route()
+        self.key_cache = None
+        self.value_cache = None
+        self.key_scale_cache = None
+        self.value_scale_cache = None
+        self.key_zero_cache = None
+        self._shape = None
+        self._dtypes = None
+        self.offset = 0
+        needed_blocks = (rows + int(self.block_size) - 1) // int(self.block_size)
+        if int(self.num_blocks) < needed_blocks:
+            self.num_blocks = int(needed_blocks)
+        self._ensure_allocated(
+            mx.zeros((1, heads, 1, head_dims[0]), dtype=dtypes[0]),
+            mx.zeros((1, heads, 1, head_dims[1]), dtype=dtypes[1]),
+        )
+
+        def write(buf: Any, src: Any) -> Any:
+            flat = buf.reshape(-1, int(buf.shape[2]), int(buf.shape[3]))
+            flat[:rows] = src[0].transpose(1, 0, 2).astype(flat.dtype)
+            return flat.reshape(buf.shape)
+
+        self.key_cache = write(self.key_cache, state["keys"])
+        self.value_cache = write(self.value_cache, state["values"])
+        self.key_scale_cache = write(self.key_scale_cache, state["key_scales"])
+        self.value_scale_cache = write(self.value_scale_cache, state["value_scales"])
+        self.offset = rows
+        # One layer's pages at a time: the caller restores 16 layers in a row.
+        mx.eval(
+            self.key_cache,
+            self.value_cache,
+            self.key_scale_cache,
+            self.value_scale_cache,
+        )
+        return True
 
     @property
     def meta_state(self) -> tuple[str, ...]:
@@ -2724,6 +2826,27 @@ class VllmMetalPagedKVCache:
                     self.kv_quant_kernel_calls += 1
                     self.attention_time_s += time.perf_counter() - started
                     return kernel_out
+            if q_len > max_q_len:
+                # Prefill-width window over q8 pages (a suffix after a bank
+                # restore): the MMA prefill kernel reads the pages in place.
+                # Without it the fallback below builds an offset-sized bf16
+                # mirror (~17 GB at 256K) that then stays with the cache.
+                mma_out = self._mma_prefill_q8(
+                    queries, scale=scale, sliding_window=int(sliding_window), mask=mask
+                )
+                if mma_out is not None:
+                    if _env_truthy("MTPLX_KV_QUANT_ROUTE_TRACE"):
+                        print(
+                            "mtplx_kv_quant_mma_prefill "
+                            f"offset={int(self.offset)} q_len={q_len}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    self.paged_attention_calls += 1
+                    self.kv_quant_attention_calls += 1
+                    self.mma_prefill_q8_calls += 1
+                    self.attention_time_s += time.perf_counter() - started
+                    return mma_out
             if int(self.kv_quant_config.bits) != 8:
                 # q4 keeps no bf16 mirror, so the full-width fallback below
                 # would re-materialize offset-sized K/V on every step. The
@@ -2935,6 +3058,7 @@ class VllmMetalPagedKVCache:
                 self.kv_quant_dequant_memo_rebuilds
             ),
             "kv_quant_kernel_calls": int(self.kv_quant_kernel_calls),
+            "mma_prefill_q8_calls": int(self.mma_prefill_q8_calls),
             "kv_quant_bank_rebuilds": int(self.kv_quant_bank_rebuilds),
             "kv_quant_bank_extended_tokens": int(
                 self.kv_quant_bank_extended_tokens
@@ -4863,6 +4987,7 @@ def tail_owned_attention_kv_stats(cache: list[Any] | None) -> dict[str, Any]:
             aggregate["kv_quant_kernel_calls"] = int(
                 aggregate.get("kv_quant_kernel_calls", 0)
             ) + int(stats.get("kv_quant_kernel_calls", 0))
+
             aggregate["dense_fallback_calls"] = int(
                 aggregate.get("dense_fallback_calls", 0)
             ) + int(stats.get("dense_fallback_calls", 0))
@@ -5119,12 +5244,58 @@ def restore_cache(
     restore_meta_state: bool = True,
     clone_states: bool = True,
 ) -> None:
-    for entry, state, meta_state in zip(cache, snapshot.states, snapshot.meta_states):
+    for idx, (entry, state, meta_state) in enumerate(
+        zip(cache, snapshot.states, snapshot.meta_states)
+    ):
         if state is not None:
-            install_view = not clone_states and _is_trimmable(entry)
-            _restore_state_preserving_container(entry, state, clone=not install_view)
+            direct = (
+                _compact_kv_restore_target(entry, state)
+                if is_compact_kv_state(state) and isinstance(cache, list)
+                else None
+            )
+            if direct is not None:
+                cache[idx] = entry = direct
+            else:
+                install_view = not clone_states and _is_trimmable(entry)
+                _restore_state_preserving_container(entry, state, clone=not install_view)
         if restore_meta_state and meta_state is not None:
             entry.meta_state = _clone_tree(meta_state)
+
+
+def _compact_kv_restore_target(entry: Any, state: dict[str, Any]) -> Any | None:
+    """The cache that takes a compact state without a dense detour, or None.
+
+    A quantized paged target loads the integers in place. A contiguous KV
+    target (the prefill layout a bank restore starts from) is replaced by a
+    paged cache of the request's own quantization when it matches the
+    snapshot's bits: that request would repage to exactly those pages after
+    its suffix prefill anyway. ``MTPLX_SESSION_BANK_COMPACT_DIRECT=0`` keeps
+    the dense restore.
+    """
+    raw = os.environ.get("MTPLX_SESSION_BANK_COMPACT_DIRECT", "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return None
+    if isinstance(entry, VllmMetalPagedKVCache):
+        return entry if entry.load_compact_snapshot_state(state) else None
+    if not _is_trimmable(entry) or not hasattr(entry, "keys"):
+        return None
+    if getattr(entry, "_idx", None) is not None:
+        return None
+    from .kv_quant import config_from_env
+
+    config = config_from_env()
+    if config is None or int(config.bits) != int(state["bits"]):
+        return None
+    block_size = int(os.environ.get("MTPLX_VLLM_METAL_PAGED_BLOCK_SIZE") or "16")
+    configured_blocks = int(os.environ.get("MTPLX_VLLM_METAL_PAGED_NUM_BLOCKS") or "1024")
+    paged = VllmMetalPagedKVCache(
+        block_size=block_size,
+        num_blocks=_dynamic_paged_num_blocks(
+            block_size=block_size, configured_blocks=configured_blocks
+        ),
+        kv_quant_config=config,
+    )
+    return paged if paged.load_compact_snapshot_state(state) else None
 
 
 def _restore_state_preserving_container(entry: Any, state: Any, *, clone: bool = True) -> None:

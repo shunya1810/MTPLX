@@ -125,3 +125,40 @@ def test_dense_verify_route_min_capacity_floor(monkeypatch):
     assert _gqa_mma_min_capacity() == 0
     monkeypatch.setenv("MTPLX_GQA_MMA_MIN_CAPACITY", "junk")
     assert _gqa_mma_min_capacity() == 4096
+
+
+@pytest.mark.parametrize("prefix,q_len", [(0, 37), (300, 21), (1000, 64)])
+def test_prefill_over_q8_pages_matches_dequantized_reference(prefix, q_len):
+    from mtplx.kernels.sdpa_gqa_mma import sdpa_gqa_mma_prefill_q8_pages
+    from mtplx.kv_quant import dequantize_symmetric, quantize_symmetric
+
+    hk, hq, d, block = 4, 24, 256, 16
+    total = prefix + q_len
+    blocks = (total + block - 1) // block + 2
+    rows = blocks * block
+    k = mx.random.normal((rows, hk, d), key=mx.random.key(1)).astype(mx.float16)
+    v = mx.random.normal((rows, hk, d), key=mx.random.key(2)).astype(mx.float16)
+    kq, ks = quantize_symmetric(k, bits=8)
+    vq, vs = quantize_symmetric(v, bits=8)
+    q = (mx.random.normal((1, hq, q_len, d), key=mx.random.key(3)) * 0.5).astype(mx.float16)
+    out = sdpa_gqa_mma_prefill_q8_pages(
+        queries=q,
+        key_pages=kq.reshape(blocks, block, hk, d),
+        value_pages=vq.reshape(blocks, block, hk, d),
+        key_scales=ks.reshape(blocks, block, hk, 1),
+        value_scales=vs.reshape(blocks, block, hk, 1),
+        prefix=prefix,
+        scale=d ** -0.5,
+    )
+    assert out is not None
+    kd = dequantize_symmetric(kq, ks, bits=8, head_dim=d)[:total].transpose(1, 0, 2)[None]
+    vd = dequantize_symmetric(vq, vs, bits=8, head_dim=d)[:total].transpose(1, 0, 2)[None]
+    kd = mx.repeat(kd, hq // hk, axis=1).astype(mx.float32)
+    vd = mx.repeat(vd, hq // hk, axis=1).astype(mx.float32)
+    scores = (q.astype(mx.float32) @ kd.transpose(0, 1, 3, 2)) * d ** -0.5
+    qpos = prefix + mx.arange(q_len)[:, None]
+    kpos = mx.arange(total)[None, :]
+    scores = mx.where(kpos <= qpos, scores, -1e30)
+    ref = mx.softmax(scores, axis=-1) @ vd
+    err = mx.max(mx.abs(out.astype(mx.float32) - ref)).item()
+    assert err < 2e-2, err

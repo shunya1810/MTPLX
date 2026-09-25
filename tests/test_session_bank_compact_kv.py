@@ -135,3 +135,64 @@ def test_tensor_offset_adapter_snapshot_matches_the_paged_one(pages, monkeypatch
     restore_cache([target], snapshot_cache([adapter]), restore_meta_state=False)
     assert mx.array_equal(target.keys[..., :37, :], expected_k).item()
     assert mx.array_equal(target.values[..., :37, :], expected_v).item()
+
+
+def _pages_equal(a: VllmMetalPagedKVCache, b: VllmMetalPagedKVCache, rows: int) -> bool:
+    def flat(buf):
+        return buf.reshape(-1, int(buf.shape[2]), int(buf.shape[3]))[:rows]
+
+    return all(
+        mx.array_equal(flat(x), flat(y)).item()
+        for x, y in (
+            (a.key_cache, b.key_cache),
+            (a.value_cache, b.value_cache),
+            (a.key_scale_cache, b.key_scale_cache),
+            (a.value_scale_cache, b.value_scale_cache),
+        )
+    )
+
+
+@pytest.mark.parametrize("bits", [8, 4])
+def test_compact_state_loads_into_quantized_pages_without_dense(bits):
+    cache = _quant_cache(bits, tokens=45)
+    snapshot = snapshot_cache([cache])
+    target = [
+        VllmMetalPagedKVCache(
+            block_size=16, num_blocks=2, kv_quant_config=PagedKVQuantConfig(mode=f"q{bits}")
+        )
+    ]
+    restore_cache(target, snapshot)
+    assert target[0].offset == 45
+    assert target[0].capacity >= 45
+    assert _pages_equal(target[0], cache, 45)
+    assert target[0]._dequant_memo is None
+
+
+def test_contiguous_target_becomes_quantized_pages_for_a_matching_request(monkeypatch):
+    monkeypatch.setenv("MTPLX_PAGED_KV_QUANT", "q8")
+    monkeypatch.delenv("MTPLX_VLLM_METAL_PAGED_KV_QUANT", raising=False)
+    cache = _quant_cache(8, tokens=45)
+    snapshot = snapshot_cache([cache])
+    target = [KVCache()]
+    restore_cache(target, snapshot)
+    assert isinstance(target[0], VllmMetalPagedKVCache)
+    assert target[0].kv_quant and target[0].offset == 45
+    assert _pages_equal(target[0], cache, 45)
+    # The restored pages keep serving writes.
+    more = mx.ones((1, 4, 3, 64), dtype=mx.float16)
+    target[0].update_and_fetch(more, more)
+    assert target[0].offset == 48
+
+
+@pytest.mark.parametrize("mode,direct", [("off", "1"), ("q4", "1"), ("q8", "0")])
+def test_contiguous_target_stays_dense_otherwise(monkeypatch, mode, direct):
+    monkeypatch.setenv("MTPLX_PAGED_KV_QUANT", mode)
+    monkeypatch.delenv("MTPLX_VLLM_METAL_PAGED_KV_QUANT", raising=False)
+    monkeypatch.setenv("MTPLX_SESSION_BANK_COMPACT_DIRECT", direct)
+    cache = _quant_cache(8, tokens=45)
+    expected_k, _ = cache.state
+    snapshot = snapshot_cache([cache])
+    target = [KVCache()]
+    restore_cache(target, snapshot, restore_meta_state=False)
+    assert isinstance(target[0], KVCache)
+    assert mx.array_equal(target[0].keys[..., :45, :], expected_k).item()

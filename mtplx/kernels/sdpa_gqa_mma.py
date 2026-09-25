@@ -676,3 +676,80 @@ def sdpa_gqa_mma_prefill(
         output_dtypes=[queries.dtype],
     )
     return out
+
+
+def sdpa_gqa_mma_prefill_q8_pages(
+    *,
+    queries: mx.array,
+    key_pages: mx.array,
+    value_pages: mx.array,
+    key_scales: mx.array,
+    value_scales: mx.array,
+    prefix: int,
+    scale: float,
+    block_positions: int = 4,
+) -> mx.array | None:
+    """Causal prefill attention over q8 token-major pages.
+
+    ``*_pages`` are ``[num_blocks, block_size, Hk, D]`` int8 with the L new
+    rows already written at flat rows [prefix, prefix + L); ``*_scales`` are
+    the matching fp32 ``[num_blocks, block_size, Hk, 1]`` row scales. Same
+    inner loop as :func:`sdpa_gqa_mma_prefill` with the kernel's KQ=8 path
+    (the decode kernel's page reads), so a restored q8 prefix serves a long
+    suffix prefill without a dense copy of the prefix. Returns None when the
+    contract is not met.
+    """
+    if not mx.metal.is_available():
+        return _bail("metal_unavailable")
+    if queries.ndim != 4 or key_pages.ndim != 4 or value_pages.ndim != 4:
+        return _bail("ndim")
+    bsz, hq, q_len, d = (int(x) for x in queries.shape)
+    if bsz != 1:
+        return _bail("batch_size")
+    if d % 32 or d > 256 or int(key_pages.shape[3]) != d or int(value_pages.shape[3]) != d:
+        return _bail("head_dim")
+    if key_pages.dtype != mx.int8 or value_pages.dtype != mx.int8:
+        return _bail("kv_dtype")
+    hk = int(key_pages.shape[2])
+    if hk <= 0 or hq % hk:
+        return _bail("gqa_heads")
+    ql = int(block_positions)
+    if ql < 1 or (hq // hk) * ql > 32:
+        return _bail("rows")
+    if queries.dtype not in (mx.float16, mx.bfloat16):
+        return _bail("query_dtype")
+    rows = int(key_pages.shape[0]) * int(key_pages.shape[1])
+    prefix = int(prefix)
+    if prefix < 0 or prefix + q_len > rows:
+        return _bail("offset_range")
+    kernel = _prefill_kernel()
+    if kernel is None:
+        return _bail("kernel_unavailable")
+    blocks = (q_len + ql - 1) // ql
+    (out,) = kernel(
+        inputs=[
+            queries,
+            key_pages,
+            value_pages,
+            key_scales.astype(mx.float32),
+            value_scales.astype(mx.float32),
+            mx.array([prefix], dtype=mx.int32),
+            d, hk * d, d, hk * d, 1, hk,
+            float(scale), q_len,
+        ],
+        template=[
+            ("InT", queries.dtype),
+            ("OutT", queries.dtype),
+            ("D", d),
+            ("GQA_F", hq // hk),
+            ("QL", ql),
+            ("KQ", 8),
+            ("KT", 1),
+            ("QKS", 1),
+        ],
+        grid=(hk * 32, 4, blocks),
+        threadgroup=(32, 4, 1),
+        output_shapes=[queries.shape],
+        output_dtypes=[queries.dtype],
+    )
+    return out
