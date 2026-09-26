@@ -30,6 +30,9 @@ UNRELATED = (9, 9, 9)
 @pytest.fixture(autouse=True)
 def _no_inherited_gate(monkeypatch):
     monkeypatch.delenv(SESSION_BANK_PROTECTED_TERMINAL_ENV, raising=False)
+    # Three entries per session, the default off the M1 GPU family (which
+    # keeps two, see test_m1_memory_defaults.py).
+    monkeypatch.setenv("MTPLX_SESSION_BANK_PER_SESSION_MAX_ENTRIES", "3")
 
 
 def _bank(**kwargs) -> SessionBank:

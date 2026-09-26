@@ -1550,6 +1550,12 @@ def _default_mlx_cache_limit_bytes(memory_budget: int | None = None) -> int | No
     prefill spikes still allocate whatever they need — so the bound trades a
     little reuse at the tail for a flat resident footprint. Tiers keep
     several GiB of hot-loop reuse on every box.
+
+    The M1 GPU family (cache_state.m1_long_context_defaults) caps the tier at
+    1 GiB: on an M1 Max 64 GB, Qwen3.8-27B, 3-turn conversations at 2K, 32K
+    and 64K, 1 GiB instead of 4 GiB cut the footprint 2-3 GB with the same
+    decode, cold TTFT and outputs (2026-09-26, opt-s9). A declared memory
+    budget keeps its own rule.
     """
     if memory_budget is not None:
         return max(1 * 1024**3, min(8 * 1024**3, memory_budget // 8))
@@ -1557,12 +1563,18 @@ def _default_mlx_cache_limit_bytes(memory_budget: int | None = None) -> int | No
     if total is None:
         return None  # unknown machine: leave MLX defaults untouched
     if total <= 36 * 1024**3:
-        return 2 * 1024**3
-    if total <= 72 * 1024**3:
-        return 4 * 1024**3
-    if total <= 100 * 1024**3:
-        return 6 * 1024**3
-    return 8 * 1024**3
+        tier = 2 * 1024**3
+    elif total <= 72 * 1024**3:
+        tier = 4 * 1024**3
+    elif total <= 100 * 1024**3:
+        tier = 6 * 1024**3
+    else:
+        tier = 8 * 1024**3
+    from mtplx.cache_state import m1_long_context_defaults
+
+    if m1_long_context_defaults():
+        return min(tier, 1 * 1024**3)
+    return tier
 
 
 def _configure_mlx_cache_limit(args: argparse.Namespace) -> dict[str, Any]:

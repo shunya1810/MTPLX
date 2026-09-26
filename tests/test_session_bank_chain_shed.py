@@ -13,7 +13,16 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from mtplx.session_bank import SessionBank
+
+
+@pytest.fixture(autouse=True)
+def _three_entries_per_session(monkeypatch):
+    # The chains below hold three entries per session; the M1 GPU family
+    # keeps two by default (test_m1_memory_defaults.py).
+    monkeypatch.setenv("MTPLX_SESSION_BANK_PER_SESSION_MAX_ENTRIES", "3")
 
 
 RUNTIME = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)

@@ -693,6 +693,27 @@ def _gqa_mma_prefill_enabled() -> bool:
     return _env_flag_default_m1("MTPLX_GQA_MMA_PREFILL")
 
 
+def _gqa_mma_prefill_min_prefix() -> int:
+    """Cached keys below which a prefill chunk keeps fused SDPA.
+
+    ``MTPLX_GQA_MMA_PREFILL_MIN_PREFIX`` wins. Unset, the M1 GPU family
+    (cache_state.m1_long_context_defaults) serves every chunk on the MMA
+    kernel: in the server the fused path held 2-3 GB of transient at a 32K
+    prefill that the MMA kernel does not, and the whole cold prefill took the
+    same time (M1 Max, Qwen3.8-27B: 8K 55.1 vs 55.1 s, 32K 258 vs 260 s;
+    2026-09-26, opt-s9). Elsewhere the measured 49152 crossover stays.
+    """
+    raw = (os.environ.get("MTPLX_GQA_MMA_PREFILL_MIN_PREFIX") or "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    from .cache_state import m1_long_context_defaults
+
+    return 0 if m1_long_context_defaults() else 49152
+
+
 def _mma_prefill_attention(attn: Any, queries: mx.array, cache: Any, mask: Any):
     """Causal prefill chunk on sdpa_gqa_mma_prefill, or None for fused SDPA.
 
@@ -700,8 +721,8 @@ def _mma_prefill_attention(attn: Any, queries: mx.array, cache: Any, mask: Any):
     kernel past ~48K cached keys on M1 Max (256K chunk 512: 0.95 -> 0.65 s per
     layer) and 26 GB transient per layer at 256K chunk 2048. Only the dense
     contiguous prefill container (python-int offset, new rows already written)
-    with mask None/"causal" and at least ``MTPLX_GQA_MMA_PREFILL_MIN_PREFIX``
-    (49152) cached keys is served.
+    with mask None/"causal" and at least ``_gqa_mma_prefill_min_prefix()``
+    cached keys (0 on the M1 family, 49152 elsewhere) is served.
     """
     if mask is not None and not (isinstance(mask, str) and mask == "causal"):
         return None
@@ -714,7 +735,7 @@ def _mma_prefill_attention(attn: Any, queries: mx.array, cache: Any, mask: Any):
         return None
     q_len = int(queries.shape[2])
     prefix = int(offset) - q_len
-    min_prefix = int(os.environ.get("MTPLX_GQA_MMA_PREFILL_MIN_PREFIX", "49152") or "49152")
+    min_prefix = _gqa_mma_prefill_min_prefix()
     if prefix < max(0, min_prefix):
         return None
     from .kernels.sdpa_gqa_mma import sdpa_gqa_mma_prefill

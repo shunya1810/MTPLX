@@ -557,10 +557,14 @@ def test_active_session_over_its_own_budget_still_self_evicts():
     assert bank.eviction_log[-1]["session_id"] == "live"
 
 
-def test_per_session_entry_retention_bounds_divergent_siblings():
+def test_per_session_entry_retention_bounds_divergent_siblings(monkeypatch):
     # 2026-08-01 live leak: divergent same-session tails are not strict
     # prefixes, so supersede never fires and one agent session accumulated
     # 5 near-duplicate multi-GB snapshots. Newest-K retention bounds it.
+    # The M1 GPU family keeps 2 (test_m1_memory_defaults.py); pin the
+    # non-M1 default here.
+    monkeypatch.delenv("MTPLX_SESSION_BANK_PER_SESSION_MAX_ENTRIES", raising=False)
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "0")
     bank = SessionBank(max_entries=16, max_bytes=10_000, per_session_max_bytes=10_000)
     runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
     for i in range(5):

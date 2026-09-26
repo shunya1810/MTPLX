@@ -249,6 +249,7 @@ DEFAULT_PREFIX_BLOCK_SIZE = 256
 DEFAULT_BLOCK_PREFIX_MIN_MATCH_TOKENS = 512
 DEFAULT_ACTIVE_SESSION_PIN_TTL_S = 600.0
 DEFAULT_PER_SESSION_MAX_ENTRIES = 3
+M1_PER_SESSION_MAX_ENTRIES = 2
 
 
 def _per_session_max_entries() -> int:
@@ -262,9 +263,20 @@ def _per_session_max_entries() -> int:
     25-40ms/tick to every verify call. Newest-K retention bounds that while
     keeping a couple of older boundary entries for divergent restores.
     0 disables (byte budgets alone).
+
+    The M1 GPU family (cache_state.m1_long_context_defaults) keeps 2: one
+    32K entry is ~2.6 GB there (q8 KV plus eight GDN boundary records), and
+    on an M1 Max 64 GB three entries per conversation held 8.1 GB at 32K and
+    10.9 GB at 64K. Appending conversations restored the same with fewer
+    (2026-09-26, opt-s9); 2 still leaves one older entry for a divergent
+    re-render.
     """
     raw = os.environ.get("MTPLX_SESSION_BANK_PER_SESSION_MAX_ENTRIES")
     if raw is None or not str(raw).strip():
+        from .cache_state import m1_long_context_defaults
+
+        if m1_long_context_defaults():
+            return M1_PER_SESSION_MAX_ENTRIES
         return DEFAULT_PER_SESSION_MAX_ENTRIES
     try:
         return max(0, int(str(raw).strip()))
