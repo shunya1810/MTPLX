@@ -8,7 +8,7 @@ requantization. The fused module is an ``nn.QuantizedLinear``, so the verify-ker
 patches on ``nn.QuantizedLinear.__call__`` still route it. Members fall back to the
 unfused computation outside the row window where fusion is bitwise exact.
 
-Default off. ``MTPLX_FUSE_PROJ`` selects families: ``gdn``, ``attn``, ``mlp``,
+Default off (``gdn,attn`` on the M1 GPU family). ``MTPLX_FUSE_PROJ`` selects families: ``gdn``, ``attn``, ``mlp``,
 ``1``/``on``/``yes`` == ``gdn,attn``, ``all`` == ``gdn,attn,mlp``.
 ``MTPLX_FUSE_PROJ_MAX_ROWS`` overrides the row window ceiling.
 
@@ -58,7 +58,19 @@ def requested_groups() -> set[str]:
     """Which projection families the environment asks to fuse."""
 
     raw = os.environ.get(FUSE_ENV, "").strip().lower()
-    if raw in {"", "0", "off", "false", "no"}:
+    if raw == "":
+        # Unset: gdn+attn on the M1 GPU family, off elsewhere. On an M1 Max
+        # (Qwen3.8-27B, 4-row verify) the small attention/GDN projections run
+        # at 11-62% of the weight-stream floor unfused; fusing them took the
+        # eager verify from 86.3-88.0 to 84.4-84.9 ms and, in the server,
+        # decode +1.6% at 2K and +2.7% at 32K, same memory (2026-09-27, opt-s11).
+        # An explicit packed-concats lane (the other fusion) wins over this default.
+        if os.environ.get("MTPLX_PACKED_PROJ_CONCATS", "").strip().lower() in {"1", "true", "yes", "on"}:
+            return set()
+        from .cache_state import m1_long_context_defaults
+
+        return {"gdn", "attn"} if m1_long_context_defaults() else set()
+    if raw in {"0", "off", "false", "no"}:
         return set()
     if raw in {"1", "true", "yes", "on"}:
         return {"gdn", "attn"}
@@ -376,6 +388,11 @@ def configure_fused_projections(model: Any | None = None) -> dict[str, Any]:
     reset_fused_projection_counters()
 
     if not groups or model is None:
+        return fused_projection_stats()
+    if not callable(getattr(model, "named_modules", None)):
+        # Only mlx.nn module trees carry projections to fuse (runtime stubs do not).
+        _STATS["enabled"] = False
+        _note_skip("all", "model has no module tree")
         return fused_projection_stats()
 
     from .packed_concats import enabled as packed_concats_enabled

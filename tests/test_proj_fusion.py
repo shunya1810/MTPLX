@@ -86,6 +86,11 @@ def _originals(model: _Model) -> dict[str, list[nn.QuantizedLinear]]:
 
 def test_env_parsing(monkeypatch):
     monkeypatch.delenv(FUSE_ENV, raising=False)
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "0")
+    assert requested_groups() == set()
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "1")
+    assert requested_groups() == {"gdn", "attn"}
+    monkeypatch.setenv(FUSE_ENV, "0")
     assert requested_groups() == set()
     monkeypatch.setenv(FUSE_ENV, "1")
     assert requested_groups() == {"gdn", "attn"}
