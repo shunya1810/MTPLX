@@ -520,12 +520,20 @@ def _install_draft_lm_head(rt: Any, *, bits: int, group_size: int, mode: str) ->
     else:
         raise AttributeError("model has no lm_head and does not tie output projection to embeddings")
     text._mtplx_draft_lm_head = draft_head
-    from .frspec_draft import frspec_enabled, install_frspec_draft_head
+    from .frspec_draft import (
+        frspec_enabled,
+        frspec_explicitly_requested,
+        install_frspec_draft_head,
+    )
 
     if frspec_enabled():
         report = dict(report)
         report["frspec"] = install_frspec_draft_head(text)
-        if not report["frspec"].get("installed"):
+        if not report["frspec"].get("installed") and not frspec_explicitly_requested():
+            # M1-family default: a model the built-in list does not fit keeps
+            # its full draft head.
+            print(f"[frspec] default skipped: {report['frspec']}", file=sys.stderr, flush=True)
+        elif not report["frspec"].get("installed"):
             raise RuntimeError(
                 "FR-Spec draft head installation failed: "
                 f"{report['frspec'].get('reason', 'unknown reason')}"

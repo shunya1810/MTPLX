@@ -13,7 +13,8 @@ corpus deliberately NOT workload-fit — see the rig's LOSSES.md S2-L9):
 0.99487 at n=65536 build-time out-of-sample, 0.99728 measured on real traces;
 acceptance-length ceiling cost <=2.2% over 8 draft positions.
 
-Env contract (all default-off):
+Env contract (default off; on the M1 GPU family FR-Spec defaults on with
+``builtin:qwen38-code64k-ja`` and the legacy swap, see ``M1_DEFAULT_VOCAB``):
 - ``MTPLX_FRSPEC_DRAFT=1`` enables the pruned draft head.
 - ``MTPLX_FRSPEC_VOCAB=<path>`` JSON carrying ``{"ids": [...]}`` ranked
   most-frequent-first (the Y-PC artifact loads unchanged — same tokenizer).
@@ -36,7 +37,34 @@ logger = logging.getLogger(__name__)
 _BUILTIN_VOCABS = {
     "qwen38-code-64k": Path(__file__).with_name("data")
     / "qwen38_code_ranked_64k.npy",
+    # qwen38-code-64k plus every Qwen3.8 token holding kana/full-width text,
+    # one or two CJK ideographs, or a partial UTF-8 byte (103,887 rows, 41.8%).
+    # The code list alone covers 78-84% of Japanese text tokens and collapsed
+    # Japanese drafting (-25% decode); this one covers 99.7-99.8% while
+    # keeping English/code at 99.5-99.9% (2026-09-27, opt-s11).
+    "qwen38-code64k-ja": Path(__file__).with_name("data")
+    / "qwen38_code64k_ja.npy",
 }
+
+# M1 GPU family default (MTPLX_FRSPEC_DRAFT unset): the pruned head with the
+# Japanese-aware list, swapped into the per-step draft path (legacy lane) so
+# the greedy on-device chain reads it. M1 Max, Qwen3.8-27B, 3-turn chats:
+# draft 13.5 -> 8.4-9.1 ms/round, same acceptance and text; decode +4-7%
+# (English), +2-6% (Japanese). Contract misses skip quietly (never fatal).
+M1_DEFAULT_VOCAB = "builtin:qwen38-code64k-ja"
+
+
+def _m1_default_active() -> bool:
+    if (os.environ.get("MTPLX_FRSPEC_DRAFT") or "").strip():
+        return False
+    from .cache_state import m1_long_context_defaults
+
+    return m1_long_context_defaults()
+
+
+def frspec_explicitly_requested() -> bool:
+    return (os.environ.get("MTPLX_FRSPEC_DRAFT", "").strip().lower()
+            in {"1", "true", "yes", "on"})
 
 
 def _full_vocab_head(head: Any, ids: Any, vocab_rows: int) -> Any:
@@ -105,12 +133,13 @@ def _full_vocab_head(head: Any, ids: Any, vocab_rows: int) -> Any:
 
 
 def frspec_enabled() -> bool:
-    return (os.environ.get("MTPLX_FRSPEC_DRAFT", "").strip().lower()
-            in {"1", "true", "yes", "on"})
+    return frspec_explicitly_requested() or _m1_default_active()
 
 
 def _vocab_path() -> Path | None:
     raw = (os.environ.get("MTPLX_FRSPEC_VOCAB") or "").strip()
+    if not raw and _m1_default_active():
+        raw = M1_DEFAULT_VOCAB
     if not raw:
         return None
     if raw.startswith("builtin:"):
@@ -235,6 +264,10 @@ def install_frspec_draft_head(text: Any) -> dict[str, Any]:
     text._mtplx_frspec_full_vocab = vocab_rows
     text._mtplx_frspec_ids = ids_arr
     legacy = frspec_legacy_enabled()
+    if legacy and not (os.environ.get("MTPLX_FRSPEC_LEGACY") or "").strip() and source != "configured_draft_head":
+        # The M1 default swaps only the configured per-step head; a native MTP
+        # head binds the full-domain wrapper below instead.
+        legacy = False
     bind_draft_head = getattr(text, "_mtplx_bind_draft_lm_head", None)
     if bind_draft_head is not None:
         bind_draft_head(full_head)
@@ -263,5 +296,7 @@ def install_frspec_draft_head(text: Any) -> dict[str, Any]:
 
 
 def frspec_legacy_enabled() -> bool:
-    return (os.environ.get("MTPLX_FRSPEC_LEGACY", "").strip().lower()
-            in {"1", "true", "yes", "on"})
+    raw = os.environ.get("MTPLX_FRSPEC_LEGACY", "").strip().lower()
+    if raw:
+        return raw in {"1", "true", "yes", "on"}
+    return _m1_default_active()

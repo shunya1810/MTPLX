@@ -9534,7 +9534,9 @@ def generate_mtpk(
     # unswapped graph degrades to exact full-vocab drafting, never a mismap.
     _frspec_legacy_ids: np.ndarray | None = None
     _frspec_legacy_full = 0
-    if os.environ.get("MTPLX_FRSPEC_LEGACY", "").strip().lower() in {"1", "true", "yes", "on"}:
+    from .frspec_draft import frspec_legacy_enabled as _frspec_legacy_enabled
+
+    if _frspec_legacy_enabled():
         _frspec_text_model = getattr(rt.model, "language_model", rt.model)
         _frspec_stamp = getattr(_frspec_text_model, "_mtplx_frspec_ids", None)
         _frspec_head_live = getattr(_frspec_text_model, "_mtplx_draft_lm_head", None) is getattr(
