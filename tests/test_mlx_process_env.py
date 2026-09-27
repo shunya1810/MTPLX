@@ -11,12 +11,32 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_by_default_mlx_keeps_its_own_rule():
-    """Lifting the rule costs 6 to 12 GB of prefill peak, so it is opt-in."""
+    """Lifting the rule costs 6 to 12 GB of prefill peak, so it is opt-in off M1."""
 
-    env: dict[str, str] = {}
+    env: dict[str, str] = {penv.M1_GATE_ENV: "0"}
     receipt = penv.apply_mlx_process_defaults(env)
     assert penv.MLX_ENV not in env
+    assert penv.MLX_OPS_ENV not in env and penv.PREFILL_EVAL_ENV not in env
     assert receipt == {"value_mb": None, "source": "default:mlx_default"}
+
+
+def test_m1_family_default_pairs_the_buffer_bound_with_the_prefill_eval():
+    env: dict[str, str] = {penv.M1_GATE_ENV: "1"}
+    receipt = penv.apply_mlx_process_defaults(env)
+    assert receipt == {"value_mb": 1000, "source": "default:m1_family"}
+    assert env[penv.MLX_ENV] == "1000"
+    assert env[penv.MLX_OPS_ENV] == "150"
+    assert env[penv.PREFILL_EVAL_ENV] == "4"
+
+
+def test_m1_default_keeps_operator_values():
+    env = {penv.M1_GATE_ENV: "1", penv.MLX_OPS_ENV: "40", penv.PREFILL_EVAL_ENV: "0"}
+    penv.apply_mlx_process_defaults(env)
+    assert env[penv.MLX_OPS_ENV] == "40" and env[penv.PREFILL_EVAL_ENV] == "0"
+    env = {penv.M1_GATE_ENV: "1", penv.MLX_ENV: "64"}
+    receipt = penv.apply_mlx_process_defaults(env)
+    assert receipt["source"] == "operator:" + penv.MLX_ENV
+    assert penv.MLX_OPS_ENV not in env
 
 
 def test_an_operator_value_for_mlx_always_wins():

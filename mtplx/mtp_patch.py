@@ -27,6 +27,28 @@ _MTP_QUANT_POLICY_ALIASES = {
 }
 
 
+
+def _prefill_layer_eval_every() -> int:
+    """Layers between evals in an eager prefill forward (``MTPLX_PREFILL_LAYER_EVAL_EVERY``, 0 = off).
+
+    With large Metal command buffers (MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER)
+    a prefill chunk keeps many layers' transients alive until its buffer commits;
+    an eval every few layers bounds that without touching decode, whose verify is a
+    compiled graph (the phase gate keeps this out of every non-prefill forward).
+    """
+    raw = (os.environ.get("MTPLX_PREFILL_LAYER_EVAL_EVERY") or "").strip()
+    if not raw:
+        return 0
+    try:
+        every = int(raw)
+    except ValueError:
+        return 0
+    if every <= 0:
+        return 0
+    from .attention_context import current_attention_phase
+
+    return every if current_attention_phase() == "prefill" else 0
+
 def _canonical_mtp_quant_policy(policy: str | None) -> str | None:
     if policy is None:
         return None
@@ -835,9 +857,14 @@ def inject_mtp_support(
 
             fa_mask = create_attention_mask(hidden_states, cache[inner.fa_idx])
             ssm_mask = create_ssm_mask(hidden_states, cache[inner.ssm_idx])
-            for layer, layer_cache in zip(inner.layers, cache):
+            eval_every = _prefill_layer_eval_every()
+            for layer_index, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
                 mask = ssm_mask if layer.is_linear else fa_mask
                 hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
+                if eval_every and (layer_index + 1) % eval_every == 0:
+                    # Close the command buffer here so this span's transients
+                    # are freed before the next layers allocate theirs.
+                    mx.eval(hidden_states)
 
             pre_norm = hidden_states
             variant = hidden_variant or getattr(self, "_mtplx_hidden_variant", "post_norm")
