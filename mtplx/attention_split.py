@@ -826,6 +826,11 @@ def configure_mtp_draft_attention(model: Any) -> dict[str, int]:
         attn = getattr(layer, "self_attn", None)
         if attn is None or getattr(layer, "is_linear", False):
             continue
+        # Same class-side opt-out as _full_attention_layers: the hook patches
+        # the attention CLASS, so on qwen4_exp (QSA) it would rewrite every
+        # trunk layer too, not just the draft head.
+        if getattr(attn, "_mtplx_generic_sdpa_rewrites_unsupported", False):
+            continue
         if not _attention_has_gated_q_proj(attn):
             continue
         stats["layers"] += 1
