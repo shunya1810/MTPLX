@@ -27,17 +27,22 @@ until it can, this is an operator's choice for decode-heavy long-context
 serving on a Mac with memory to spare, and the engine leaves MLX's default
 alone.
 
-M1 GPU family (2026-09-27, opt-s12): the default is on there, paired with
-the prefill-side bound it was missing. Unset, an M1 host (CPU brand "Apple
-M1", or ``MTPLX_M1_LONG_CONTEXT=1``) gets 1,000 MiB and 150 ops per command
-buffer plus ``MTPLX_PREFILL_LAYER_EVAL_EVERY=4`` (an eval every 4 layers of an
-eager prefill forward closes the buffer, so prefill transients stay bounded).
-On an M1 Max, Qwen3.8-27B: the 4-row verify went from ~103 command buffers to
-~8, verify 85 -> 78.5 ms at 2K and 99 -> 93 ms at 32K, decode +4-11%
-(2K/32K/64K); the first-turn peak footprint stayed at 25.0/29.0/31.7 GB
-(default 25.4/29.1/31.3) where the buffer bound alone had reached 40.5/44.3
-GB; cold prefill +1-2%; identical text. ``MTPLX_M1_LONG_CONTEXT=0`` restores
-MLX's defaults.
+M1 GPU family (2026-09-27, opt-s12; default again since 2026-09-29): the
+raised bound is opt-in there too.  ``MTPLX_MLX_COMMAND_BUFFER_MB=1000`` on an
+M1 host (CPU brand "Apple M1", or ``MTPLX_M1_LONG_CONTEXT=1``) also sets 150
+ops per command buffer and ``MTPLX_PREFILL_LAYER_EVAL_EVERY=4`` (an eval
+every 4 layers of an eager prefill forward closes the buffer, so prefill
+transients stay bounded).  On an M1 Max, Qwen3.8-27B, that took the 4-row
+verify from ~103 command buffers to ~8 and decode +6-7%, but the MiB bound
+is what slows prefill: 8K cold prefill 54.7 s with MLX's rule, 59.6 / 65.1 /
+65.7 s at 150 / 500 / 1,000 MiB (150 ops, eval every 4 layers), and the
+decode gain needs 300 MiB or more (29.9 tok/s at 2K with MLX's rule, 29.8 /
+31.1 / 32.0 / 32.1 at 150 / 300 / 500 / 1,000).  An eval every layer, async
+evals and a 4 GiB MLX cache did not remove the prefill cost.  With the
+machine busy or power-limited the cost reached +13-21% at 8K-32K while the
+decode gain fell to 0-2%; on an idle machine +2-5% (2026-09-29, opt-s18).
+Long-context turns spend most of their time in prefill, so the M1 default
+leaves MLX's rule alone.
 
 ``MTPLX_MLX_COMMAND_BUFFER_MB`` sets it: a number of MiB (``mlx``, ``0`` or
 ``off`` and an unset variable all leave MLX's own default alone).  A value the operator set for
@@ -55,7 +60,6 @@ MLX_OPS_ENV = "MLX_MAX_OPS_PER_BUFFER"
 OVERRIDE_ENV = "MTPLX_MLX_COMMAND_BUFFER_MB"
 PREFILL_EVAL_ENV = "MTPLX_PREFILL_LAYER_EVAL_EVERY"
 M1_GATE_ENV = "MTPLX_M1_LONG_CONTEXT"
-M1_COMMAND_BUFFER_MB = 1000
 M1_COMMAND_BUFFER_OPS = 150
 M1_PREFILL_LAYER_EVAL_EVERY = 4
 #: None leaves MLX's own default in place (see the receipts above).
@@ -120,8 +124,6 @@ def resolve_command_buffer_mb(env=None) -> tuple[int | None, str]:
         if value <= 0:
             return None, "override:mlx_default"
         return value, "override:" + OVERRIDE_ENV
-    if m1_family_process(source):
-        return M1_COMMAND_BUFFER_MB, "default:m1_family"
     if DEFAULT_COMMAND_BUFFER_MB is None:
         return None, "default:mlx_default"
     return DEFAULT_COMMAND_BUFFER_MB, "default"
@@ -137,9 +139,9 @@ def apply_mlx_process_defaults(env=None) -> dict[str, object]:
     value, source = resolve_command_buffer_mb(target)
     if value is not None and not source.startswith("operator:"):
         target[MLX_ENV] = str(int(value))
-    if source == "default:m1_family":
-        # The op bound and the prefill-side eval travel with the M1 default;
-        # an operator's own value for either stays.
+    if source == "override:" + OVERRIDE_ENV and m1_family_process(target):
+        # On M1 the op bound and the prefill-side eval travel with a raised
+        # MiB bound; an operator's own value for either stays.
         if not str(target.get(MLX_OPS_ENV, "")).strip():
             target[MLX_OPS_ENV] = str(M1_COMMAND_BUFFER_OPS)
         if not str(target.get(PREFILL_EVAL_ENV, "")).strip():

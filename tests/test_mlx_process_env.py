@@ -20,17 +20,30 @@ def test_by_default_mlx_keeps_its_own_rule():
     assert receipt == {"value_mb": None, "source": "default:mlx_default"}
 
 
-def test_m1_family_default_pairs_the_buffer_bound_with_the_prefill_eval():
+def test_m1_family_leaves_mlx_alone_by_default():
+    """The raised MiB bound slows M1 prefill 2-21% (opt-s18), so it is opt-in there too."""
+
     env: dict[str, str] = {penv.M1_GATE_ENV: "1"}
     receipt = penv.apply_mlx_process_defaults(env)
-    assert receipt == {"value_mb": 1000, "source": "default:m1_family"}
+    assert receipt == {"value_mb": None, "source": "default:mlx_default"}
+    assert penv.MLX_ENV not in env
+    assert penv.MLX_OPS_ENV not in env and penv.PREFILL_EVAL_ENV not in env
+
+
+def test_m1_opt_in_pairs_the_buffer_bound_with_the_prefill_eval():
+    env: dict[str, str] = {penv.M1_GATE_ENV: "1", penv.OVERRIDE_ENV: "1000"}
+    receipt = penv.apply_mlx_process_defaults(env)
+    assert receipt == {"value_mb": 1000, "source": "override:" + penv.OVERRIDE_ENV}
     assert env[penv.MLX_ENV] == "1000"
     assert env[penv.MLX_OPS_ENV] == "150"
     assert env[penv.PREFILL_EVAL_ENV] == "4"
+    env = {penv.M1_GATE_ENV: "0", penv.OVERRIDE_ENV: "1000"}
+    penv.apply_mlx_process_defaults(env)
+    assert penv.MLX_OPS_ENV not in env and penv.PREFILL_EVAL_ENV not in env
 
 
-def test_m1_default_keeps_operator_values():
-    env = {penv.M1_GATE_ENV: "1", penv.MLX_OPS_ENV: "40", penv.PREFILL_EVAL_ENV: "0"}
+def test_m1_opt_in_keeps_operator_values():
+    env = {penv.M1_GATE_ENV: "1", penv.OVERRIDE_ENV: "1000", penv.MLX_OPS_ENV: "40", penv.PREFILL_EVAL_ENV: "0"}
     penv.apply_mlx_process_defaults(env)
     assert env[penv.MLX_OPS_ENV] == "40" and env[penv.PREFILL_EVAL_ENV] == "0"
     env = {penv.M1_GATE_ENV: "1", penv.MLX_ENV: "64"}
@@ -47,7 +60,7 @@ def test_an_operator_value_for_mlx_always_wins():
 
 
 def test_the_override_sets_a_number_or_leaves_mlx_alone():
-    env = {penv.OVERRIDE_ENV: "400"}
+    env = {penv.M1_GATE_ENV: "0", penv.OVERRIDE_ENV: "400"}
     assert penv.apply_mlx_process_defaults(env)["value_mb"] == 400
     assert env[penv.MLX_ENV] == "400"
     for spelling in ("0", "off", "mlx", "default", "-5"):
