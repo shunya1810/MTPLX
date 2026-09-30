@@ -4257,7 +4257,26 @@ class CompiledVerifyBank:
         if min_capacity is None:
             return 0  # no paged entries; bucket unused
         if max_needed > min_capacity:
-            return None
+            # The generation outran the pages reserved at request start.
+            # Grow every paged adapter on the host before any write (the
+            # compiled and eager paths both write through these adapters,
+            # and a write past the capacity clamps silently).
+            grown_capacity: int | None = None
+            for idx, kind, _n in self._spec or []:
+                if kind != VERIFY_SPEC_KIND_FULL_ATTN:
+                    continue
+                entry = cache[idx]
+                grow = getattr(entry, "grow_to", None)
+                if grow is None or not hasattr(entry, "capacity"):
+                    continue
+                if not grow(max_needed + 512):
+                    return None
+                capacity = int(entry.capacity)
+                grown_capacity = capacity if grown_capacity is None else min(grown_capacity, capacity)
+            if grown_capacity is None or max_needed > grown_capacity:
+                return None
+            self.stats["paged_grow_events"] = int(self.stats.get("paged_grow_events", 0)) + 1
+            min_capacity = grown_capacity
         bucket = min(min_capacity, _next_pow2(max_needed + 512))
         if max_needed > bucket:  # hard precondition: offset+M <= bucket
             bucket = min_capacity

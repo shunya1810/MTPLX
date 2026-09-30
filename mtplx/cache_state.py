@@ -3218,6 +3218,53 @@ class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
         # captures this tree reads the delta at call time (see rope_origin).
         return [self.cache, self.rollback_state, self.rope_state]
 
+    def grow_to(self, required_tokens: int) -> bool:
+        """Host-side capacity growth (never inside an ``mx.compile`` trace).
+
+        The adapter's leaves are fixed at promotion, so a generation that
+        outruns the pages reserved at request start (the server reserves at
+        most 16,384 new tokens up front) wrote past the capacity inside the
+        functional ``slice_update`` path, which clamps, and the next
+        attention read produced non-finite logits (thinking-on decode past
+        ~16.5K tokens, 2026-10-01). Grow like ``VllmMetalPagedKVCache``: 1.5x
+        or the requirement, zero-filled, block-aligned. Returns True when
+        the capacity now covers ``required_tokens``.
+        """
+        import mlx.core as mx
+
+        required = int(required_tokens)
+        current = int(self.capacity)
+        if required <= current:
+            return True
+        block = max(1, int(self.block_size))
+        target = max(required, (current * 3 + 1) // 2)
+        target = ((target + block - 1) // block) * block
+        extra = target - current
+        layout = getattr(self, "layout", "pages")
+        slots = [0, 1] + ([3, 4] if len(self.cache) >= 5 else [])
+        grown = []
+        for slot in slots:
+            leaf = self.cache[slot]
+            if leaf is None:
+                continue
+            if layout == "bank":
+                # head-major [1, H, capacity, packed|1]
+                pad_shape = (leaf.shape[0], leaf.shape[1], extra, leaf.shape[3])
+                axis = 2
+            else:
+                # token-major pages [blocks, block_size, H, D|packed|1]
+                pad_shape = (extra // block, *leaf.shape[1:])
+                axis = 0
+            self.cache[slot] = mx.concatenate(
+                [leaf, mx.zeros(pad_shape, dtype=leaf.dtype)], axis=axis
+            )
+            grown.append(self.cache[slot])
+        self.num_blocks = target // block
+        self.grow_events = int(getattr(self, "grow_events", 0)) + 1
+        if grown:
+            mx.eval(*grown)
+        return int(self.capacity) >= required
+
     def _flat_key_cache(self):
         return self.cache[0].reshape(-1, int(self.cache[0].shape[2]), int(self.cache[0].shape[3]))
 
