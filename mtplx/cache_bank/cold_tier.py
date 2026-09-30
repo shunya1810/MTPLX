@@ -1176,19 +1176,36 @@ class SessionBankColdTier:
                             "ssd_prefix_shadowed_by_resident_duplicate"
                         )
                         return None
+            restore_tokens = int(best[1])
+            if best[2] == "block_prefix":
+                # The block-aligned length only ranks candidates. The tokens
+                # themselves match exactly up to the common prefix, so any
+                # persisted recurrent boundary inside it is a valid restore
+                # point: an agent's system prompt ends a few dozen tokens past
+                # a block edge (omp: boundary 19,337, block edge 19,200), and
+                # aligning first fell back to the 18,432 boundary and
+                # re-prefilled ~1K tokens (TTFT 10.7 s instead of ~1.5 s).
+                restore_tokens = min(
+                    common_prefix_len(
+                        tokens,
+                        tuple(int(t) for t in json.loads(str(best[0]["token_ids_json"]))),
+                    ),
+                    best[3],
+                    len(tokens),
+                )
             record = self._restore_row(
                 best[0],
                 tokens,
                 started_s=started,
                 require_exact_prefix=False,
                 include_gdn_boundaries=True,
-                prefix_restore_tokens=int(best[1]),
+                prefix_restore_tokens=restore_tokens,
             )
             if record is None:
                 return None
             return ColdPrefixRestoreRecord(
                 record=record,
-                matched_tokens=int(best[1]),
+                matched_tokens=restore_tokens,
                 restore_kind=str(best[2]),
             )
         except Exception as exc:
