@@ -3985,6 +3985,9 @@ class ServerState:
             model_weights_bytes=_plan_weights_bytes,
             memory_plan=self.memory_plan,
         )
+        self.sessions.seam_resync = lambda prompt, committed, at, _state=self: (
+            _session_seam_resync(_state, prompt, committed, at)
+        )
         # Keep the SSD cold-tier encode (full-KV byte conversion; post-#169
         # it runs at enqueue, never on the writer thread) off request and
         # stream tails: dispatch it to the scheduler's idle lane, where it
@@ -14375,6 +14378,32 @@ def _is_chat_control_token(tokenizer: Any, token_id: int) -> bool:
     except Exception:
         return False
     return isinstance(text, str) and len(text) > 2 and text[0] == "<" and text[-1] == ">"
+
+
+def _session_seam_resync(
+    state: Any, prompt_ids: Sequence[int], committed: Sequence[int], divergence: int
+) -> bool:
+    """Whether ``prompt_ids`` re-synchronises with a session's committed
+    stream right after ``divergence`` on the same decoded text: the seam test
+    behind EngineSessionManager's ``token_seam`` identity rule. One splice
+    span (``_splice_committed_token_ids``), so an edit -- different bytes --
+    never passes. Off with MTPLX_COMMITTED_TOKEN_SPLICE=0."""
+
+    if not _committed_token_splice_enabled():
+        return False
+    runtime = getattr(state, "runtime", None)
+    tokenizer = getattr(runtime, "tokenizer", None)
+    if tokenizer is None:
+        return False
+    start = max(0, int(divergence) - 1)
+    window_prompt = list(prompt_ids[start : int(divergence) + 4 * _COMMITTED_SPLICE_WINDOW])
+    window_stream = list(committed[start : int(divergence) + 4 * _COMMITTED_SPLICE_WINDOW])
+    _spliced, receipt = _splice_committed_token_ids(
+        window_prompt, window_stream, tokenizer, max_spans=1
+    )
+    return int(receipt.get("spans") or 0) >= 1 and int(receipt.get("cp_after") or 0) > (
+        int(divergence) - start
+    )
 
 
 def _splice_committed_token_ids(

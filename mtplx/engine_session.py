@@ -970,6 +970,9 @@ class EngineSession:
         # Prompt lengths of the turns this session generated from; the
         # resolver's turn-boundary reuse (#446) reads them.
         self.turn_prompt_lens: list[int] = []
+        # Where best_common_prefix_session last adopted this session at a
+        # token-boundary seam (diagnostics only).
+        self.last_seam_reuse_at: int | None = None
         self.in_flight = False
         self.in_flight_started_s: float | None = None
         self.last_commit_s: float | None = None
@@ -1910,6 +1913,12 @@ class EngineSessionManager:
     ) -> None:
         if idle_ttl_s is None:
             idle_ttl_s = session_bank_idle_ttl_s()
+        # ``seam_resync(prompt_ids, committed_ids, divergence) -> bool``: does
+        # the prompt re-synchronise with a session's committed stream right
+        # after ``divergence`` (a token-boundary seam, same bytes)? The server
+        # installs one backed by its tokenizer; without it the seam rule in
+        # best_common_prefix_session stays off.
+        self.seam_resync: Any | None = None
         # Byte caps resolve model-aware by default (v2): unset or "auto" env
         # gives the bank half of the RAM surplus left after the model weights
         # (floored 1 GiB, capped 48 GiB), so a 32 GB Mac never inherits the
@@ -2123,6 +2132,8 @@ class EngineSessionManager:
                             "fraction"
                             if int(matched) >= _common_prefix_reuse_threshold(len(prompt_ids))
                             else "turn_boundary"
+                            if best.turn_boundary_at(matched) is not None
+                            else "token_seam"
                         ),
                         "turn_boundary": best.turn_boundary_at(matched),
                     }
@@ -2329,7 +2340,42 @@ class EngineSessionManager:
         # turn, whatever fraction of the new prompt that is.
         if boundary_best is not None:
             return boundary_best, boundary_common
+        # The same conversation resent with the session's own generation in
+        # it, diverging at a token-boundary seam: a sampled run the tokenizer
+        # encodes differently ("Nothing" as one token where the history has
+        # '"' + 'Nothing'), same bytes. Long thinking turns carry such seams
+        # anywhere; once the turn is three times the shared prompt the
+        # fraction rule fails, the request forked a fresh anon id, the
+        # committed-token splice had no session to read from, and the whole
+        # turn was prefilled again (omp, 2026-10-03: an 81K-token thinking
+        # turn, 100K-token next prompt, 984 s TTFT). Adopted only when the
+        # divergence lies past a recorded turn prompt (inside what the session
+        # generated or appended) and the server's tokenizer confirms the two
+        # streams re-synchronise on the same text right after it.
+        if (
+            best is not None
+            and best_common >= _COMMON_PREFIX_REUSE_MIN_TOKENS
+            and best_common < min(len(tokens), len(best.committed_token_ids))
+            and any(int(p) <= best_common for p in best.turn_prompt_lens)
+            and self._seam_resyncs(tokens, best.committed_token_ids, best_common)
+        ):
+            best.last_seam_reuse_at = int(best_common)
+            return best, best_common
         return None, 0
+
+    def _seam_resyncs(
+        self,
+        tokens: tuple[int, ...],
+        committed: tuple[int, ...] | list[int],
+        divergence: int,
+    ) -> bool:
+        check = self.seam_resync
+        if check is None:
+            return False
+        try:
+            return bool(check(tokens, committed, int(divergence)))
+        except Exception:
+            return False
 
     def pending_near_prefix_session(
         self,
