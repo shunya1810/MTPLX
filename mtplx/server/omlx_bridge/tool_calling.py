@@ -168,6 +168,38 @@ def _parse_bare_tool_payload(content: str) -> dict[str, Any] | None:
     return _tool_call(name, arguments)
 
 
+def _qwen_xml_param(raw: str) -> Any:
+    """A Qwen XML parameter value with only its framing newlines removed.
+
+    The chat template renders '<parameter=NAME>\n' + value + '\n</parameter>'.
+    Stripping every surrounding whitespace (as before) changed the value: a
+    file's trailing newline or its first line's indentation was lost, and the
+    re-rendered history no longer matched what the model generated, so the
+    session bank refused the turn's snapshot (an omp write of a 74K-token
+    thinking turn, 2026-10-04: the next call prefilled 74K tokens again).
+    JSON values (numbers, booleans, objects) still parse from the trimmed text.
+    """
+
+    value = raw[1:] if raw.startswith("\n") else raw
+    value = value[:-1] if value.endswith("\n") else value
+    stripped = value.strip()
+    if stripped[:1] in {"{", "[", '"'} or stripped in {"true", "false", "null"} or _looks_numeric(stripped):
+        try:
+            return json.loads(stripped)
+        except (TypeError, ValueError):
+            pass
+    # Single-line values (paths, commands) stay trimmed, as before.
+    return value if "\n" in stripped else stripped
+
+
+def _looks_numeric(text: str) -> bool:
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return bool(text) and text[0] in "-0123456789"
+
+
 def _parse_xml_tool_calls(text: str) -> tuple[str, list[dict[str, Any]] | None, str | None]:
     calls: list[dict[str, Any]] = []
     malformed_reason: str | None = None
@@ -194,12 +226,18 @@ def _parse_xml_tool_calls(text: str) -> tuple[str, list[dict[str, Any]] | None, 
             name = func_match.group(1)
             params = {}
             param_patterns = (
-                r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>",
-                r'<parameter\s+name="([^"]+)">\s*(.*?)\s*</parameter>',
+                # Qwen XML: the template writes '<parameter=NAME>\n' + value
+                # + '\n</parameter>', so exactly one newline on each side is
+                # framing and everything else is the value (_qwen_xml_param).
+                (r"<parameter=([^>\s]+)>(.*?)</parameter>", True),
+                (r'<parameter\s+name="([^"]+)">\s*(.*?)\s*</parameter>', False),
             )
-            for pattern in param_patterns:
+            for pattern, qwen_xml in param_patterns:
                 for param in re.finditer(pattern, func_match.group(2), re.DOTALL):
                     key = param.group(1)
+                    if qwen_xml:
+                        params[key] = _qwen_xml_param(param.group(2))
+                        continue
                     value = param.group(2).strip()
                     try:
                         params[key] = json.loads(value)

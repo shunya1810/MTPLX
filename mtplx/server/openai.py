@@ -9846,6 +9846,13 @@ def _tool_parameter_schema(
 
 
 def _decode_tool_parameter_value(value: str, schema: Any | None = None) -> Any:
+    # A multi-line string value is the model's own payload (a file's content):
+    # kept whole, past the framing newline the parser already dropped. Every
+    # surrounding whitespace used to be stripped, which lost a file's trailing
+    # newline or its first line's indentation and made the re-rendered history
+    # differ from what the model generated (the session bank then refused the
+    # turn's snapshot). Single-line values (paths, commands) are still trimmed.
+    multiline = "\n" in value.strip()
     text = value.strip()
     if not text:
         return ""
@@ -9884,12 +9891,13 @@ def _decode_tool_parameter_value(value: str, schema: Any | None = None) -> Any:
         ):
             text = wrapper.group(2).strip()
     text = html.unescape(text)
+    whole = html.unescape(value) if multiline and wrapper is None else text
     if schema_types and schema_types <= {"string", "null"}:
-        return text
+        return whole
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return text
+        return whole
 
 
 def _repair_tool_argument_keys_for_schema(
@@ -11106,19 +11114,22 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                         self._current_value_parts.append(value_piece)
                     return deltas
                 value_piece = self._buf[:close_start]
-                # Qwen usually formats XML parameters as newline-delimited
-                # blocks. Preserve user payload text, but drop the formatting
-                # newline immediately before the closing tag to match the
-                # existing final parser's stripped value semantics.
-                if value_piece.endswith("\n"):
-                    value_piece = value_piece[:-1]
+                # Qwen formats XML parameters as newline-delimited blocks:
+                # one framing newline after the open tag and one before the
+                # close. Preserve the payload, drop exactly those two. The
+                # closing newline is dropped from the joined value, not the
+                # last chunk: a close tag streamed in its own chunk left it
+                # in an earlier one.
                 if not self._current_value_parts and value_piece.startswith("\n"):
                     value_piece = value_piece[1:]
                 if value_piece:
                     self._current_value_parts.append(value_piece)
+                joined = "".join(self._current_value_parts)
+                if joined.endswith("\n"):
+                    joined = joined[:-1]
                 key = str(self._current_key or "")
                 self._params[key] = _decode_tool_parameter_value(
-                    "".join(self._current_value_parts),
+                    joined,
                     schema=_tool_parameter_schema(
                         self._tools,
                         tool_name=self._name,
