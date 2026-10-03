@@ -66,3 +66,66 @@ def test_full_bill_without_the_mma_prefill(bill, monkeypatch, env):
         assert source == "geometry_measured_m1_mma" and scratch == _upstream(2048)
     else:
         assert source == "geometry_measured" and scratch == _upstream(2048)
+
+
+# -- the M1 build's quantized direct restore ------------------------------------
+
+from mtplx.cache_state import COMPACT_KV_FORMAT, COMPACT_KV_FORMAT_KEY  # noqa: E402
+
+LIVE_W = 65_536 + 4_096  # 27B fp16 KV row + the MTP head's history
+PAGED_W = 34_816 + 4_096  # q8 pages + the history
+
+
+def _q8_geometry():
+    return srv._AdmissionGeometry(
+        live_bytes_per_token=LIVE_W,
+        paged_bytes_per_token=PAGED_W,
+        context_transient_bytes_per_token=0,
+        flat_transient_bytes=3 * GIB,
+        weights_bytes=19 * GIB,
+        aux_bytes_per_token=4_096,
+        kv_quantization="q8",
+    )
+
+
+def _compact_source(bits=8):
+    state = {COMPACT_KV_FORMAT_KEY: COMPACT_KV_FORMAT, "bits": bits}
+    return SimpleNamespace(cache_snapshot=SimpleNamespace(states=(None, state, None, state)))
+
+
+def test_a_compact_q8_restore_is_priced_at_page_width(monkeypatch):
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "1")
+    geometry = _q8_geometry()
+    assert srv._m1_compact_direct_restore(_compact_source(8), geometry)
+    kwargs = dict(
+        prompt_tokens=112_318, reused_tokens=112_299, restore_copies_prefix=True,
+        layout="contiguous_then_repage", source_layout="contiguous_then_repage",
+        output_tokens=16_384, publish=False, scratch_bytes=1 * GIB,
+    )
+    upstream = srv._admission_growth(geometry, **kwargs)
+    direct = srv._admission_growth(geometry, **kwargs, compact_direct=True)
+    assert upstream["repage_copy_bytes"] > 0
+    assert direct["repage_copy_bytes"] == 0 and direct["quant_working_bytes"] == 0
+    # The restored prefix, the suffix and the answer's reserve, all at page width.
+    assert direct["live_prefill_bytes"] == (112_318 + 16_384) * PAGED_W
+    assert direct["growth_bytes"] < upstream["growth_bytes"] / 2
+
+
+@pytest.mark.parametrize(
+    "env,source,quant",
+    [
+        ({"MTPLX_M1_LONG_CONTEXT": "0"}, _compact_source(8), "q8"),
+        ({"MTPLX_M1_LONG_CONTEXT": "1", "MTPLX_SESSION_BANK_COMPACT_DIRECT": "0"}, _compact_source(8), "q8"),
+        ({"MTPLX_M1_LONG_CONTEXT": "1", "MTPLX_KV_QUANT_MMA_PREFILL": "0"}, _compact_source(8), "q8"),
+        ({"MTPLX_M1_LONG_CONTEXT": "1"}, _compact_source(4), "q8"),
+        ({"MTPLX_M1_LONG_CONTEXT": "1"}, SimpleNamespace(cache_snapshot=SimpleNamespace(states=(None,))), "q8"),
+        ({"MTPLX_M1_LONG_CONTEXT": "1"}, _compact_source(8), "off"),
+    ],
+)
+def test_the_direct_path_needs_every_condition(monkeypatch, env, source, quant):
+    for name in ("MTPLX_SESSION_BANK_COMPACT_DIRECT", "MTPLX_KV_QUANT_MMA_PREFILL", "MTPLX_GQA_MMA_PREFILL"):
+        monkeypatch.delenv(name, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    geometry = SimpleNamespace(kv_quantization=quant)
+    assert srv._m1_compact_direct_restore(source, geometry) is False

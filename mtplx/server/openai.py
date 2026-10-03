@@ -22175,6 +22175,47 @@ def _admission_quant_working(
     }
 
 
+def _m1_compact_direct_restore(source: Any, geometry: Any) -> bool:
+    """Whether restoring ``source`` takes the M1 build's quantized direct path.
+
+    The bank keeps a quantized paged prompt at its stored precision (a
+    compact snapshot), and ``cache_state._compact_kv_restore_target`` loads
+    it straight into pages of the request's bits; the MMA prefill then runs
+    the suffix over those pages (``MTPLX_KV_QUANT_MMA_PREFILL``). The bill
+    for a contiguous restore (a full-width copy, its repage and a working
+    mirror) over-charged it: on an M1 Max (omp, 2026-10-03) a 19-token turn
+    on a 112,299-token q8 conversation was billed 12.99 GB and refused, where
+    the same restore at 90K grew the Mac's wired memory by 5.8 GB.
+    """
+
+    if source is None:
+        return False
+    raw = os.environ.get("MTPLX_SESSION_BANK_COMPACT_DIRECT", "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    quant = str(getattr(geometry, "kv_quantization", "off") or "off").lower()
+    if quant not in {"q4", "q8"}:
+        return False
+    try:
+        from mtplx.cache_state import _env_flag_default_m1, is_compact_kv_state
+
+        if not (
+            _env_flag_default_m1("MTPLX_GQA_MMA_PREFILL")
+            and _env_flag_default_m1("MTPLX_KV_QUANT_MMA_PREFILL")
+        ):
+            return False
+        snapshot = getattr(source, "cache_snapshot", None)
+        states = getattr(snapshot, "states", None) or ()
+        bits = {
+            int(state["bits"])
+            for state in states
+            if state is not None and is_compact_kv_state(state)
+        }
+    except Exception:
+        return False
+    return bits == {8 if quant == "q8" else 4}
+
+
 def _admission_growth(
     geometry: _AdmissionGeometry,
     *,
@@ -22193,6 +22234,7 @@ def _admission_growth(
     restore_fixed_bytes: int | None = None,
     publish_bytes: int | None = None,
     slack_rows: int = 0,
+    compact_direct: bool = False,
 ) -> dict[str, Any]:
     """New memory one request needs at its peak, on top of what is measured.
 
@@ -22242,6 +22284,13 @@ def _admission_growth(
     P = max(0, int(prompt_tokens))
     R = min(max(0, int(reused_tokens)), P)
     M = P - R
+    if compact_direct and R > 0:
+        # M1 build: a quantized bank entry restores straight into quantized
+        # pages of the request's own bits (cache_state._compact_kv_restore_target)
+        # and the suffix prefills into those pages on the MMA kernel: no
+        # contiguous copy, no repage, no working mirror
+        # (``_m1_compact_direct_restore``).
+        layout = "paged_compact_direct"
     live_w = max(0, int(geometry.live_bytes_per_token))
     paged_w = max(0, int(geometry.paged_bytes_per_token))
     restore_rows = R if restore_copies_prefix else 0
@@ -22356,6 +22405,9 @@ def _admission_growth(
             prefill_chunk_tokens=prefill_chunk_tokens,
             verify_tokens=verify_tokens,
         )
+    if layout == "paged_compact_direct":
+        quant_working = 0
+        quant_detail = {"route": "m1_mma_pages", "kernel_q_len": 0}
     if repages:
         live_decode = paged_copy + quant_working
         live_total = paged_copy
@@ -22373,9 +22425,10 @@ def _admission_growth(
             elif restore_rows and restore_fixed_bytes is not None:
                 windows_after = int(restore_fixed_bytes)
         live_total = P * geometry.resident_width + windows_after
-    if quantized:
+    if quantized and layout != "paged_compact_direct":
         # The snapshot holds the prompt dequantized (q4), or views of the q8
         # mirror that decode's first write copies: full width either way.
+        # (The M1 build banks quantized pages at their stored precision.)
         live_total = P * live_w
     if not publish:
         publish_copy = 0
@@ -23170,6 +23223,7 @@ def _run_prefill_admission(
             ),
             publish_bytes=anchor_bytes,
             slack_rows=slack_rows,
+            compact_direct=bool(copies) and _m1_compact_direct_restore(source, geometry),
         )
         model["scratch_source"] = scratch_source
         calibration = getattr(runtime, "prefill_scratch_calibration", None)
