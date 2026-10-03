@@ -38,13 +38,28 @@ def is_gemma4_tokenizer(tokenizer: Any) -> bool:
             and str(getattr(tokenizer, "eoc_token", "")) == "<channel|>"
         ):
             return True
-        vocab = tokenizer.get_vocab()
-        return all(
-            token in vocab
-            for token in ("<|think|>", "<|channel>", "<channel|>", "<|turn>", "<turn|>")
+        return _vocab_contains_all(
+            tokenizer, ("<|think|>", "<|channel>", "<channel|>", "<|turn>", "<turn|>")
         )
     except Exception:
         return False
+
+
+def _vocab_contains_all(tokenizer: Any, tokens: tuple[str, ...]) -> bool:
+    """Vocabulary membership without materializing the vocabulary.
+
+    ``get_vocab()`` on a fast tokenizer builds a dict of every token on each
+    call (~47 ms for the 248k-token Qwen3.6 tokenizer, once per chat
+    request). The ``tokenizers`` backend answers per token in microseconds;
+    ``get_vocab()`` stays the fallback for tokenizers without one.
+    """
+    for candidate in (tokenizer, getattr(tokenizer, "_tokenizer", None)):
+        backend = getattr(candidate, "backend_tokenizer", None)
+        token_to_id = getattr(backend, "token_to_id", None)
+        if callable(token_to_id):
+            return all(token_to_id(token) is not None for token in tokens)
+    vocab = tokenizer.get_vocab()
+    return all(token in vocab for token in tokens)
 
 
 def encode_without_added_special_tokens(tokenizer: Any, text: str) -> list[int]:
@@ -72,7 +87,7 @@ def strip_gemma4_thinking_text(text: str) -> str:
 
 def _tool_instruction_message(tools: list[dict[str, Any]]) -> dict[str, str]:
     lines = [
-        "Tool calling is available. If a tool is needed, respond with exactly one XML tool call in this format:",
+        "Tool calling is available. If a tool is needed, use this XML format for each tool call:",
         "<tool_call>",
         "<function=TOOL_NAME>",
         "<parameter=ARGUMENT_NAME>",
@@ -109,7 +124,17 @@ def _prepend_tool_instruction(
 ) -> list[dict[str, Any]]:
     if not tools:
         return messages
-    return [_tool_instruction_message(tools), *messages]
+    instruction = _tool_instruction_message(tools)
+    if messages and messages[0].get("role") in {"system", "developer"}:
+        # Gemma renders one system turn. Keep the client's instructions in it
+        # when adding the tool declaration, without mutating the transcript.
+        first = dict(messages[0])
+        content = _content_to_text(first.get("content")).rstrip()
+        first["content"] = (
+            f"{content}\n\n{instruction['content']}" if content else instruction["content"]
+        )
+        return [first, *messages[1:]]
+    return [instruction, *messages]
 
 
 def _content_to_text(content: Any) -> str:
@@ -233,18 +258,26 @@ def encode_gemma4_messages(
             reasoning = _content_to_text(
                 item.get("reasoning_content") or item.get("reasoning")
             )
-            if enable_thinking and reasoning:
-                content = (
-                    f"{GEMMA4_THINK_OPEN}{GEMMA4_THOUGHT_PREFIX}"
-                    f"{reasoning}{GEMMA4_THINK_CLOSE}{content}"
-                )
             tool_call_text = _gemma4_tool_calls_text(item.get("tool_calls"))
             if tool_call_text:
+                # A newline only after visible text: the model writes
+                # `<channel|><tool_call>` straight after its thought block.
                 content = (
                     f"{content.rstrip()}\n{tool_call_text}"
                     if content.strip()
                     else tool_call_text
                 )
+            if enable_thinking and reasoning:
+                content = (
+                    f"{GEMMA4_THINK_OPEN}{GEMMA4_THOUGHT_PREFIX}"
+                    f"{reasoning}{GEMMA4_THINK_CLOSE}{content}"
+                )
+            elif not enable_thinking and content.strip():
+                # With thinking off the generation prompt ends in an empty
+                # thought block and the model writes its turn right after it.
+                # Render the same scaffold on history turns, or every thinking-
+                # off turn diverges from the next prompt four tokens early.
+                content = f"{GEMMA4_EMPTY_THOUGHT_BLOCK}{content.strip()}"
         elif role == "tool":
             role = "tool_response"
         if role not in {"user", "model", "tool_response"}:

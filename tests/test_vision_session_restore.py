@@ -55,7 +55,7 @@ from mtplx.runtime import MTPLXRuntime
 from mtplx.server import openai
 from mtplx.server.openai import create_app
 from mtplx.session_bank import SessionBank
-from mtplx.vision.splice import VisionSplice, vision_image_spans
+from mtplx.vision.splice import VisionSplice, vision_bank_key_ids, vision_image_spans
 
 VOCAB = 48
 ALPHABET = "abcdefghijklmnopqrstuvwxyz .:"
@@ -480,8 +480,13 @@ def test_image_turn_after_text_history_restores_to_the_pad_boundary(harness):
     # (This dict is what generation spreads into the request log row, next to
     # its own cached_tokens: "held N, shares M, first pad at P, restored K".)
     assert observed["request_vision_images"] == 1
-    # An image turn still never advances the raw-id session frontier.
-    assert list(harness.state.sessions.peek(SESSION).committed_token_ids) == committed
+    # The image turn advances the session frontier in the content-keyed
+    # view: its image rows stand for image A, never for the raw pad id.
+    frontier = harness.state.sessions.peek(SESSION).committed_token_ids
+    assert list(frontier) == vision_bank_key_ids(
+        prompt_ids + call["reply"], call["splice"]
+    )
+    assert PAD not in frontier
 
 
 def _image_turn(harness) -> tuple[list[dict], list[int], dict]:
@@ -547,14 +552,14 @@ def test_other_pixels_in_the_old_slot_never_restore_past_the_old_image(harness):
     assert call["logits"] != _cold_logits(prompt_ids, [IMAGE_A, IMAGE_B])
 
 
-def test_a_follow_up_never_drops_below_the_text_history(harness):
-    """The floor after an image turn. The raw-id session frontier stays put
-    on image turns, so the committed stream never covers the image turn's own
-    answer. A client that strips that answer's reasoning parts from the
-    banked ids there, and the restore falls back to the text under the first
-    image: the text history stays warm on every later turn."""
+def test_a_client_that_strips_the_image_turns_reasoning_restores_all_of_it(harness):
+    """The image turn committed its keyed view, so the session holds the
+    image turn's own answer. A client that strips that answer's reasoning
+    resends a history that parts from the banked ids there; the repair puts
+    the committed reasoning back past the image, and the follow-up restores
+    the whole image turn. Never less than the text history."""
 
-    history, committed, _first_call = _image_turn(harness)
+    history, committed, first_call = _image_turn(harness)
 
     _echoed, call = _chat(
         harness, _second_image_request(history, IMAGE_A), SHORT_ANSWER
@@ -562,8 +567,83 @@ def test_a_follow_up_never_drops_below_the_text_history(harness):
 
     prompt_ids = call["prompt_ids"]
     assert prompt_ids[: len(committed)] == committed
-    assert call["cached_tokens"] >= len(committed)
+    assert call["cached_tokens"] == len(first_call["prompt_ids"]) + len(
+        first_call["reply"]
+    )
     assert call["logits"] == _cold_logits(prompt_ids, [IMAGE_A, IMAGE_B])
+    receipt = call["observability"]["request_vision_session_restore"]
+    assert receipt["canonicalized"] is True and receipt["refused"] is None
+
+
+# The image turn's answer starts with the merged token too, so the resent
+# history parts from the session's stream AFTER the image.
+IMAGE_ANSWER = [MERGED_AB] + SeamTokenizer().encode(" the window is cut off on the right.")
+
+
+def test_the_repair_crosses_an_image_its_session_holds(harness):
+    history, _committed = _text_turn(harness)
+    messages = [*history, _image_message("look at this: ", IMAGE_A)]
+    echoed, call = _chat(harness, messages, IMAGE_ANSWER)
+    # The image turn committed the content-keyed view of what it was served.
+    frontier = vision_bank_key_ids(call["prompt_ids"] + call["reply"], call["splice"])
+    assert list(harness.state.sessions.peek(SESSION).committed_token_ids) == frontier
+
+    _echoed, follow = _chat(
+        harness, _second_image_request([*messages, echoed], IMAGE_A), SHORT_ANSWER
+    )
+
+    # The repair re-expressed the image turn's answer in the model's own
+    # tokens past the image, so the served prompt extends the banked turn
+    # and restores all of it.
+    served = vision_bank_key_ids(follow["prompt_ids"], follow["splice"])
+    assert served[: len(frontier)] == frontier
+    assert follow["cached_tokens"] == len(frontier)
+    assert follow["logits"] == _cold_logits(follow["prompt_ids"], [IMAGE_A, IMAGE_B])
+    receipt = follow["observability"]["request_vision_session_restore"]
+    assert receipt["canonicalized"] is True and receipt["refused"] is None
+    assert receipt["committed_prefix_tokens"] == len(frontier)
+
+
+def test_a_pi_session_restores_all_but_the_new_turn_after_a_screenshot(harness):
+    """Consecutive Pi-shaped prompts: two text turns, a screenshot, then an
+    edit, a write and a read turn. Every answer starts with the token the
+    model sampled and the tokenizer never produces (and, with thinking on,
+    the client drops its reasoning), so every history the client re-sends
+    parts from the session's stream inside the previous answer, after the
+    screenshot. On 2026-09-29 each such turn restored nothing past the
+    screenshot and read 123K to 138K tokens again. Every turn after the
+    screenshot restores its prompt minus the new turn (the previous turn's
+    prompt and answer), and its logits equal a cold prefill."""
+
+    messages: list[dict] = [{"role": "user", "content": "read the game file."}]
+    echoed, _call = _chat(harness, messages, FIRST_ANSWER)
+    messages += [echoed, {"role": "user", "content": "run it."}]
+    echoed, _call = _chat(harness, messages, IMAGE_ANSWER)
+    messages += [echoed, _image_message("screenshot: ", IMAGE_A)]
+    echoed, previous = _chat(harness, messages, IMAGE_ANSWER)
+    messages.append(echoed)
+    for request in ("edit the bird speed.", "write the file.", "read it back."):
+        messages.append({"role": "user", "content": request})
+        echoed, call = _chat(harness, messages, IMAGE_ANSWER)
+        messages.append(echoed)
+        held = len(previous["prompt_ids"]) + len(previous["reply"])
+        assert call["cached_tokens"] >= held, request
+        assert call["logits"] == _cold_logits(call["prompt_ids"], [IMAGE_A])
+        receipt = call["observability"]["request_vision_session_restore"]
+        assert receipt["canonicalized"] is True and receipt["refused"] is None
+        previous = call
+
+
+def test_the_splice_never_copies_across_image_rows_that_differ():
+    tokenizer = SeamTokenizer()
+    a = tokenizer.encode("look ") + [VISION_START, PAD, PAD, VISION_END]
+    committed = _keyed([*a, MERGED_AB, 26], (DIGEST_A, 2))  # "ab" as one token
+    same = _keyed([*a, 0, 1, 26], (DIGEST_A, 2))  # "a", "b": a seam after the image
+    other = _keyed([*a, 0, 1, 26], (DIGEST_C, 2))  # the same text, other pixels
+    spliced, receipt = openai._splice_committed_token_ids(same, committed, tokenizer)
+    assert spliced == committed and receipt["spans"] == 1
+    spliced, receipt = openai._splice_committed_token_ids(other, committed, tokenizer)
+    assert spliced == other and receipt["spans"] == 0
 
 
 def _follow_up_text_ids(harness, monkeypatch, switch: str | None) -> list[int]:
@@ -688,36 +768,86 @@ def test_an_inferred_session_sweeps_once_its_lineage_is_known(harness, monkeypat
 # the guard on the canonicalized TEXT ids
 
 
-def test_canonicalization_is_legal_only_before_the_first_image_placeholder():
-    refusal = openai._vision_text_canonicalization_refusal
-    raw = [1, 2, 3, 4, VISION_START, PAD, VISION_END, 5, 6]
-    tail = raw[4:]
-    assert refusal(raw, [1, 9, 4, *tail], PAD) is None
-    assert refusal(raw, raw, PAD) is None
-    # anything from the first placeholder on must be the raw encode's
-    assert refusal(raw, [1, 9, 4, VISION_START, PAD, VISION_END, 5, 7], PAD) == (
-        "canonicalization_crossed_first_image"
+def _keyed(ids: list[int], *images: tuple[int, int]) -> list[int]:
+    """``ids`` in the content-keyed view, ``(digest, pad count)`` per image."""
+
+    splice = VisionSplice(
+        image_pad_token_id=PAD,
+        embeddings=mx.zeros((sum(count for _digest, count in images), 1)),
+        image_digests=tuple(digest for digest, _count in images),
+        pad_counts=tuple(count for _digest, count in images),
     )
-    assert refusal(raw, [VISION_END, 5, 6], PAD) == (
-        "canonicalization_crossed_first_image"
+    return vision_bank_key_ids(list(ids), splice)
+
+
+# Text, image A (two rows), text, image B (two rows), text.
+TWO_IMAGES = [1, 2, 3, 4, VISION_START, PAD, PAD, VISION_END, 5, 6,
+              VISION_START, PAD, PAD, VISION_END, 8, 9]
+DIGEST_A, DIGEST_B, DIGEST_C = 0xA, 0xB, 0xC
+
+
+def test_the_repair_stops_at_the_first_image_its_session_does_not_hold():
+    refusal = openai._vision_canonicalization_refusal
+    raw = _keyed(TWO_IMAGES, (DIGEST_A, 2), (DIGEST_B, 2))
+    between = [*raw[:9], 7, *raw[10:]]  # the text between the images changed
+    after = [*raw[:15], 7]  # the text after the second image changed
+    # A stream that holds no image (a text session, or one from before image
+    # sessions committed): legal only before the first image, as it was.
+    text_only = [1, 2, 3, 4]
+    assert refusal(raw, [1, 9, 4, *raw[4:]], text_only, PAD) is None
+    assert refusal(raw, raw, text_only, PAD) is None
+    assert refusal(raw, between, text_only, PAD) == (
+        "canonicalization_crossed_an_image_not_in_the_session"
     )
-    # a placeholder the raw encode did not have would shift every image
-    assert refusal(raw, [1, PAD, 4, *tail], PAD) == (
+    # A stream that holds image A: the stretch after it is the session's own.
+    holds_a = _keyed([*TWO_IMAGES[:8], 5, 7], (DIGEST_A, 2))
+    assert refusal(raw, between, holds_a, PAD) is None
+    assert refusal(raw, after, holds_a, PAD) == (
+        "canonicalization_crossed_an_image_not_in_the_session"
+    )
+    # A stream that holds both images: every stretch may be repaired.
+    holds_both = _keyed(TWO_IMAGES[:14], (DIGEST_A, 2), (DIGEST_B, 2))
+    assert refusal(raw, after, holds_both, PAD) is None
+    # A stream whose first image has other pixels holds none of the request's.
+    holds_c = _keyed([*TWO_IMAGES[:8], 5, 7], (DIGEST_C, 2))
+    assert refusal(raw, between, holds_c, PAD) == (
+        "canonicalization_crossed_an_image_not_in_the_session"
+    )
+    # An image the session holds must come back byte-identical.
+    other_rows = _keyed(TWO_IMAGES, (DIGEST_C, 2), (DIGEST_B, 2))
+    assert refusal(raw, [*other_rows[:9], 7, *raw[10:]], holds_a, PAD) == (
+        "canonicalization_changed_an_image"
+    )
+    # A placeholder the raw encode did not have would shift every image.
+    assert refusal(raw, [1, PAD, *raw[2:]], text_only, PAD) == (
         "canonicalization_added_image_placeholder"
     )
-    assert refusal([1, 2, 3], [1, 2, 3], PAD) == "image_placeholder_missing"
-    assert refusal(raw, raw, None) == "image_pad_token_unknown"
+    assert refusal([1, 2, 3], [1, 2, 3], text_only, PAD) == "image_placeholder_missing"
+    assert refusal(raw, raw, text_only, None) == "image_pad_token_unknown"
+
+
+def _gate_state(committed):
+    return SimpleNamespace(
+        _vision_spec_cache=SimpleNamespace(image_token_id=PAD),
+        sessions=SimpleNamespace(
+            peek=lambda _sid: SimpleNamespace(committed_token_ids=tuple(committed))
+        ),
+    )
+
+
+def _one_image_splice() -> VisionSplice:
+    return VisionSplice(
+        image_pad_token_id=PAD,
+        embeddings=mx.zeros((1, 1)),
+        image_digests=(DIGEST_A,),
+        pad_counts=(1,),
+    )
 
 
 def test_a_refused_canonicalization_serves_the_raw_encode_and_says_why():
-    state = SimpleNamespace(
-        _vision_spec_cache=SimpleNamespace(image_token_id=PAD),
-        sessions=SimpleNamespace(
-            peek=lambda _sid: SimpleNamespace(committed_token_ids=(1, 2, 3, 4))
-        ),
-    )
     raw = [1, 2, 9, VISION_START, PAD, VISION_END, 5]
-    crossed = [1, 2, 3, 4, VISION_START, PAD, VISION_END, 6]
+    raw_keyed = _keyed(raw, (DIGEST_A, 1))
+    crossed = [1, 2, 3, 4, *raw_keyed[3:6], 6]
     template_observability = {"chat_encode_cache": "miss"}
     gate_observability = {
         "stable_prefix_len": 3,
@@ -725,10 +855,11 @@ def test_a_refused_canonicalization_serves_the_raw_encode_and_says_why():
     }
     receipt = {"enabled": True, "canonicalized": False, "refused": None}
 
-    served = openai._vision_gate_text_canonicalization(
-        state,
-        raw_ids=raw,
+    served = openai._vision_gate_canonicalization(
+        _gate_state((1, 2, 3, 4)),
+        raw_keyed=raw_keyed,
         canonicalized=(["canon"], crossed),
+        splice=_one_image_splice(),
         canon_observability=gate_observability,
         template_observability=template_observability,
         receipt=receipt,
@@ -742,15 +873,48 @@ def test_a_refused_canonicalization_serves_the_raw_encode_and_says_why():
         "committed_reasoning_canonicalization": {
             "applied": False,
             "cp_raw": 2,
-            "refused_reason": "canonicalization_crossed_first_image",
+            "refused_reason": "canonicalization_crossed_an_image_not_in_the_session",
         },
     }
     assert receipt == {
         "enabled": True,
         "canonicalized": False,
-        "refused": "canonicalization_crossed_first_image",
+        "refused": "canonicalization_crossed_an_image_not_in_the_session",
         "session_committed_tokens": 4,
         "committed_prefix_tokens": 2,
+    }
+
+
+def test_a_served_canonicalization_hands_the_model_its_ids_and_splice():
+    raw = [1, 2, 9, VISION_START, PAD, VISION_END, 5]
+    raw_keyed = _keyed(raw, (DIGEST_A, 1))
+    repaired = [1, 2, 3, 4, *raw_keyed[3:]]  # a seam before the image
+    template_observability = {"chat_encode_cache": "miss"}
+    gate_observability = {"committed_reasoning_canonicalization": {"applied": True}}
+    receipt = {"enabled": True, "canonicalized": False, "refused": None}
+
+    messages, served_ids, splice = openai._vision_gate_canonicalization(
+        _gate_state((1, 2, 3, 4)),
+        raw_keyed=raw_keyed,
+        canonicalized=(["canon"], repaired),
+        splice=_one_image_splice(),
+        canon_observability=gate_observability,
+        template_observability=template_observability,
+        receipt=receipt,
+        session_id="s",
+    )
+
+    assert messages == ["canon"]
+    # The model reads the pad id; the rows ride the splice, from its start.
+    assert served_ids == [1, 2, 3, 4, VISION_START, PAD, VISION_END, 5]
+    assert splice.cursor == 0 and splice.pad_counts == (1,)
+    assert template_observability == gate_observability
+    assert receipt == {
+        "enabled": True,
+        "canonicalized": True,
+        "refused": None,
+        "session_committed_tokens": 4,
+        "committed_prefix_tokens": 4,
     }
 
 

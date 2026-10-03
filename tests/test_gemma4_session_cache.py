@@ -271,8 +271,9 @@ def test_gemma4_two_turn_memory_rewrite_restores_common_prefix_with_cold_parity(
 
     prefill_calls = []
 
-    def fake_prefill(_runtime, prompt_ids, *, cache, phase):
+    def fake_prefill(_runtime, prompt_ids, *, cache, phase, abort_check=None):
         assert phase == "prefill"
+        assert abort_check is None
         prefill_calls.append(tuple(prompt_ids))
         cache[0].token_ids.extend(int(token) for token in prompt_ids)
         cache[0].offset = len(cache[0].token_ids)

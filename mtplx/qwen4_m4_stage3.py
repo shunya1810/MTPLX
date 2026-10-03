@@ -20,7 +20,6 @@ from .models.qwen4_exp import (
     SparseMoeBlock,
     _FusedGateUpMLP,
     _FusedGateUpSwitchGLU,
-    _hyper_residual_write,
 )
 from .runtime_options import env_bool
 
@@ -34,7 +33,7 @@ def qwen4_m4_stage3_enabled() -> bool:
 #: its sigmoid) with the two kernels in ``kernels/qwen4_m4_route``.  Off by
 #: default.  Bit-exactness is not asserted by argument: every layer's whole
 #: ``(expert_ids, route_scores, shared_factor)`` tuple is compared against the
-#: stock scaffold with ``mx.array_equal`` at install, and a mismatch raises.
+#: stock scaffold bit for bit at install (``_same_bits``), and a mismatch raises.
 #: A flipped near-tie changes WHICH experts run, so there is no tolerance to
 #: fall back on and no silent fallback path.
 QWEN4_ROUTE_KERNEL_ENV = "MTPLX_QWEN4_ROUTE_KERNEL"
@@ -419,9 +418,10 @@ def _m4_routed_down_residual_tail_layer_forward(
         block_out = layer.linear_attn(mixed, ssm_mask, cache)
     else:
         block_out = layer.self_attn(mixed, cache)
-    hidden = _hyper_residual_write(hyper, block_out, inject)
-
-    mixed, hyper, inject = layer.mlp_hyper_connection(hidden)
+    # The attention write rides into the MLP read (see DecoderLayer).
+    mixed, hyper, inject = layer.mlp_hyper_connection(
+        hyper, pending=(block_out, inject)
+    )
     return _m4_routed_down_residual_tail_forward(
         layer.mlp,
         mixed,
@@ -447,9 +447,10 @@ def _m4_paired_routed_glu_residual_tail_layer_forward(
         block_out = layer.linear_attn(mixed, ssm_mask, cache)
     else:
         block_out = layer.self_attn(mixed, cache)
-    hidden = _hyper_residual_write(hyper, block_out, inject)
-
-    mixed, hyper, inject = layer.mlp_hyper_connection(hidden)
+    # The attention write rides into the MLP read (see DecoderLayer).
+    mixed, hyper, inject = layer.mlp_hyper_connection(
+        hyper, pending=(block_out, inject)
+    )
     return _m4_paired_routed_glu_residual_tail_forward(
         layer.mlp,
         mixed,
@@ -794,6 +795,18 @@ def _install_validated_plans(
             block.__class__ = _M4Stage3SparseMoeBlock
 
 
+def _same_bits(want: mx.array, got: mx.array) -> mx.array:
+    """``array_equal`` on bit patterns: -0 and +0 differ, as they do in a
+    later sum, a sign test or a sort. Integer arrays compare as values."""
+
+    if want.dtype != got.dtype or want.shape != got.shape:
+        return mx.array(False)
+    if mx.issubdtype(want.dtype, mx.floating):
+        view = {2: mx.uint16, 4: mx.uint32}[want.dtype.size]
+        return mx.array_equal(mx.view(want, view), mx.view(got, view))
+    return mx.array_equal(want, got)
+
+
 def install_qwen4_m4_stage3(
     runtime: Any,
     *,
@@ -855,8 +868,8 @@ def install_qwen4_m4_stage3(
     for index, (layer, block, stage3, routed_down_reduce) in enumerate(plans):
         if route is not None:
             # The route head decides WHICH experts run. A near-tie that flips
-            # is not a rounding-class difference, so this gate is array_equal
-            # on all three emitted tensors, no tolerance, no fallback.
+            # is not a rounding-class difference, so this gate compares all
+            # three emitted tensors bit for bit, no tolerance, no fallback.
             _route_kernel.check_input(sample.reshape(4, 2560))
             reference_route = _route_kernel.stock_route(block, sample)
             candidate_route = route(
@@ -870,7 +883,7 @@ def install_qwen4_m4_stage3(
             )
             names = ("expert_ids", "route_scores", "shared_factor")
             checks = tuple(
-                mx.array_equal(want, got)
+                _same_bits(want, got)
                 for want, got in zip(reference_route, candidate_route)
             )
             mx.eval(checks)
@@ -918,7 +931,7 @@ def install_qwen4_m4_stage3(
         else:
             candidate = reference
         if routed_down_reduce_enabled:
-            exact = mx.array_equal(reference, candidate)
+            exact = _same_bits(reference, candidate)
             mx.eval(exact)
             if not bool(exact.item()):
                 raise ValueError(

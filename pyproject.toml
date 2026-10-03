@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mtplx"
-version = "2.12.0"
+version = "2.12.2"
 description = "Native MTP speculative decoding for Qwen3-Next on Apple Silicon."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,7 +30,10 @@ dependencies = [
   # (2026-08-26, MEASUREMENTS 07:20) measured 0.32.0 -> 0.32.2 at +29%
   # decode / +41% prefill @88.4k and +31% @16k — same wheel, same flags,
   # only mlx differs. A 0.32.0 venv silently forfeits that; converge it.
-  "mlx>=0.32.2,<0.33; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  # Pinned to exactly 0.32.2 (2026-09-29): 0.32.3 decodes at the same speed,
+  # but its output is not bit-identical to 0.32.2 on Flash-Next, and the app
+  # bundles 0.32.2, so pip and Homebrew now install what the app runs.
+  "mlx==0.32.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "mlx-lm>=0.31,<0.32; sys_platform == 'darwin' and platform_machine == 'arm64'",
   # transformers 5.13.0 changed AutoTokenizer.register to require a config
   # class as the key; mlx-lm 0.31.x still registers by name
@@ -45,7 +48,12 @@ dependencies = [
   # Floor 5.10.0: GHSA path traversal in save_pretrained through chat
   # template names (Dependabot alert 24, 2026-09-06); the shipped venvs run
   # 5.14.1, so the floor changes nothing installed and closes the alert.
-  "transformers>=5.10.0,!=5.13.0,<5.15; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  # 5.15 and 5.16 verified 2026-09-27 (PR #538): mlx-lm 0.31.3 imports, and
+  # the tool chat template (thinking on and off) and plain encodes give token
+  # ids identical to 5.14.1 on the Qwen 3.8 27B, Flash-Next, Qwen 3.6 A3B,
+  # Qwen 3.5 9B and LFM2.5 pack tokenizers; 5.16.1 brings tokenizers 0.23.2
+  # with the same ids. 5.17 is not verified, so the ceiling stays below it.
+  "transformers>=5.10.0,!=5.13.0,<5.17; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "nanobind>=2; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "numpy>=2",
   "pydantic>=2",
@@ -79,7 +87,7 @@ competitors = [
 ]
 server = [
   "fastapi>=0.136",
-  "llguidance>=1.7",
+  "llguidance>=1.8",
   "uvicorn>=0.46",
 ]
 dev = [

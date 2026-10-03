@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import mtplx.generation as gen
+import mtplx.graphbank as graphbank
 
 GB = 1_000_000_000
 
@@ -26,7 +27,7 @@ def _gate(monkeypatch, *, active, cache_before, cache_after, limit=103_079_215_1
     monkeypatch.setattr(gen, "_mlx_release_allocator_cache", release)
     monkeypatch.setattr(gen, "_qwen4_fixed_m4_promotion_bytes_per_token", lambda rt: per_token)
     monkeypatch.setattr(gen, "_metal_memory_limit_bytes", lambda rt: limit)
-    monkeypatch.setattr(gen, "_fixed_m4_initial_growth_reserve", lambda: 4096)
+    monkeypatch.setattr(graphbank, "_fixed_m4_initial_growth_reserve", lambda: 4096)
     announced = []
     monkeypatch.setattr(gen, "_announce_qwen4_fixed_m4_skip", announced.append)
     monkeypatch.delenv("MTPLX_QWEN4_FIXED_M4_MAX_CONTEXT", raising=False)
@@ -88,7 +89,7 @@ def test_idle_bank_yields_but_logical_eviction_is_not_proof_of_freed_memory(monk
     monkeypatch.setattr(gen, "_mlx_release_allocator_cache", lambda: 0)
     monkeypatch.setattr(gen, "_qwen4_fixed_m4_promotion_bytes_per_token", lambda rt: 28416)
     monkeypatch.setattr(gen, "_metal_memory_limit_bytes", lambda rt: 103079215104)
-    monkeypatch.setattr(gen, "_fixed_m4_initial_growth_reserve", lambda: 4096)
+    monkeypatch.setattr(graphbank, "_fixed_m4_initial_growth_reserve", lambda: 4096)
     monkeypatch.delenv("MTPLX_QWEN4_FIXED_M4_MAX_CONTEXT", raising=False)
 
     class Bank:

@@ -33,6 +33,7 @@ These tests pin two invariants:
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 from mtplx.server import openai
@@ -143,6 +144,62 @@ def test_postcommit_passes_session_bank_and_identities_to_restore(monkeypatch):
         "policy_fingerprint MUST be passed - without it the bank rejects "
         "the entry as POLICY_MISMATCH."
     )
+
+
+def test_postcommit_restore_runs_as_bank_maintenance(monkeypatch):
+    """The postcommit's own restore must not refresh the source
+    entry's recency, or per-session retention evicts a sibling lineage."""
+    maintenance_depth = []
+
+    class _PromptState:
+        trunk_cache = "cache"
+        logits = "logits"
+        hidden = "hidden"
+        committed_mtp_cache = None
+
+    class _Bank:
+        depth = 0
+
+        @contextmanager
+        def maintenance_reads(self):
+            self.depth += 1
+            try:
+                yield
+            finally:
+                self.depth -= 1
+
+        def put(self, **_kwargs):
+            return SimpleNamespace(prefix_len=5, nbytes=42, token_hash="h")
+
+    bank = _Bank()
+
+    def fake_restore_or_prefill(*_args, **_kwargs):
+        maintenance_depth.append(bank.depth)
+        return _PromptState()
+
+    monkeypatch.setattr(
+        openai, "restore_or_prefill_prompt_state", fake_restore_or_prefill
+    )
+    monkeypatch.setattr(openai, "snapshot_cache", lambda c: c)
+    monkeypatch.setattr(openai, "_encode_messages", lambda *a, **k: [10, 11, 12, 13, 14])
+    monkeypatch.setattr(
+        openai,
+        "_history_ids_for_postcommit",
+        lambda *a, **k: ([10, 11, 12, 13, 14], None),
+    )
+
+    result = openai._store_retokenized_history_snapshot(
+        _make_state(bank=bank),
+        session_id="session-A",
+        messages=[],
+        assistant_content="ok",
+        thinking_enabled=False,
+        policy_fingerprint="policy-fp",
+    )
+
+    assert result["stored"] is True, result
+    assert maintenance_depth == [1]
+    assert bank.depth == 0
 
 
 def test_postcommit_propagates_observability_fields(monkeypatch):

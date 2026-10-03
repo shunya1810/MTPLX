@@ -1,9 +1,10 @@
 """SSD cold-tier defaults accepted from PR #496 (Dizzler7).
 
 The RAM-tiered SSD cap stays 32 GiB on a 64 GB Mac unless the disk has room
-to spare (>= 150 GiB free lifts it to the 100 GiB big-machine default); the
-effective cap is still min(cap, free/4) at write time, so the lift only
-matters on disks with >= 400 GiB free. The hourly SSD write budget default
+to spare (>= 150 GiB free lifts it to the 100 GiB big-machine default); at
+write time the effective cap is still bounded by the free disk (normally a
+quarter of the space the tier can use), so the lift only matters on disks
+with >= 400 GiB free. The hourly SSD write budget default
 is 128 GiB (was 64): a deep multi-turn session dedupes most blocks, but the
 first snapshot of several long conversations in one hour could exceed 64.
 """

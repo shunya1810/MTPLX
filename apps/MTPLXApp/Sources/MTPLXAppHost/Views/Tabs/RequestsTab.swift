@@ -101,6 +101,13 @@ struct RequestsTab: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
+            if let prefill = request.prefillState, prefill.isActive,
+               let reread = prefill.reread, reread.explainsAReread {
+                RereadExplanationText(
+                    reread: reread,
+                    ssd: SSDLowDiskNotice.from(backend.health?.ssdSessionCache)
+                )
+            }
             HStack(spacing: 14) {
                 Label(tr("%@ prompt tok", Format.integer(request.promptTokens)),
                       systemImage: "text.alignleft")

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 import json
 import logging
 import os
@@ -30,6 +30,7 @@ from .codec import (
     payload_supports_prefix_decode,
     snapshot_supports_prefix_decode,
 )
+from .disk_budget import DISK_FLOOR_BYTES, DISK_FULL, DiskBudget, disk_budget
 from .reconcile import (
     DEFAULT_COLD_TIER_DIR,
     ReconcileReport,
@@ -142,6 +143,12 @@ class PendingWrite:
     # Estimated bytes this write pins in memory until the writer drains it
     # (deferred payloads hold live KV arrays; encoded ones hold the buffers).
     pinned_nbytes: int = 0
+    # Incremental encode (MTPLX_SSD_INCREMENTAL_ENCODE): names referenced to
+    # blobs the store already holds ({"sha256", "nbytes"}, no bytes here),
+    # the content key of every fingerprinted name, and the memo to update.
+    reused_blobs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    fingerprints: dict[str, tuple] = field(default_factory=dict)
+    memo_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -174,7 +181,13 @@ class ColdPrefixRestoreRecord:
 
 
 GIB = 1024**3
-LOW_DISK_FLOOR_BYTES = 10 * GIB
+# Free disk the tier never writes into (the policy lives in .disk_budget).
+LOW_DISK_FLOOR_BYTES = DISK_FLOOR_BYTES
+
+# _install_entry outcomes.
+_INSTALL_INSTALLED = "installed"
+_INSTALL_PRESENT = "present"  # the same entry was already in the manifest
+_INSTALL_FAILED = "failed"
 
 
 def detect_total_ram_bytes() -> int | None:
@@ -298,6 +311,11 @@ def block_aligned_prefix_len(matched_tokens: int, *, block_size: int) -> int:
     block = max(1, int(block_size))
     matched = max(0, int(matched_tokens))
     return (matched // block) * block
+
+
+# Ranked SSD rows a prefix lookup opens before it gives up: each refusal
+# costs only its payload.json read.
+_PREFIX_BOUNDARY_ROWS_TRIED = 4
 
 
 def _payload_boundary_at_or_below(
@@ -427,6 +445,25 @@ class SessionBankColdTier:
         self._encode_yield_enabled = _env_flag(
             "MTPLX_SSD_ENCODE_FOREGROUND_YIELD", default=True
         )
+        # Incremental encode (opt-in, MTPLX_SSD_INCREMENTAL_ENCODE=1): each
+        # agent turn re-encodes the whole session on the model-owner thread
+        # (eval + host copy of every KV block) and the writer re-hashes every
+        # blob, although only the new tail is new on disk. With this on,
+        # put_entry fingerprints every KV block on the GPU (one reduction per
+        # tensor) and references a block whose content key matches the
+        # session's last completed write instead of capturing it. Off by
+        # default: the fingerprint is not a content identity. Flipping the
+        # signs of any two float32 elements leaves both of its sums unchanged,
+        # so a changed tensor can borrow its predecessor's blob and restore
+        # the wrong state (tests/test_cold_tier_incremental_encode.py).
+        self._incremental_encode = _env_flag(
+            "MTPLX_SSD_INCREMENTAL_ENCODE", default=False
+        )
+        # session_id -> {content key: {"sha256", "nbytes"}} of the newest
+        # completed write; written by the writer thread, read at encode.
+        self._block_memos: OrderedDict[str, dict[tuple, dict[str, Any]]] = OrderedDict()
+        self._block_memos_lock = threading.Lock()
+        self._block_memos_max = 16
         self._stop = threading.Event()
         self._base_lock = threading.RLock()
         self._disk_usage_lock = threading.Lock()
@@ -450,6 +487,12 @@ class SessionBankColdTier:
         # the orphan cleanup consults these before deleting anything.
         self._inflight_entry_dirs: Counter[str] = Counter()
         self._inflight_blob_hashes: Counter[str] = Counter()
+        # Disk bytes that admitted writes may still add, guarded by
+        # _base_lock. A write reserves before its first blob and releases
+        # once its manifest row is installed or it gives up, so two writers
+        # (the owner-thread spill and the writer thread) cannot both spend
+        # the same free space above the floor.
+        self._reserved_bytes = 0
         self._stats_lock = threading.Lock()
         self._stats: dict[str, int | float | str | bool | None] = {
             "format_version": COLD_TIER_FORMAT_VERSION,
@@ -465,6 +508,9 @@ class SessionBankColdTier:
             "skipped_too_short": 0,
             "skipped_queue_full": 0,
             "skipped_size_cap": 0,
+            # The disk above the floor had no room for this write; the copy
+            # already saved was kept.
+            "skipped_no_disk_room": 0,
             "skipped_serialize_error": 0,
             "deduped_blob_hits": 0,
             "entries_evicted": 0,
@@ -478,6 +524,12 @@ class SessionBankColdTier:
             "orphan_cleanup_disk_bytes_deleted": 0,
             "orphan_cleanup_last_s": 0.0,
             "last_write_s": None,
+            # The newest write that did not land: {"reason", "message",
+            # "prefix_len", "at_s"}, the message in plain words.
+            "last_write_skip": None,
+            # Post-install evictions put off because a request arrived; the
+            # next write settles the store back under its cap.
+            "settle_deferred": 0,
             "last_restore_s": None,
             "last_miss_reason": None,
             "last_archive_path": None,
@@ -492,6 +544,11 @@ class SessionBankColdTier:
             "writer_foreground_pauses": 0,
             "writer_foreground_pause_s": 0.0,
             "writer_pause_expired_busy": 0,
+            "incremental_encode": self._incremental_encode,
+            "incremental_encodes": 0,
+            "incremental_reused_blobs": 0,
+            "incremental_reused_bytes": 0,
+            "incremental_missing_blobs": 0,
         }
         self._ensure_store()
         self._writer = threading.Thread(
@@ -568,6 +625,13 @@ class SessionBankColdTier:
         # corrupt persisted sessions that degrade on every restore. Bytes are
         # captured at snapshot time; the writer thread is pure file IO.
         should_abort = self.encode_should_abort()
+        memo_key: str | None = None
+        reuse: dict[tuple, dict[str, Any]] | None = None
+        if self._incremental_encode:
+            session_id = getattr(entry, "session_id", None)
+            memo_key = str(session_id) if session_id else None
+            # An empty memo still fingerprints, so the next turn can reuse.
+            reuse = dict(self._block_memo(memo_key))
         try:
             encoded = encode_payload(
                 cache_snapshot=getattr(entry, "cache_snapshot"),
@@ -579,6 +643,7 @@ class SessionBankColdTier:
                 block_size=self.block_size,
                 should_abort=should_abort,
                 on_unit=self._observe_encode_unit,
+                reuse=reuse,
             )
         except ColdEncodeInterrupted:
             self._release_pending(estimated_nbytes)
@@ -610,8 +675,12 @@ class SessionBankColdTier:
         metadata = self._metadata_for_entry(
             entry,
             capabilities=capabilities or (),
-            payload_nbytes=encoded.nbytes,
+            payload_nbytes=encoded.nbytes + encoded.reused_nbytes,
         )
+        if encoded.reused:
+            self._inc("incremental_encodes")
+            self._inc("incremental_reused_blobs", len(encoded.reused))
+            self._inc("incremental_reused_bytes", encoded.reused_nbytes)
         pending = PendingWrite(
             entry_id=str(metadata["entry_id"]),
             token_ids=token_ids,
@@ -619,6 +688,9 @@ class SessionBankColdTier:
             payload_spec=encoded.spec,
             tensors=encoded.tensors,
             pinned_nbytes=max(estimated_nbytes, int(encoded.nbytes)),
+            reused_blobs=encoded.reused,
+            fingerprints=encoded.fingerprints,
+            memo_key=memo_key,
         )
         try:
             self._queue.put_nowait(pending)
@@ -665,7 +737,7 @@ class SessionBankColdTier:
         """One console line per session when a spill is refused for size.
 
         skipped_size_cap was a silent in-memory counter — a session bigger
-        than min(cap, free_disk/4) lost durability with no trace, and the
+        than the effective cap lost durability with no trace, and the
         user's next restart paid a full re-prefill with nothing to explain
         it (the 2026-08-27 48G-sim finding: a 4 TB disk at 28 GiB free
         capped the lane at ~7 GiB and every 100k+ session skipped mutely,
@@ -688,13 +760,15 @@ class SessionBankColdTier:
             free_gib = -1.0
         logger.warning(
             "SessionBank SSD spill skipped for session %s: entry ~%.1f GiB "
-            "exceeds the effective cap %.1f GiB (min of configured cap and "
-            "free_disk/4; free disk %.1f GiB). The session stays warm in RAM "
-            "but will re-prefill after a restart. Free disk space to restore "
-            "durability for sessions this large.",
+            "exceeds the effective cap %.1f GiB (the configured cap, or what "
+            "free disk above the %d GiB floor allows; free disk %.1f GiB). "
+            "The session stays warm in RAM but will re-prefill after a "
+            "restart. Free disk space or raise the cap to restore durability "
+            "for sessions this large.",
             session_id or "<anon>",
             estimated / GIB,
             effective_cap / GIB,
+            LOW_DISK_FLOOR_BYTES // GIB,
             free_gib,
         )
 
@@ -722,6 +796,14 @@ class SessionBankColdTier:
         The on-disk result is byte-compatible with put_entry — same
         content-addressed blobs, same payload.json shape, same manifest
         row — so lookups and restores cannot tell the paths apart.
+
+        Replacement is a transaction, in this order: reserve the disk the
+        new copy may need, write its blobs, install its manifest row, and
+        only then retire older entries for the cap. The copy a restore
+        would use today stays whole until its successor is installed, so a
+        failed or interrupted write, a full disk or a killed process leaves
+        one restorable copy (2026-09-29: evicting first left none between
+        20:55 and 20:56, and a 138K request had nothing to restore).
         """
         if self.mode == "off":
             return False
@@ -746,35 +828,11 @@ class SessionBankColdTier:
         # Orphans that price it over the cap are reclaimed in the background
         # and are not charged to this spill meanwhile.
         self._reclaim_orphans_if_over_cap(estimated, inline=False)
-        with self._base_lock:
-            self._ensure_store()
-            if final_dir.exists():
-                if self._entry_in_manifest(entry_id):
-                    self._touch_entry(entry_id)
-                    return True
-                self._archive_orphan_entry_dir(final_dir, entry_id)
-            effective_cap, budget_block = self._effective_write_budget()
-            if budget_block is not None:
-                self._inc("skipped_low_disk")
-                with self._stats_lock:
-                    self._stats["low_disk_writes_disabled"] = True
-                logger.warning(
-                    "SessionBank SSD spill disabled (%s): free disk below %d GiB",
-                    budget_block,
-                    LOW_DISK_FLOOR_BYTES // GIB,
-                )
-                return False
-            with self._stats_lock:
-                self._stats["low_disk_writes_disabled"] = False
-                self._stats["effective_max_bytes"] = int(effective_cap)
-            if estimated > effective_cap:
-                self._inc("skipped_size_cap")
-                self._warn_spill_size_capped(entry, estimated, effective_cap)
-                return False
+
         # The owner thread yields back to the scheduler rather than waiting
         # behind foreground work. In particular, never pause with _base_lock
         # held: a foreground restore may need that same lock.
-        def yield_eviction() -> None:
+        def yield_to_foreground() -> None:
             if self._stop.is_set() or (
                 self._encode_yield_enabled
                 and self.foreground_busy is not None
@@ -783,23 +841,39 @@ class SessionBankColdTier:
                 raise ColdEncodeInterrupted()
 
         try:
-            room = self._evict_until_room(
-                estimated, cap_bytes=effective_cap, on_yield=yield_eviction
-            )
+            # Before anything is reserved or claimed: a spill that would
+            # yield at its first tensor should not hold disk it never uses.
+            yield_to_foreground()
         except ColdEncodeInterrupted:
             self._inc("encode_yields_foreground")
             if raise_on_yield:
                 raise
             return False
-        if not room:
-            self._inc("skipped_size_cap")
-            self._warn_spill_size_capped(entry, estimated, effective_cap)
-            return False
         with self._base_lock:
+            self._ensure_store()
+            if final_dir.exists():
+                if self._entry_in_manifest(entry_id):
+                    self._touch_entry(entry_id)
+                    return True
+                self._archive_orphan_entry_dir(final_dir, entry_id)
+            # A streamed payload's physical size is known only once it is
+            # encoded, so the whole logical size is reserved: an upper
+            # bound, because blobs the store already holds (the entry this
+            # one replaces, kept until it is installed) are deduplicated.
+            budget = self._admit_write_room(
+                estimated,
+                entry_nbytes=estimated,
+                prefix_len=len(token_ids),
+                warn_size_cap=lambda cap: self._warn_spill_size_capped(
+                    entry, estimated, cap
+                ),
+            )
+            if budget is None:
+                return False
             self._claim_inflight(entry_dirs=(entry_dir_rel,))
         claimed_digests: set[str] = set()
         try:
-            return self._spill_entry_admitted(
+            stored = self._spill_entry_admitted(
                 entry,
                 metadata=metadata,
                 entry_id=entry_id,
@@ -811,6 +885,12 @@ class SessionBankColdTier:
             )
         finally:
             self._release_inflight(entry_dirs=(entry_dir_rel,), digests=claimed_digests)
+            self._release_reserved(estimated)
+        if stored:
+            # Only now, with the new entry installed, may anything older
+            # (the entry it replaces included) be retired for the cap.
+            self._settle_to_cap(keep=entry_id, on_yield=yield_to_foreground)
+        return stored
 
     def _claim_inflight(
         self, *, entry_dirs: tuple[str, ...] = (), digests: set[str] | None = None
@@ -923,6 +1003,12 @@ class SessionBankColdTier:
             if raise_on_yield:
                 raise
             return False
+        except OSError as exc:
+            # A blob write the disk refused (ENOSPC, EIO). Nothing of this
+            # entry is restorable yet; its blobs are orphans for the
+            # cleanup, and the copy it was replacing is untouched.
+            self._record_write_failure(entry_id, len(token_ids), exc)
+            return False
         except Exception as exc:
             self._inc("skipped_serialize_error")
             logger.warning(
@@ -954,25 +1040,18 @@ class SessionBankColdTier:
             "tensor_names": sorted(tensor_blobs),
             "tensor_blobs": tensor_blobs,
         }
-        with self._base_lock:
-            if final_dir.exists():
-                if self._entry_in_manifest(entry_id):
-                    self._touch_entry(entry_id)
-                    return True
-                self._archive_orphan_entry_dir(final_dir, entry_id)
-            temp_parent = self.base_dir / "entries" / entry_hash_prefix
-            temp_parent.mkdir(parents=True, exist_ok=True)
-            temp_dir = Path(
-                tempfile.mkdtemp(prefix=f".{entry_id}.tmp-", dir=temp_parent)
-            )
-            (temp_dir / "payload.json").write_text(
-                json.dumps(payload, sort_keys=True, separators=(",", ":")),
-                encoding="utf-8",
-            )
-            temp_dir.rename(final_dir)
-            metadata["entry_dir"] = str(final_dir.relative_to(self.base_dir))
-            self._insert_manifest(metadata)
-            self._invalidate_disk_usage_cache()
+        outcome = self._install_entry(
+            entry_id=entry_id,
+            entry_hash_prefix=entry_hash_prefix,
+            final_dir=final_dir,
+            payload_text=json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            metadata=metadata,
+            prefix_len=len(token_ids),
+        )
+        if outcome == _INSTALL_FAILED:
+            return False
+        if outcome == _INSTALL_PRESENT:
+            return True
         self._inc("writes_completed")
         self._inc("spill_writes_completed")
         with self._stats_lock:
@@ -1099,8 +1178,7 @@ class SessionBankColdTier:
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
             )
-            best: tuple[sqlite3.Row, int, str, int] | None = None
-            best_key: tuple[int, int, int] | None = None
+            ranked: list[tuple[tuple[int, int, int], sqlite3.Row, int, str, int]] = []
             for row in rows:
                 prefix = tuple(int(token) for token in json.loads(str(row["token_ids_json"])))
                 if not prefix:
@@ -1128,15 +1206,21 @@ class SessionBankColdTier:
                     restore_kind = "block_prefix"
                 else:
                     continue
-                candidate_key = (candidate_matched, int(matched), len(prefix))
-                if best_key is None or candidate_key > best_key:
-                    best = (row, candidate_matched, restore_kind, len(prefix))
-                    best_key = candidate_key
-            if best is None:
+                ranked.append(
+                    (
+                        (candidate_matched, int(matched), len(prefix)),
+                        row,
+                        candidate_matched,
+                        restore_kind,
+                        len(prefix),
+                    )
+                )
+            if not ranked:
                 self._inc("restore_misses")
                 self._set_last_miss("ssd_prefix_miss")
                 return None
-            if int(min_useful_matched_tokens) > 0 and best[1] < int(
+            ranked.sort(key=lambda item: item[0], reverse=True)
+            if int(min_useful_matched_tokens) > 0 and ranked[0][2] < int(
                 min_useful_matched_tokens
             ):
                 # The caller's best RAM candidate already matches more
@@ -1150,71 +1234,83 @@ class SessionBankColdTier:
                 self._inc("prefix_lookups_not_better_than_ram")
                 self._set_last_miss("ssd_prefix_not_better_than_ram")
                 return None
-            if resident_duplicates:
-                dup = resident_duplicates.get(str(best[0]["token_hash"]))
-                if dup is not None and int(dup.get("prefix_len") or -1) == int(
-                    best[3]
+            # Best first; a row that cannot serve (a hybrid entry with no
+            # recurrent boundary at or below its match, a format or epoch
+            # mismatch) is refused by _restore_row before any tensor is read,
+            # and the next one is tried: a new conversation shares its system
+            # prompt with every older one, and the longest of them is often a
+            # conversation without a boundary there.
+            for _key, row, candidate_matched, restore_kind, prefix_len in ranked[
+                :_PREFIX_BOUNDARY_ROWS_TRIED
+            ]:
+                if candidate_matched < int(min_useful_matched_tokens):
+                    # Ranked best first: this row and every later one are
+                    # under the caller's RAM match.
+                    self._inc("prefix_lookups_not_better_than_ram")
+                    self._set_last_miss("ssd_prefix_not_better_than_ram")
+                    return None
+                if resident_duplicates and self._shadowed_by_resident_duplicate(
+                    row, prefix_len, resident_duplicates
                 ):
-                    try:
-                        row_caps = {
-                            str(c)
-                            for c in json.loads(
-                                str(best[0]["capabilities_json"] or "[]")
-                            )
-                        }
-                    except Exception:
-                        # Unknown capabilities: assume the row is maximal so
-                        # only a fully-covered resident twin may shadow it.
-                        row_caps = {"mtp_full"}
-                    row_has_mtp = (
-                        "mtp_full" in row_caps
-                        or best[0]["mtp_snapshot_epoch"] is not None
+                    self._inc("prefix_lookups_shadowed_by_ram")
+                    self._set_last_miss("ssd_prefix_shadowed_by_resident_duplicate")
+                    return None
+                if restore_kind == "block_prefix":
+                    # The block-aligned length only ranks candidates; the
+                    # tokens match exactly up to the common prefix, so any
+                    # persisted recurrent boundary inside it is a valid
+                    # restore point (omp: boundary 19,337, block edge 19,200).
+                    candidate_matched = min(
+                        common_prefix_len(
+                            tokens,
+                            tuple(int(t) for t in json.loads(str(row["token_ids_json"]))),
+                        ),
+                        int(prefix_len),
+                        len(tokens),
                     )
-                    if (not row_has_mtp) or bool(dup.get("has_mtp_history")):
-                        self._inc("prefix_lookups_shadowed_by_ram")
-                        self._set_last_miss(
-                            "ssd_prefix_shadowed_by_resident_duplicate"
-                        )
-                        return None
-            restore_tokens = int(best[1])
-            if best[2] == "block_prefix":
-                # The block-aligned length only ranks candidates. The tokens
-                # themselves match exactly up to the common prefix, so any
-                # persisted recurrent boundary inside it is a valid restore
-                # point: an agent's system prompt ends a few dozen tokens past
-                # a block edge (omp: boundary 19,337, block edge 19,200), and
-                # aligning first fell back to the 18,432 boundary and
-                # re-prefilled ~1K tokens (TTFT 10.7 s instead of ~1.5 s).
-                restore_tokens = min(
-                    common_prefix_len(
-                        tokens,
-                        tuple(int(t) for t in json.loads(str(best[0]["token_ids_json"]))),
-                    ),
-                    best[3],
-                    len(tokens),
+                record = self._restore_row(
+                    row,
+                    tokens,
+                    started_s=started,
+                    require_exact_prefix=False,
+                    include_gdn_boundaries=True,
+                    prefix_restore_tokens=int(candidate_matched),
                 )
-            record = self._restore_row(
-                best[0],
-                tokens,
-                started_s=started,
-                require_exact_prefix=False,
-                include_gdn_boundaries=True,
-                prefix_restore_tokens=restore_tokens,
-            )
-            if record is None:
-                return None
-            return ColdPrefixRestoreRecord(
-                record=record,
-                matched_tokens=restore_tokens,
-                restore_kind=str(best[2]),
-            )
+                if record is not None:
+                    return ColdPrefixRestoreRecord(
+                        record=record,
+                        matched_tokens=int(candidate_matched),
+                        restore_kind=str(restore_kind),
+                    )
+            return None
         except Exception as exc:
             self._inc("restore_failures")
             self._set_last_miss(f"ssd_restore_error:{type(exc).__name__}")
             logger.warning("SessionBank SSD prefix-boundary restore failed: %s: %s", type(exc).__name__, exc)
             return None
 
-    def _manifest_stats_row(self) -> tuple[int, int, int, int]:
+    @staticmethod
+    def _shadowed_by_resident_duplicate(
+        row: sqlite3.Row,
+        prefix_len: int,
+        resident_duplicates: dict[str, dict[str, Any]],
+    ) -> bool:
+        """Whether a RAM entry the caller can serve holds this row's tokens
+        and at least its committed-MTP coverage (``lookup_prefix_boundary``)."""
+
+        dup = resident_duplicates.get(str(row["token_hash"]))
+        if dup is None or int(dup.get("prefix_len") or -1) != int(prefix_len):
+            return False
+        try:
+            row_caps = {str(c) for c in json.loads(str(row["capabilities_json"] or "[]"))}
+        except Exception:
+            # Unknown capabilities: assume the row is maximal so only a
+            # fully-covered resident twin may shadow it.
+            row_caps = {"mtp_full"}
+        row_has_mtp = "mtp_full" in row_caps or row["mtp_snapshot_epoch"] is not None
+        return (not row_has_mtp) or bool(dup.get("has_mtp_history"))
+
+    def _manifest_stats_row(self) -> tuple[int, int, int, int, int]:
         """The stats() aggregate, opening the manifest only when it changed.
 
         Before 2.8.2 every stats() call — i.e. every /health and dashboard
@@ -1243,9 +1339,16 @@ class SessionBankColdTier:
                 "THEN logical_nbytes ELSE nbytes END), 0), "
                 "COALESCE(SUM(CASE WHEN physical_nbytes > 0 "
                 "THEN physical_nbytes ELSE nbytes END), 0), "
-                "COALESCE(SUM(deduped_nbytes), 0) FROM entries"
+                "COALESCE(SUM(deduped_nbytes), 0), "
+                "COALESCE(MAX(max(nbytes, logical_nbytes)), 0) FROM entries"
             ).fetchone()
-        row = (int(fetched[0]), int(fetched[1]), int(fetched[2]), int(fetched[3]))
+        row = (
+            int(fetched[0]),
+            int(fetched[1]),
+            int(fetched[2]),
+            int(fetched[3]),
+            int(fetched[4]),
+        )
         with self._manifest_stats_lock:
             self._manifest_stats_cache = {
                 "generation": generation,
@@ -1310,6 +1413,31 @@ class SessionBankColdTier:
                 managed_disk_bytes - database_disk_bytes - manifest_bytes_at_scan,
             )
             stats["orphan_cleanup_running"] = self._orphan_cleanup_is_running()
+            # The disk as the next write will see it, live on every read (a
+            # statvfs; the manifest figures are the cached aggregate above):
+            # whether the cache can still hold two copies of the largest
+            # conversation above the free-disk floor, in plain words for the
+            # app. Field names added here are new; existing ones keep their
+            # meaning (low_disk_writes_disabled is the last write's verdict).
+            # One int read, no lock: /health must never wait behind a writer.
+            reserved = int(self._reserved_bytes)
+            budget = disk_budget(
+                configured_max_bytes=self.max_bytes,
+                free_bytes=self._free_disk_bytes(),
+                store_bytes=int(row[2]) + self._untracked_bytes_estimate(),
+                largest_session_bytes=int(row[4]),
+                reserved_bytes=reserved,
+                floor_bytes=LOW_DISK_FLOOR_BYTES,
+            )
+            stats["effective_max_bytes"] = int(budget.cap_bytes)
+            stats["disk_state"] = budget.state
+            stats["low_disk"] = bool(budget.low)
+            stats["disk_message"] = budget.message()
+            stats["disk_free_bytes"] = int(budget.free_bytes)
+            stats["disk_floor_bytes"] = int(budget.floor_bytes)
+            stats["disk_room_bytes"] = int(budget.room_bytes)
+            stats["largest_session_bytes"] = int(budget.largest_session_bytes)
+            stats["reserved_write_bytes"] = reserved
             # Reclaimable garbage is the part of untracked_* a cleanup can
             # free; the rest is live blobs booked under evicted entries.
             if (
@@ -1405,15 +1533,9 @@ class SessionBankColdTier:
             pass
         self._writer.join(timeout=5.0)
 
-    def _metadata_for_entry(
-        self,
-        entry: Any,
-        *,
-        capabilities: list[str] | tuple[str, ...],
-        payload_nbytes: int,
-    ) -> dict[str, Any]:
-        token_ids = tuple(int(token) for token in getattr(entry, "token_ids"))
-        identity = {
+    @staticmethod
+    def _entry_identity(entry: Any) -> dict[str, Any]:
+        return {
             "model_path": str(getattr(entry, "model_path", "")),
             "mtp_enabled": bool(getattr(entry, "mtp_enabled", False)),
             "hidden_variant": getattr(entry, "hidden_variant", None),
@@ -1423,12 +1545,42 @@ class SessionBankColdTier:
             "policy_fingerprint": getattr(entry, "policy_fingerprint", None),
             "session_id": getattr(entry, "session_id", None),
         }
+
+    def entry_id_for(self, entry: Any) -> str:
+        """The id a bank entry is written under: its tokens, identity and
+        commit epochs, so the same entry always maps to the same record."""
+
+        token_ids = tuple(int(token) for token in getattr(entry, "token_ids"))
         digest = hashlib.sha256()
         digest.update(token_hash(token_ids).encode("utf-8"))
-        digest.update(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        digest.update(
+            json.dumps(
+                self._entry_identity(entry), sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        )
         digest.update(str(int(getattr(entry, "snapshot_epoch", 0) or 0)).encode("ascii"))
         digest.update(str(int(getattr(entry, "mtp_snapshot_epoch", 0) or 0)).encode("ascii"))
-        entry_id = digest.hexdigest()[:32]
+        return digest.hexdigest()[:32]
+
+    def is_published(self, entry: Any) -> bool:
+        """Whether a restore can find this entry on disk: its manifest row
+        has landed. A write still in the writer's queue, or one that failed,
+        is not published; only the manifest row makes a record restorable."""
+
+        if self.mode == "off":
+            return False
+        return self._entry_in_manifest(self.entry_id_for(entry))
+
+    def _metadata_for_entry(
+        self,
+        entry: Any,
+        *,
+        capabilities: list[str] | tuple[str, ...],
+        payload_nbytes: int,
+    ) -> dict[str, Any]:
+        token_ids = tuple(int(token) for token in getattr(entry, "token_ids"))
+        identity = self._entry_identity(entry)
+        entry_id = self.entry_id_for(entry)
         block_identity = {
             key: value
             for key, value in identity.items()
@@ -1649,11 +1801,16 @@ class SessionBankColdTier:
         tensor_blobs, missing_blob_bytes = self._plan_tensor_blobs(
             pending.tensors, pause_for_foreground=True
         )
+        # Incremental encode: referenced blobs carry their digest already.
+        # They are claimed with the rest below and must exist on disk then.
+        tensor_blobs.update(
+            {name: dict(blob) for name, blob in pending.reused_blobs.items()}
+        )
         payload = {
             "format_version": COLD_TIER_FORMAT_VERSION,
             "metadata": pending.metadata,
             "payload_spec": pending.payload_spec,
-            "tensor_names": sorted(pending.tensors),
+            "tensor_names": sorted(set(pending.tensors) | set(pending.reused_blobs)),
             "tensor_blobs": tensor_blobs,
         }
         payload_text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -1663,13 +1820,25 @@ class SessionBankColdTier:
         # against (an orphan until its row lands) is kept, not rewritten.
         self._claim_inflight(entry_dirs=(entry_dir_rel,), digests=digests)
         try:
+            # The claim above keeps eviction and orphan cleanup away from
+            # these digests, so a blob seen here stays until the row lands.
+            # One gone already (its entries were evicted) means this write
+            # lacks bytes it needs: skip it and let the next turn encode in
+            # full.
+            if any(
+                not self._blob_path(str(blob["sha256"])).exists()
+                for blob in pending.reused_blobs.values()
+            ):
+                self._inc("incremental_missing_blobs")
+                self._drop_block_memo(pending.memo_key)
+                return False
             # Phase 0.5 (no lock): if the snapshot prices the store over the
             # cap and part of that is reclaimable garbage, reclaim it now, on
             # this thread. A walk here delays durability, never a request,
             # and it frees room before the gate below would evict live
             # entries for it.
             self._reclaim_orphans_if_over_cap(pending_bytes, inline=True)
-            return self._write_pending_admitted(
+            wrote = self._write_pending_admitted(
                 pending,
                 tensor_blobs=tensor_blobs,
                 payload_text=payload_text,
@@ -1677,6 +1846,9 @@ class SessionBankColdTier:
                 final_dir=final_dir,
                 entry_hash_prefix=entry_hash_prefix,
             )
+            if wrote and pending.fingerprints:
+                self._store_block_memo(pending, tensor_blobs)
+            return wrote
         finally:
             self._release_inflight(entry_dirs=(entry_dir_rel,), digests=digests)
 
@@ -1690,71 +1862,101 @@ class SessionBankColdTier:
         final_dir: Path,
         entry_hash_prefix: str,
     ) -> bool:
-        # Phase 1 (under lock): admission gates — no bulk IO, no hashing.
+        logical_bytes = sum(int(item["nbytes"]) for item in tensor_blobs.values())
+        entry_nbytes = max(int(pending.metadata.get("nbytes") or 0), int(logical_bytes))
+        prefix_len = int(pending.metadata["prefix_len"])
+        # Phase 1 (under lock): admission and reservation — no bulk IO, no
+        # hashing, and nothing evicted. pending_bytes is exact here: the
+        # blobs this payload does not share with the store (the entry it
+        # replaces stays, so its blobs stay deduplicated) plus payload.json.
         with self._base_lock:
-            effective_cap, budget_block = self._effective_write_budget()
-            if budget_block is not None:
-                self._inc("skipped_low_disk")
-                with self._stats_lock:
-                    self._stats["low_disk_writes_disabled"] = True
-                logger.warning(
-                    "SessionBank SSD writes disabled (%s): free disk below %d GiB",
-                    budget_block,
-                    LOW_DISK_FLOOR_BYTES // GIB,
-                )
+            budget = self._admit_write_room(
+                pending_bytes, entry_nbytes=entry_nbytes, prefix_len=prefix_len
+            )
+            if budget is None:
                 return False
-            with self._stats_lock:
-                self._stats["low_disk_writes_disabled"] = False
-                self._stats["effective_max_bytes"] = int(effective_cap)
-            logical_bytes = sum(int(item["nbytes"]) for item in tensor_blobs.values())
-            if pending_bytes > effective_cap:
-                self._inc("skipped_size_cap")
-                logger.warning(
-                    "SessionBank SSD size cap skipped entry_id=%s prefix_len=%d pending=%d max=%d",
-                    pending.entry_id,
-                    int(pending.metadata["prefix_len"]),
-                    pending_bytes,
-                    self.max_bytes,
-                )
-                return False
-        if not self._evict_until_room(pending_bytes, cap_bytes=effective_cap):
-            self._inc("skipped_size_cap")
-            return False
-        # Phase 2 (no lock): pause-aware bulk blob writes. Blobs are
-        # content-addressed, atomic (tmp+rename), idempotent, and invisible
-        # to restores until the manifest row lands in phase 3 — a crash or a
-        # skip here leaves only orphan blobs, which the existing orphan
-        # cleanup already handles. Pausing per blob bounds the
-        # bandwidth-contention window to one blob write (gate254-c4s: an
-        # entry-granular pause left the 2.5 GB write straddling the arrival).
-        for name, raw in pending.tensors.items():
-            self._pause_for_foreground()
-            if self._stop.is_set():
-                return False
-            blob = tensor_blobs[name]
-            if self._write_blob(blob["sha256"], raw):
-                continue
-            self._inc("deduped_blob_hits")
-        # Phase 3 (under lock): entry payload + manifest finalize.
-        with self._base_lock:
-            if final_dir.exists():
-                if self._entry_in_manifest(pending.entry_id):
-                    self._touch_entry(pending.entry_id)
-                    return True
-                self._archive_orphan_entry_dir(final_dir, pending.entry_id)
-            temp_parent = self.base_dir / "entries" / entry_hash_prefix
-            temp_parent.mkdir(parents=True, exist_ok=True)
-            temp_dir = Path(tempfile.mkdtemp(prefix=f".{pending.entry_id}.tmp-", dir=temp_parent))
-            (temp_dir / "payload.json").write_text(payload_text, encoding="utf-8")
-            temp_dir.rename(final_dir)
+        try:
+            # Phase 2 (no lock): pause-aware bulk blob writes. Blobs are
+            # content-addressed, atomic (tmp+rename), idempotent, and
+            # invisible to restores until the manifest row lands in phase 3
+            # — a crash or a skip here leaves only orphan blobs, which the
+            # existing orphan cleanup already handles. Pausing per blob
+            # bounds the bandwidth-contention window to one blob write
+            # (gate254-c4s: an entry-granular pause left the 2.5 GB write
+            # straddling the arrival).
+            for name, raw in pending.tensors.items():
+                self._pause_for_foreground()
+                if self._stop.is_set():
+                    return False
+                blob = tensor_blobs[name]
+                try:
+                    wrote = self._write_blob(blob["sha256"], raw)
+                except OSError as exc:
+                    self._record_write_failure(pending.entry_id, prefix_len, exc)
+                    return False
+                if not wrote:
+                    self._inc("deduped_blob_hits")
             metadata = dict(pending.metadata)
-            metadata["entry_dir"] = str(final_dir.relative_to(self.base_dir))
             metadata["logical_nbytes"] = int(logical_bytes)
             metadata["physical_nbytes"] = int(pending_bytes)
             metadata["deduped_nbytes"] = max(0, int(logical_bytes) - int(pending_bytes))
-            self._insert_manifest(metadata)
-            self._invalidate_disk_usage_cache()
-            return True
+            # Phase 3 (under lock): payload directory, then the manifest
+            # row, the commit point.
+            outcome = self._install_entry(
+                entry_id=pending.entry_id,
+                entry_hash_prefix=entry_hash_prefix,
+                final_dir=final_dir,
+                payload_text=payload_text,
+                metadata=metadata,
+                prefix_len=prefix_len,
+            )
+        finally:
+            self._release_reserved(pending_bytes)
+        if outcome == _INSTALL_FAILED:
+            return False
+        # Phase 4 (no lock): only with this entry installed may older ones,
+        # the entry it replaces included, be retired for the cap.
+        self._settle_to_cap(keep=pending.entry_id)
+        return True
+
+    def _block_memo(self, memo_key: str | None) -> dict[tuple, dict[str, Any]]:
+        if memo_key is None:
+            return {}
+        with self._block_memos_lock:
+            memo = self._block_memos.get(memo_key)
+            if memo is None:
+                return {}
+            self._block_memos.move_to_end(memo_key)
+            return memo
+
+    def _drop_block_memo(self, memo_key: str | None) -> None:
+        if memo_key is None:
+            return
+        with self._block_memos_lock:
+            self._block_memos.pop(memo_key, None)
+
+    def _store_block_memo(
+        self,
+        pending: PendingWrite,
+        tensor_blobs: dict[str, dict[str, Any]],
+    ) -> None:
+        """Newest completed write per session becomes the reuse source: its
+        content keys map to the digests the manifest row now references."""
+        if pending.memo_key is None:
+            return
+        memo = {
+            key: {
+                "sha256": str(tensor_blobs[name]["sha256"]),
+                "nbytes": int(tensor_blobs[name]["nbytes"]),
+            }
+            for name, key in pending.fingerprints.items()
+            if name in tensor_blobs
+        }
+        with self._block_memos_lock:
+            self._block_memos[pending.memo_key] = memo
+            self._block_memos.move_to_end(pending.memo_key)
+            while len(self._block_memos) > self._block_memos_max:
+                self._block_memos.popitem(last=False)
 
     def _plan_tensor_blobs(
         self,
@@ -1787,16 +1989,29 @@ class SessionBankColdTier:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_name(f".{path.name}.tmp-{time.time_ns()}")
         try:
-            temp_path.write_bytes(raw)
-        except FileNotFoundError:
-            # An orphan cleanup pruned the now-empty prefix directory between
-            # the mkdir above and this write; the directory is ours to remake.
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path.write_bytes(raw)
-        try:
-            temp_path.rename(path)
-        except FileExistsError:
-            return False
+            try:
+                temp_path.write_bytes(raw)
+            except FileNotFoundError:
+                # An orphan cleanup pruned the now-empty prefix directory
+                # between the mkdir above and this write; the directory is
+                # ours to remake.
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path.write_bytes(raw)
+            try:
+                temp_path.rename(path)
+            except FileExistsError:
+                temp_path.unlink(missing_ok=True)
+                return False
+        except OSError:
+            # A write the disk refused (ENOSPC) leaves a partial temp file
+            # that would hold its bytes for the reconcile's hour-long temp
+            # grace, on exactly the disk that just ran out. It is ours and
+            # unreferenced: remove it, then report the failure.
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         return True
 
     def _evict_until_room(
@@ -1805,6 +2020,7 @@ class SessionBankColdTier:
         *,
         cap_bytes: int | None = None,
         on_yield: Callable[[], None] | None = None,
+        protect: frozenset[str] = frozenset(),
     ) -> bool:
         """Retire LRU entries, then reclaim their blobs in one paced pass.
 
@@ -1812,6 +2028,8 @@ class SessionBankColdTier:
         turn; owner-thread spills instead raise ColdEncodeInterrupted.
         Re-reading every surviving payload for every victim made a 66-entry
         eviction run for 89 seconds alongside the next two app replies.
+        ``protect`` names entries that must survive this pass (the entry a
+        write has just installed).
         """
         required = max(0, int(required_bytes))
         cap = int(self.max_bytes if cap_bytes is None else cap_bytes)
@@ -1834,6 +2052,8 @@ class SessionBankColdTier:
                 if self._stop.is_set():
                     return False
                 with self._base_lock:
+                    if str(row["entry_id"]) in protect:
+                        continue
                     # A concurrent spill may be reusing this entry. Its
                     # manifest and blobs remain protected until it commits.
                     if str(row["entry_dir"]) in self._inflight_entry_dirs:
@@ -1861,18 +2081,243 @@ class SessionBankColdTier:
                 # existing foreground-aware orphan worker after a stop.
                 self._start_orphan_cleanup()
 
-    def _effective_write_budget(self) -> tuple[int, str | None]:
-        """min(configured cap, free_disk/4), writes disabled under 10 GiB free.
-
-        Re-checked on every write (cheap statvfs); guards strangers' Macs where
-        a flat configured cap could fill the disk (kvcache-v2 P2.3)."""
+    def _free_disk_bytes(self) -> int | None:
         try:
-            free = shutil.disk_usage(self.base_dir).free
+            return int(shutil.disk_usage(self.base_dir).free)
         except Exception:
-            return self.max_bytes, None
-        if free < LOW_DISK_FLOOR_BYTES:
-            return 0, "low_disk"
-        return min(int(self.max_bytes), int(free // 4)), None
+            return None
+
+    def _largest_entry_bytes(self) -> int:
+        """Logical size of the largest entry the manifest holds."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(max(nbytes, logical_nbytes)), 0) FROM entries"
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def _disk_budget(self, *, incoming_bytes: int = 0) -> DiskBudget:
+        """What the disk allows now (the policy is in .disk_budget).
+
+        Re-read on every write (one statvfs and two manifest queries), so a
+        disk that fills or empties between turns is seen at once; it guards
+        strangers' Macs where a flat configured cap could fill the disk
+        (kvcache-v2 P2.3). ``incoming_bytes`` is the logical size of the
+        entry being written, which may be the largest conversation yet.
+        Writers call it under _base_lock, so the reservation read is exact.
+        """
+        return disk_budget(
+            configured_max_bytes=self.max_bytes,
+            free_bytes=self._free_disk_bytes(),
+            store_bytes=self._current_bytes_for_cap(),
+            largest_session_bytes=max(
+                int(incoming_bytes), self._largest_entry_bytes()
+            ),
+            reserved_bytes=self._reserved_bytes,
+            floor_bytes=LOW_DISK_FLOOR_BYTES,
+        )
+
+    def _admit_write_room(
+        self,
+        need_bytes: int,
+        *,
+        entry_nbytes: int,
+        prefix_len: int,
+        warn_size_cap: Callable[[int], None] | None = None,
+    ) -> DiskBudget | None:
+        """Admit one write and reserve the disk it may add; None skips it.
+
+        Called under _base_lock before the write's first blob. Nothing is
+        evicted here: the entries on disk, the one this write replaces
+        included, stay whole until the new entry is installed. A write that
+        does not fit is skipped with its reason recorded, keeping the copy
+        that exists instead of destroying it for one that may never land.
+        """
+        budget = self._disk_budget(incoming_bytes=entry_nbytes)
+        if budget.state == DISK_FULL:
+            self._inc("skipped_low_disk")
+            with self._stats_lock:
+                self._stats["low_disk_writes_disabled"] = True
+            self._record_write_skip("low_disk", budget.message() or "", prefix_len)
+            logger.warning(
+                "SessionBank SSD writes disabled: free disk %.1f GiB is at or "
+                "below the %d GiB floor",
+                budget.free_bytes / GIB,
+                LOW_DISK_FLOOR_BYTES // GIB,
+            )
+            return None
+        with self._stats_lock:
+            self._stats["low_disk_writes_disabled"] = False
+            self._stats["effective_max_bytes"] = int(budget.cap_bytes)
+        need = max(0, int(need_bytes))
+        entry_nbytes = max(0, int(entry_nbytes))
+        if entry_nbytes > budget.cap_bytes and not budget.cap_limited_by_disk:
+            # The configured cap cannot hold this entry even alone.
+            self._inc("skipped_size_cap")
+            self._record_write_skip(
+                "size_cap",
+                f"Not saved to the SSD cache: this conversation needs "
+                f"{entry_nbytes / GIB:.1f} GiB and the cache limit is "
+                f"{budget.cap_bytes / GIB:.1f} GiB.",
+                prefix_len,
+            )
+            if warn_size_cap is not None:
+                warn_size_cap(int(budget.cap_bytes))
+            else:
+                logger.warning(
+                    "SessionBank SSD size cap skipped prefix_len=%d nbytes=%d max=%d",
+                    int(prefix_len),
+                    entry_nbytes,
+                    int(budget.cap_bytes),
+                )
+            return None
+        if need > budget.room_bytes or entry_nbytes > budget.cap_bytes:
+            self._inc("skipped_no_disk_room")
+            self._record_write_skip(
+                "no_disk_room",
+                f"Not saved to the SSD cache: the disk has "
+                f"{budget.room_bytes / GIB:.1f} GiB it can use above the "
+                f"{budget.floor_bytes / GIB:.0f} GiB it always leaves free, "
+                f"and this save needs {max(need, entry_nbytes) / GIB:.1f} GiB. "
+                "The copy saved before it was kept.",
+                prefix_len,
+            )
+            logger.warning(
+                "SessionBank SSD write skipped, no disk room: prefix_len=%d "
+                "need=%d nbytes=%d room=%d cap=%d free=%d",
+                int(prefix_len),
+                need,
+                entry_nbytes,
+                int(budget.room_bytes),
+                int(budget.cap_bytes),
+                int(budget.free_bytes),
+            )
+            return None
+        self._reserved_bytes += need
+        return budget
+
+    def _release_reserved(self, nbytes: int) -> None:
+        with self._base_lock:
+            self._reserved_bytes = max(0, self._reserved_bytes - max(0, int(nbytes)))
+
+    def _install_entry(
+        self,
+        *,
+        entry_id: str,
+        entry_hash_prefix: str,
+        final_dir: Path,
+        payload_text: str,
+        metadata: dict[str, Any],
+        prefix_len: int,
+    ) -> str:
+        """Install a written entry: its payload directory, then its manifest row.
+
+        The row is the commit point. A restore sees an entry only once its
+        row exists, and a row always names a directory whose payload and
+        blobs are complete. When the disk refuses the payload, the rename or
+        the SQLite write, what this call created is set aside and the store
+        is as it was before the entry was written.
+        """
+        with self._base_lock:
+            if final_dir.exists():
+                if self._entry_in_manifest(entry_id):
+                    self._touch_entry(entry_id)
+                    return _INSTALL_PRESENT
+                self._archive_orphan_entry_dir(final_dir, entry_id)
+            temp_parent = self.base_dir / "entries" / entry_hash_prefix
+            temp_dir: Path | None = None
+            renamed = False
+            try:
+                temp_parent.mkdir(parents=True, exist_ok=True)
+                temp_dir = Path(
+                    tempfile.mkdtemp(prefix=f".{entry_id}.tmp-", dir=temp_parent)
+                )
+                (temp_dir / "payload.json").write_text(payload_text, encoding="utf-8")
+                temp_dir.rename(final_dir)
+                renamed = True
+                metadata["entry_dir"] = str(final_dir.relative_to(self.base_dir))
+                self._insert_manifest(metadata)
+            except (OSError, sqlite3.Error) as exc:
+                try:
+                    if renamed:
+                        # The directory landed without its row: set it aside
+                        # so the next write of this entry starts clean.
+                        self._archive_orphan_entry_dir(final_dir, entry_id)
+                    elif temp_dir is not None:
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                except OSError as cleanup_exc:
+                    # Left for the reconcile, which removes directories no
+                    # manifest row names.
+                    logger.warning(
+                        "SessionBank SSD could not set aside the partial entry "
+                        "entry_id=%s: %s: %s",
+                        entry_id,
+                        type(cleanup_exc).__name__,
+                        cleanup_exc,
+                    )
+                self._record_write_failure(entry_id, prefix_len, exc)
+                return _INSTALL_FAILED
+            finally:
+                self._invalidate_disk_usage_cache()
+        return _INSTALL_INSTALLED
+
+    def _settle_to_cap(
+        self,
+        *,
+        keep: str,
+        on_yield: Callable[[], None] | None = None,
+    ) -> None:
+        """Retire LRU entries until the store is back under its cap.
+
+        Runs only after a write's manifest row is installed and never takes
+        that entry. The cap is re-read, since the write changed both the
+        store and the free space. A request arriving mid-pass (owner-thread
+        spills) or a failing removal leaves the store over its cap until the
+        next write settles it; the new entry is installed and restorable
+        either way.
+        """
+        with self._base_lock:
+            cap = self._disk_budget().cap_bytes
+        try:
+            self._evict_until_room(
+                0, cap_bytes=cap, on_yield=on_yield, protect=frozenset({keep})
+            )
+        except ColdEncodeInterrupted:
+            self._inc("settle_deferred")
+        except (OSError, sqlite3.Error) as exc:
+            self._inc("settle_deferred")
+            logger.warning(
+                "SessionBank SSD could not retire older entries after writing "
+                "entry_id=%s: %s: %s",
+                keep,
+                type(exc).__name__,
+                exc,
+            )
+
+    def _record_write_skip(self, reason: str, message: str, prefix_len: int) -> None:
+        with self._stats_lock:
+            self._stats["last_write_skip"] = {
+                "reason": str(reason),
+                "message": str(message),
+                "prefix_len": int(prefix_len),
+                "at_s": time.time(),
+            }
+
+    def _record_write_failure(
+        self, entry_id: str, prefix_len: int, exc: BaseException
+    ) -> None:
+        self._inc("write_failures")
+        self._record_write_skip(
+            "write_failed",
+            f"Not saved to the SSD cache: the disk refused the write "
+            f"({type(exc).__name__}: {exc}). The copy saved before it was kept.",
+            prefix_len,
+        )
+        logger.warning(
+            "SessionBank SSD write failed entry_id=%s: %s: %s",
+            entry_id,
+            type(exc).__name__,
+            exc,
+        )
 
     def _current_bytes_for_cap(self, required_bytes: int = 0) -> int:
         """Bytes the cap gate prices: the whole managed directory.
@@ -1927,9 +2372,8 @@ class SessionBankColdTier:
         reclaimable = self._reclaimable_bytes_estimate()
         if reclaimable <= 0 or self._orphan_cleanup_is_running():
             return
-        cap, budget_block = self._effective_write_budget()
-        if budget_block is not None:
-            cap = 0
+        budget = self._disk_budget()
+        cap = 0 if budget.state == DISK_FULL else budget.cap_bytes
         current = self._current_bytes() + self._untracked_bytes_estimate()
         if current + max(0, int(required_bytes)) <= cap:
             return
@@ -1952,15 +2396,23 @@ class SessionBankColdTier:
         self._delete_unreferenced_blobs(blob_hashes)
 
     def _retire_entry_row(self, row: sqlite3.Row) -> set[str]:
-        """Remove the small entry record under _base_lock, retaining blobs."""
+        """Remove the small entry record under _base_lock, retaining blobs.
+
+        The manifest row goes first. A row must never name a directory that
+        is gone (a restore would find the row and fail on the missing
+        payload), while a directory no row names is garbage the reconcile
+        already removes; a process killed between the two leaves only that.
+        """
         entry_id = str(row["entry_id"])
         entry_dir = self.base_dir / str(row["entry_dir"])
         blob_hashes = self._entry_blob_hashes(entry_dir)
-        if entry_dir.exists():
-            shutil.rmtree(entry_dir)
         with self._connect() as conn:
             conn.execute("DELETE FROM entries WHERE entry_id = ?", (entry_id,))
-        self._invalidate_disk_usage_cache()
+        try:
+            if entry_dir.exists():
+                shutil.rmtree(entry_dir)
+        finally:
+            self._invalidate_disk_usage_cache()
         return blob_hashes
 
     def _archive_entry_row(self, row: sqlite3.Row) -> None:
@@ -2268,12 +2720,25 @@ class SessionBankColdTier:
             boundary_prefix = _payload_boundary_at_or_below(
                 payload_spec, requested_prefix
             )
-            # Preserve the established tiny-gap behavior for hybrid entries
-            # without an interior capture.  SessionBank decides whether that
-            # full snapshot can serve the requested match; rejecting it here
-            # would turn tokenizer-boundary drift into an avoidable cold
-            # prefill.  Likewise, cache types whose metadata couples rolling
-            # state to their tensors must use the exact decoder plus trim.
+            if has_recurrent and boundary_prefix is None:
+                from mtplx.session_bank import _boundary_true_restore_enabled
+
+                if _boundary_true_restore_enabled():
+                    # A hybrid entry restores only at a stored recurrent
+                    # boundary at or below the match, tiny gaps included
+                    # (SessionBank.restore_entry_prefix_cache, since
+                    # 2026-09-08). With none, decoding the whole entry only
+                    # fed a candidate the restore refuses: on 2026-10-01 a
+                    # Pi turn sharing its tool definitions with a 131,735-
+                    # token conversation decoded that entry's 4.17 GB on
+                    # every attempt, and it stayed resident through the cold
+                    # prefill that followed, which the engine then refused.
+                    self._inc("prefix_restores_without_boundary")
+                    self._set_last_miss("ssd_prefix_no_recurrent_boundary")
+                    return None
+            # Cache types whose metadata couples rolling state to their
+            # tensors must use the exact decoder plus trim; so does a hybrid
+            # entry without a boundary when boundary-true restores are off.
             if (
                 (has_recurrent and boundary_prefix is None)
                 or not payload_supports_prefix_decode(payload_spec)

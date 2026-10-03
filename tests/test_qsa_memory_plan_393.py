@@ -71,6 +71,10 @@ class TestQsaPlanTerms:
             kv_bytes_per_token=24576,
             model_max_context=1_048_576,
             requested_context=262144,
+            # The #393 machine ran at the then-default 96 GiB limit; pinned so
+            # this test stays about the per-token terms, not the default.
+            usable_bytes_override=96 * GIB,
+            usable_bytes_explicit=True,
         )
         dense_priced = plan_memory(**base)
         qsa_priced = plan_memory(

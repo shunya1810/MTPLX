@@ -7,6 +7,7 @@
  "active_memory_bytes": "<int>",
  "ar_dense_fallback_calls": 0,
  "ar_return_hidden": false,
+ "attempts": 1,
  "attention_dense_fallback_calls": 0,
  "benchmark_mode": "mtplx_mtp_loaded_mtp_decode",
  "bonus_tokens": 0,
@@ -67,6 +68,7 @@
  "dirty_detach_gdn_every": 0,
  "dirty_detach_mode": "selected_slice_contiguous_eval",
  "dirty_detach_time_s": "<float>",
+ "discarded_attempt_wall_s": "<float>",
  "draft_head_installed": false,
  "draft_sampler_policy": "target_mirror",
  "draft_sampler_policy_source": "target_mirror",
@@ -129,10 +131,17 @@
  },
  "make_mtp_cache_calls": 0,
  "mean_accept_probability_by_depth": [],
+ "mlx_cache_cleanup": {
+  "cleared": true,
+  "elapsed_s": "<float>",
+  "reason": "after_request"
+ },
  "mode": "mtpk",
  "mtp_depth": 3,
  "mtp_forward_calls": 0,
  "mtp_history_append_calls": 0,
+ "mtp_history_append_settle_time_s": "<float>",
+ "mtp_history_final_settle_time_s": "<float>",
  "mtp_history_live_reset_threshold": 0,
  "mtp_history_live_resets": 0,
  "mtp_history_materialize_events": 0,
@@ -276,6 +285,7 @@
  "server_seed": "<int>",
  "server_tok_s": "<float>",
  "session_cache_hit": false,
+ "session_checkpoints": {},
  "session_id": null,
  "session_prefill_store": {},
  "session_prompt_prefix_bank_commit": {},
@@ -360,6 +370,30 @@
  "trunk_cache_materialize_every": 0,
  "trunk_cache_materialize_time_s": "<float>",
  "ttft_s": null,
+ "ttft_spans": {
+  "attempts": 1,
+  "details": {
+   "engine": {
+    "prompt_eval_time_s": "<float>"
+   }
+  },
+  "discarded_attempt_wall_s": "<float>",
+  "endpoint": null,
+  "exclusive_s": {
+   "admission_s": "<float>",
+   "dispatch_s": "<float>",
+   "encode_s": "<float>",
+   "http_parse_s": "<float>",
+   "lock_wait_s": "<float>",
+   "policy_s": "<float>",
+   "prologue_s": "<float>",
+   "scheduler_queue_s": "<float>"
+  },
+  "origin": "http_arrival",
+  "retry_paths": [],
+  "sum_s": "<float>",
+  "ttft_s": null
+ },
  "uncapped_response_lease_applied": false,
  "uncapped_response_lease_tokens": null,
  "uncapped_response_requested": false,

@@ -34,6 +34,14 @@ KV_PER_TOKEN = 24576
 AUX_PER_TOKEN = 7872
 
 
+@pytest.fixture(autouse=True)
+def _served_prefill_is_chunked(monkeypatch):
+    # The admission prices the rows each prefill forward runs. The served
+    # profiles (sustained, turbo) prefill in chunks; without the flag a
+    # prompt is one forward and is priced as one.
+    monkeypatch.setenv("MTPLX_SUSTAINED_PREFILL", "1")
+
+
 def _state():
     return SimpleNamespace(
         metal_memory_caps={"memory_limit_bytes": LIMIT},

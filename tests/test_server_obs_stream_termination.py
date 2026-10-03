@@ -64,6 +64,10 @@ def test_commit_wait_is_bounded_and_heartbeats_stay_alive(monkeypatch):
     heartbeats keep flowing at the stream cadence and the stall watchdog ends
     the stream with a visible error finish + [DONE] within the deadline."""
 
+    # The frame after the commit (the order before aed64295, still the
+    # order for sessions found by prompt inference and with the switch
+    # off): the stream itself waits for the commit.
+    monkeypatch.setenv("MTPLX_STREAM_TERMINAL_FRAME_BEFORE_COMMIT", "0")
     state = _fake_streaming_session_state()
     monkeypatch.setattr(openai, "STREAM_STALL_DEADLINE_S", 1.0)
     monkeypatch.setattr(openai, "STREAM_HEARTBEAT_INTERVAL_S", 0.05)
@@ -380,3 +384,100 @@ def test_completions_generator_exit_is_reraised(monkeypatch):
         asyncio.run(drive())
     finally:
         release_worker.set()
+
+
+def test_a_wedged_commit_after_an_early_frame_refuses_the_next_turn(monkeypatch):
+    """With the frame at the last token (aed64295), a wedged owner during the
+    commit cannot hang the stream, which already ended; the next turn of the
+    same session waits for that commit and, once the owner has made no
+    progress for the stall deadline, is refused with 503 instead of hanging
+    or reading the session before the commit."""
+
+    monkeypatch.delenv("MTPLX_STREAM_TERMINAL_FRAME_BEFORE_COMMIT", raising=False)
+    state = _fake_streaming_session_state()
+    monkeypatch.setattr(openai, "STREAM_STALL_DEADLINE_S", 1.0)
+    monkeypatch.setattr(openai, "STREAM_COMMIT_WAIT_MAX_S", 0.1)
+
+    def fake_run_generation(_state, prompt_ids, **kwargs):
+        token_callback = kwargs.get("token_callback")
+        if token_callback is not None:
+            token_callback([ord("O")])
+            token_callback([ord("K")])
+        return {
+            "text": "OK",
+            "tokens": [ord("O"), ord("K")],
+            "stats": {
+                "generation_mode": kwargs["generation_mode"],
+                "mtp_depth": kwargs["depth"],
+                "completion_tokens": 2,
+            },
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": 2,
+            "finish_reason": "stop",
+        }
+
+    release_wedged_owner = Event()
+    reads: list[str] = []
+
+    def wedged_store(*_args, **_kwargs):
+        release_wedged_owner.wait(30.0)
+        return {"stored": False, "reason": "wedged_test_owner"}
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    monkeypatch.setattr(
+        openai, "_store_generation_final_history_snapshot", wedged_store
+    )
+    from mtplx.engine_session import EngineSession
+
+    original_resolve = EngineSession.resolve_pending_postcommit_for_request
+
+    def observed_resolve(self):
+        reads.append(self.session_id)
+        return original_resolve(self)
+
+    monkeypatch.setattr(
+        EngineSession, "resolve_pending_postcommit_for_request", observed_resolve
+    )
+    headers = {"x-mtplx-session-id": "wedged-tail-session"}
+    try:
+        with TestClient(create_app(state)) as client:
+            started = time.monotonic()
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                headers=headers,
+                json={
+                    "messages": [{"role": "user", "content": "Say OK"}],
+                    "enable_thinking": False,
+                    "stream": True,
+                    "max_tokens": 4,
+                },
+            ) as response:
+                assert response.status_code == 200
+                first = response.read().decode()
+            assert "data: [DONE]" in first
+            assert time.monotonic() - started < 5.0
+            reads.clear()
+            second = client.post(
+                "/v1/chat/completions",
+                headers=headers,
+                json={
+                    "messages": [
+                        {"role": "user", "content": "Say OK"},
+                        {"role": "assistant", "content": "OK"},
+                        {"role": "user", "content": "Again"},
+                    ],
+                    "enable_thinking": False,
+                    "stream": False,
+                    "max_tokens": 4,
+                },
+            )
+            elapsed = time.monotonic() - started
+    finally:
+        release_wedged_owner.set()
+
+    assert second.status_code == 503, second.text
+    assert "session_commit_stalled" in second.text
+    assert elapsed < 20.0
+    # Refused before it read the session.
+    assert reads == []

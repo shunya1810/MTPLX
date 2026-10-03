@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from functools import partial
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import mlx.core as mx
 import numpy as np
@@ -376,28 +376,46 @@ def bind_batched_top_k_distributions(
     return partial(_fixed_batched_top_k_distributions, **common)
 
 
-def _device_serial_support_arrays(
-    logits: mx.array,
-    config: SamplerConfig,
-) -> tuple[np.ndarray, np.ndarray, int]:
-    """Deterministic device top-k support with device float32 mass.
+class _SerialCandidates(NamedTuple):
+    """What one device read of ``_device_serial_candidates`` brings back.
 
-    Serial-lane numerics. Support selection shares the bound route's
-    deterministic device selector (cutoff ties keep lower vocabulary ids,
-    matching the dense float64 host reference exactly); probability mass for
-    top-p decisions uses the device float32 full-vocab logsumexp normalizer
-    (the 2.5.4 serial lineage), so only the k-token support ever crosses the
-    host boundary. Materializing full vocab rows on the host per sampled
-    token was a measured 15-19% serve-lane decode regression (2026-08-11
-    four-arm sweep). The cohort bound route keeps the float64 host
-    reference; b1-exact binds these serial runners themselves, so no
-    contract requires the two lanes to be bitwise-identical to each other.
-
-    Returns (token_rows [N,k] int64, prob_rows [N,k] float64 with top-p
-    dropped entries exactly zero, vocab_size). Non-finite logits surface as
-    non-finite prob rows for the caller's fallback.
+    ``scaled`` stays on the device (the tie resolver re-reads its rows); the
+    candidate arrays are host copies in argpartition order, one row per
+    logit row.
     """
-    rows = logits.reshape(-1, logits.shape[-1]).astype(mx.float32)
+
+    scaled: mx.array
+    ids: np.ndarray
+    vals: np.ndarray
+    probs: np.ndarray | None
+    vocab_size: int
+    k: int
+    m: int
+
+    def row(self, index: int) -> "_SerialCandidates":
+        """Row ``index`` alone, as the one-row read of that row would hold it."""
+
+        cut = slice(index, index + 1)
+        return self._replace(
+            scaled=self.scaled[cut],
+            ids=self.ids[cut],
+            vals=self.vals[cut],
+            probs=None if self.probs is None else self.probs[cut],
+        )
+
+
+def _device_serial_candidates(
+    rows: mx.array,
+    config: SamplerConfig,
+) -> _SerialCandidates:
+    """Device half of ``_device_serial_support_arrays``: one read.
+
+    ``rows`` is [N, V] float32. Every op here is row-local: the scale and
+    the gathers are element-wise, ``argpartition`` sorts each row on its
+    own, and ``logsumexp`` over the last axis reduces each row in its own
+    threadgroup with a kernel chosen by the row length alone.
+    """
+
     vocab_size = int(rows.shape[-1])
     k = min(int(config.top_k), vocab_size)
     scaled = rows * (1.0 / float(config.temperature))
@@ -414,8 +432,7 @@ def _device_serial_support_arrays(
     m = min(max(4 * k, k), vocab_size)
     cand_idx = mx.argpartition(-scaled, kth=m - 1, axis=-1)[:, :m]
     cand_vals = mx.take_along_axis(scaled, cand_idx, axis=-1)
-    top_p_active = 0.0 < float(config.top_p) < 1.0
-    if top_p_active:
+    if 0.0 < float(config.top_p) < 1.0:
         log_total = mx.logsumexp(scaled, axis=-1, keepdims=True)
         cand_probs = mx.exp(cand_vals - log_total)
         mx.eval(cand_idx, cand_vals, cand_probs)
@@ -423,8 +440,34 @@ def _device_serial_support_arrays(
     else:
         mx.eval(cand_idx, cand_vals)
         cand_prob_rows = None
-    cand_ids = np.asarray(cand_idx, dtype=np.int64)
-    cand_val_rows = np.asarray(cand_vals, dtype=np.float32)
+    return _SerialCandidates(
+        scaled=scaled,
+        ids=np.asarray(cand_idx, dtype=np.int64),
+        vals=np.asarray(cand_vals, dtype=np.float32),
+        probs=cand_prob_rows,
+        vocab_size=vocab_size,
+        k=k,
+        m=m,
+    )
+
+
+def _serial_support_from_candidates(
+    candidates: _SerialCandidates,
+    config: SamplerConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Host half of ``_device_serial_support_arrays``, for the rows given.
+
+    Every statement works along axis 1, so a one-row ``candidates.row(i)``
+    gets exactly what the one-row read of that row gets. Only the rows
+    handed in are touched: a row that is never handed in cannot warn or
+    raise here.
+    """
+
+    k, m = candidates.k, candidates.m
+    cand_ids = candidates.ids
+    cand_val_rows = candidates.vals
+    cand_prob_rows = candidates.probs
+    top_p_active = cand_prob_rows is not None
 
     # Deterministic selection: value desc, then id asc — the same contract
     # as _deterministic_mlx_top_k_support and the dense host reference.
@@ -462,6 +505,7 @@ def _device_serial_support_arrays(
     if spill.any():
         # Exact path for rows whose cutoff tie group may extend beyond the
         # candidate superset.
+        scaled = candidates.scaled
         _, exact_idx, exact_vals = _fixed_top_k_support(scaled, top_k=k)
         if top_p_active:
             exact_probs = mx.exp(
@@ -489,7 +533,34 @@ def _device_serial_support_arrays(
         token_rows = np.where(spill[:, None], exact_ids, token_rows)
         prob_rows = np.where(spill[:, None], exact_prob_rows, prob_rows)
 
-    return token_rows, prob_rows, vocab_size
+    return token_rows, prob_rows
+
+
+def _device_serial_support_arrays(
+    logits: mx.array,
+    config: SamplerConfig,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Deterministic device top-k support with device float32 mass.
+
+    Serial-lane numerics. Support selection shares the bound route's
+    deterministic device selector (cutoff ties keep lower vocabulary ids,
+    matching the dense float64 host reference exactly); probability mass for
+    top-p decisions uses the device float32 full-vocab logsumexp normalizer
+    (the 2.5.4 serial lineage), so only the k-token support ever crosses the
+    host boundary. Materializing full vocab rows on the host per sampled
+    token was a measured 15-19% serve-lane decode regression (2026-08-11
+    four-arm sweep). The cohort bound route keeps the float64 host
+    reference; b1-exact binds these serial runners themselves, so no
+    contract requires the two lanes to be bitwise-identical to each other.
+
+    Returns (token_rows [N,k] int64, prob_rows [N,k] float64 with top-p
+    dropped entries exactly zero, vocab_size). Non-finite logits surface as
+    non-finite prob rows for the caller's fallback.
+    """
+    rows = logits.reshape(-1, logits.shape[-1]).astype(mx.float32)
+    candidates = _device_serial_candidates(rows, config)
+    token_rows, prob_rows = _serial_support_from_candidates(candidates, config)
+    return token_rows, prob_rows, candidates.vocab_size
 
 
 def _device_serial_support_arrays_relaxed_ties(
@@ -621,6 +692,104 @@ def sparse_distribution_from_mlx_logits_relaxed_ties(
         return dist
     mx.eval(row)
     return _host_sparse_distribution(np.asarray(row, dtype=np.float32), config)
+
+
+#: Merge-sort scratch MLX's Metal ``argpartition`` allocates per element of
+#: its input: it sorts the whole axis, and the multi-block sort holds two
+#: value and two uint32 index buffers of the full input
+#: (``mlx/backend/metal/sort.cpp``, ``multi_block_sort``), 16 bytes at
+#: float32.
+_ARGPARTITION_SCRATCH_BYTES_PER_ELEMENT = 16
+#: Bound on that scratch for one chunk of a block read: 32 MiB is 8 rows of
+#: the 248,320-entry Qwen 3.5+ vocabulary (3.79 MiB a row), against 91 MiB
+#: for a whole 24-row copy block.
+_BLOCK_READ_SCRATCH_BYTES = 32 * 2**20
+
+
+def _block_read_chunk_rows(vocab_size: int) -> int:
+    """Rows read from the device together, from the sort scratch budget."""
+
+    per_row = _ARGPARTITION_SCRATCH_BYTES_PER_ELEMENT * max(1, int(vocab_size))
+    return max(1, _BLOCK_READ_SCRATCH_BYTES // per_row)
+
+
+class SparseDistributionRows:
+    """Exact per-row sparse distributions for a block of logit rows.
+
+    Row ``i`` is the distribution ``sparse_distribution_from_mlx_logits``
+    returns for ``logits[i]`` with no penalties, bit for bit. The device work
+    is done a chunk of rows at a time (``_block_read_chunk_rows``: 8 rows at
+    the Qwen 3.5+ vocabulary), when the caller first reaches a row of the
+    chunk: one host-device round trip per chunk instead of one per row, a
+    sort scratch that stays under ``_BLOCK_READ_SCRATCH_BYTES`` on every
+    Mac, and nothing built for the chunks past a caller that stops early.
+    Everything the device computes is row-local (the float32 cast, the scale
+    and the gathers are element-wise, ``argpartition`` sorts each row on its
+    own, and ``logsumexp`` reduces each row in its own threadgroup with a
+    kernel chosen by the row length alone), so a row read inside a chunk
+    carries the same candidates as its one-row read.
+
+    The host arithmetic runs for the row being read only, with the per-row
+    reader's own statements on a one-row slice: a row the caller never
+    reaches cannot warn or raise, and a row it does reach behaves exactly as
+    under the per-row reader, including the host fallback (and its
+    ``NonFiniteLogitsError``) for a row whose device mass is not finite.
+    Rows are indexed from 0 to ``len(self) - 1``.
+    """
+
+    __slots__ = ("_logits", "_config", "_chunk_rows", "_chunk_index", "_chunk")
+
+    def __init__(self, logits: mx.array, config: SamplerConfig) -> None:
+        self._logits = logits.reshape(-1, logits.shape[-1])
+        self._config = config
+        self._chunk_rows = _block_read_chunk_rows(int(self._logits.shape[-1]))
+        # Only the chunk being walked is held: a caller reads rows in order.
+        self._chunk_index = -1
+        self._chunk: _SerialCandidates | None = None
+
+    def __len__(self) -> int:
+        return int(self._logits.shape[0])
+
+    def __getitem__(self, index: int) -> SparseDistribution:
+        index = int(index)
+        if not 0 <= index < len(self):
+            raise IndexError(f"row {index} of {len(self)}")
+        chunk_index, row = divmod(index, self._chunk_rows)
+        if chunk_index != self._chunk_index or self._chunk is None:
+            start = chunk_index * self._chunk_rows
+            rows = self._logits[start : start + self._chunk_rows].astype(mx.float32)
+            self._chunk = _device_serial_candidates(rows, self._config)
+            self._chunk_index = chunk_index
+        candidates = self._chunk.row(row)
+        token_rows, prob_rows = _serial_support_from_candidates(
+            candidates, self._config
+        )
+        dist = _serial_row_distribution(
+            token_rows[0], prob_rows[0], candidates.vocab_size
+        )
+        if dist is not None:
+            return dist
+        # Non-finite mass: the per-row reader's host fallback, on this row.
+        host_row = self._logits[index].astype(mx.float32)
+        mx.eval(host_row)
+        return _host_sparse_distribution(
+            np.asarray(host_row, dtype=np.float32), self._config
+        )
+
+
+def sparse_distribution_rows_from_mlx_logits(
+    logits: mx.array,
+    config: SamplerConfig,
+) -> SparseDistributionRows | None:
+    """Per-row exact sparse distributions read a chunk at a time, or None.
+
+    None exactly where ``sparse_distribution_from_mlx_logits`` returns None
+    (greedy, or no top-k), so a caller falls back to its per-row reader there.
+    """
+
+    if config.temperature <= 0 or config.top_k <= 0:
+        return None
+    return SparseDistributionRows(logits, config)
 
 
 def sparse_distributions_from_mlx_logits(

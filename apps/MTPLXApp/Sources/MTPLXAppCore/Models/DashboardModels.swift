@@ -460,6 +460,10 @@ public struct PrefillState: Codable, Equatable, Sendable {
     public var ssdRestoreS: Double?
     public var ssdSuffixTokens: Int?
     public var startedS: Double?
+    /// Why this prompt is read again and how long it should take (the
+    /// server's `reread`, published before the replay); nil from older
+    /// daemons and before the restore finished.
+    public var reread: PrefillReread?
 
     public init(
         phase: String,
@@ -483,7 +487,8 @@ public struct PrefillState: Codable, Equatable, Sendable {
         ssdCachedTokens: Int? = nil,
         ssdRestoreS: Double? = nil,
         ssdSuffixTokens: Int? = nil,
-        startedS: Double? = nil
+        startedS: Double? = nil,
+        reread: PrefillReread? = nil
     ) {
         self.phase = phase
         self.tokensDone = tokensDone
@@ -507,6 +512,7 @@ public struct PrefillState: Codable, Equatable, Sendable {
         self.ssdRestoreS = ssdRestoreS
         self.ssdSuffixTokens = ssdSuffixTokens
         self.startedS = startedS
+        self.reread = reread
     }
 
     enum CodingKeys: String, CodingKey {
@@ -532,6 +538,7 @@ public struct PrefillState: Codable, Equatable, Sendable {
         case ssdRestoreS = "ssd_restore_s"
         case ssdSuffixTokens = "ssd_suffix_tokens"
         case startedS = "started_s"
+        case reread
     }
 }
 
@@ -1179,6 +1186,9 @@ public struct HealthPayload: Codable, Equatable, Sendable {
     public var depth: Int
     public var profile: DynamicObject
     public var contextWindow: Int
+    /// The conversation length this daemon executes (`/health`
+    /// `execution_window`); nil from older daemons.
+    public var executionWindow: ServedExecutionWindow?
     public var maxResponseTokens: Int?
     public var activeRequests: Int
     public var fanMode: String?
@@ -1192,7 +1202,8 @@ public struct HealthPayload: Codable, Equatable, Sendable {
     public var unifiedMemoryBytes: Int?
     public var scheduler: DynamicObject?
     public var sessionBank: SessionBank?
-    public var ssdSessionCache: SessionBankColdTier?
+    /// The SSD tier's stats, read leniently (the low-disk banner reads it).
+    public var ssdSessionCache: SSDSessionCacheHealth?
     public var startup: Startup?
     public var thermal: Thermal?
     public var vision: VisionCapability?
@@ -1212,6 +1223,7 @@ public struct HealthPayload: Codable, Equatable, Sendable {
         case depth
         case profile
         case contextWindow = "context_window"
+        case executionWindow = "execution_window"
         case maxResponseTokens = "max_response_tokens"
         case activeRequests = "active_requests"
         case fanMode = "fan_mode"
@@ -1229,6 +1241,21 @@ public struct HealthPayload: Codable, Equatable, Sendable {
         case startup
         case thermal
         case vision
+    }
+}
+
+/// What `/health` publishes as `execution_window`: the conversation length,
+/// prompt plus answer, the daemon executes (`tokens`). Pi and OpenCode are
+/// configured from it instead of the raw window setting, and it is Pi's
+/// answer ceiling (`ClientContextBudget`). The half-window `answer_tokens`
+/// that daemons built from 59288061 also send is not read.
+public struct ServedExecutionWindow: Codable, Equatable, Sendable {
+    public var tokens: Int
+    public var basis: String?
+
+    public init(tokens: Int, basis: String? = nil) {
+        self.tokens = tokens
+        self.basis = basis
     }
 }
 

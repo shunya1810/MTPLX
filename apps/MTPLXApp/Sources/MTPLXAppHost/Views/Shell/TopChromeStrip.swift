@@ -87,10 +87,7 @@ struct TopChromeStrip: View {
 
             HStack(alignment: .center, spacing: 8) {
                 RefreshButton {
-                    Task {
-                        try? await backend.refreshStaticState()
-                        try? await backend.refreshSnapshot()
-                    }
+                    Task { await backend.refresh() }
                 }
                 InferenceParamsButton(
                     performanceLock: configuration.performanceLock

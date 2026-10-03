@@ -42,7 +42,7 @@ import os
 
 import mlx.core as mx
 
-from .sdpa_2pass_paged import _paged_reduce_kernel
+from .sdpa_2pass_paged import _paged_reduce_kernel, unnormalized_partials_dtype
 
 # F23b (2026-08-16): contract bails, keyed by the first gate that declined.
 # Every ``return None`` below silently routes the caller back to fused SDPA
@@ -265,11 +265,11 @@ def _packed_partials_kernel():
 
         for (int j = 0; j < QL; ++j) {
             const int o_offset = q_head_idx * QL + j;
-            device InT* p = partials
+            device PartT* p = partials
                 + ((size_t)o_offset * blocks + block_idx) * V
                 + simd_lid * v_per_thread;
             for (int i = 0; i < v_per_thread; ++i) {
-                p[i] = static_cast<InT>(o[j][i]);
+                p[i] = static_cast<PartT>(o[j][i]);
             }
             if (simd_lid == 0) {
                 const float se = (j < 4) ? sum_exp[j] : sum_exp2[j - 4];
@@ -366,6 +366,7 @@ def sdpa_gqa_packed_tail(
 
     partial_shape = (bsz, hq, q_len, blocks, vdim)
     stats_shape = (bsz, hq, q_len, blocks)
+    partial_dtype = unnormalized_partials_dtype(queries.dtype)
     partials, sums, maxs = kernel(
         inputs=[
             queries,
@@ -379,6 +380,7 @@ def sdpa_gqa_packed_tail(
         ],
         template=[
             ("InT", queries.dtype),
+            ("PartT", partial_dtype),
             ("D", d),
             ("V", vdim),
             ("GQA_F", gqa_factor),
@@ -387,7 +389,7 @@ def sdpa_gqa_packed_tail(
         grid=(hk * 32, gqa_factor, blocks),
         threadgroup=(32, gqa_factor, 1),
         output_shapes=[partial_shape, stats_shape, stats_shape],
-        output_dtypes=[queries.dtype, mx.float32, mx.float32],
+        output_dtypes=[partial_dtype, mx.float32, mx.float32],
     )
 
     (out,) = reduce_kernel(
@@ -628,11 +630,11 @@ def _grouped_partials_kernel():
 
         for (int j = 0; j < nq; ++j) {
             const int o_offset = q_head_idx * QL + q0 + j;
-            device InT* p = partials
+            device PartT* p = partials
                 + ((size_t)o_offset * blocks + block_idx) * V
                 + simd_lid * v_per_thread;
             for (int i = 0; i < v_per_thread; ++i) {
-                p[i] = static_cast<InT>(o[j][i]);
+                p[i] = static_cast<PartT>(o[j][i]);
             }
             if (simd_lid == 0) {
                 sums[o_offset * blocks + block_idx] = sum_exp[j];
@@ -641,11 +643,11 @@ def _grouped_partials_kernel():
         }
         for (int j = 0; j < nq2; ++j) {
             const int o_offset = q_head_idx * QL + q0 + 4 + j;
-            device InT* p = partials
+            device PartT* p = partials
                 + ((size_t)o_offset * blocks + block_idx) * V
                 + simd_lid * v_per_thread;
             for (int i = 0; i < v_per_thread; ++i) {
-                p[i] = static_cast<InT>(o2[j][i]);
+                p[i] = static_cast<PartT>(o2[j][i]);
             }
             if (simd_lid == 0) {
                 sums[o_offset * blocks + block_idx] = sum_exp2[j];
@@ -744,6 +746,7 @@ def sdpa_gqa_packed_tail_grouped(
 
     partial_shape = (bsz, hq, q_len, blocks, vdim)
     stats_shape = (bsz, hq, q_len, blocks)
+    partial_dtype = unnormalized_partials_dtype(queries.dtype)
     partials, sums, maxs = kernel(
         inputs=[
             queries,
@@ -757,6 +760,7 @@ def sdpa_gqa_packed_tail_grouped(
         ],
         template=[
             ("InT", queries.dtype),
+            ("PartT", partial_dtype),
             ("D", d),
             ("V", vdim),
             ("GQA_F", gqa_factor),
@@ -767,7 +771,7 @@ def sdpa_gqa_packed_tail_grouped(
         grid=(hk * 32, gqa_factor * qgroups, blocks),
         threadgroup=(32, gqa_factor, 1),
         output_shapes=[partial_shape, stats_shape, stats_shape],
-        output_dtypes=[queries.dtype, mx.float32, mx.float32],
+        output_dtypes=[partial_dtype, mx.float32, mx.float32],
     )
 
     (out,) = reduce_kernel(

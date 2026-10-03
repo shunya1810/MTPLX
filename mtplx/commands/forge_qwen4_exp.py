@@ -440,6 +440,8 @@ def write_mtp_sidecar(
 ) -> dict[str, Any]:
     import mlx.core as mx
 
+    from mtplx.expert_layout import split_fused_experts
+
     config = _load_json(source / "config.json")
     hidden = int(_text_config(config)["hidden_size"])
     weight_map = _load_json(source / "model.safetensors.index.json")["weight_map"]
@@ -455,23 +457,7 @@ def write_mtp_sidecar(
         for key in keys:
             raw[key[len("mtp."):]] = loaded[key]
     tensors: dict[str, Any] = {}
-    for key, value in raw.items():
-        if key.endswith(".mlp.experts.gate_up_proj"):
-            prefix = key.rsplit(".mlp.experts.", 1)[0]
-            if value.shape[1] == hidden:  # transformers bmm layout [E, hidden, 2*inter]
-                gate, up = mx.split(value, 2, axis=-1)
-                gate, up = gate.swapaxes(1, 2), up.swapaxes(1, 2)
-            else:  # hub Linear layout [E, 2*inter, hidden]
-                gate, up = mx.split(value, 2, axis=1)
-            tensors[f"{prefix}.mlp.switch_mlp.gate_proj.weight"] = gate
-            tensors[f"{prefix}.mlp.switch_mlp.up_proj.weight"] = up
-            continue
-        if key.endswith(".mlp.experts.down_proj"):
-            prefix = key.rsplit(".mlp.experts.", 1)[0]
-            if value.shape[2] == hidden:
-                value = value.swapaxes(1, 2)
-            tensors[f"{prefix}.mlp.switch_mlp.down_proj.weight"] = value
-            continue
+    for key, value in split_fused_experts(raw, hidden_size=hidden).items():
         if value.ndim == 1 and any(key.endswith(s) for s in MTP_NORM_SHIFT_SUFFIXES):
             value = (value.astype(mx.float32) + 1.0).astype(value.dtype)
         tensors[key] = value

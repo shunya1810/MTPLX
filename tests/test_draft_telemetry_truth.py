@@ -620,7 +620,7 @@ def test_prompt_scoring_decodes_each_unique_token_once(monkeypatch):
         encode=lambda _text, **_kwargs: list(prompt_ids),
     )
 
-    def fake_score(_runtime, ids, *, top_k):
+    def fake_score(_runtime, ids, *, top_k, abort_check=None, prefill_callback=None):
         n = len(ids)
         positions = []
         for i in range(n - 1):

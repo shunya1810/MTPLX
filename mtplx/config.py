@@ -18,9 +18,16 @@ from mtplx.runtime_options import normalize_paged_kv_quantization
 DEFAULT_CONFIG_PATH = Path("~/.mtplx/config.toml").expanduser()
 RUNTIME_MODEL_COMMANDS = {"ask", "run", "chat", "start", "serve", "quickstart", "quick-start", "tune"}
 CACHE_COMMANDS = {"pull", "list", "models", "remove"}
+# Two default repo ids that early `mtplx init` builds wrote into config.toml:
+# the v0.1.0-preview default and a 2026-05-03 development build's. Such a line
+# is the old default, not a choice, so the command's own default applies.
+# Later default ids are decided where the model is chosen
+# (`is_verified_default_model_ref`). Exact ids only: MTPLX never wrote a path
+# into config.toml (`mtplx init` and `mtplx setup` write the --model given or
+# the default repo id, `mtplx config set` the value typed), so a folder there
+# is the user's, whatever its name (#573).
 LEGACY_DEFAULT_MODEL_REFS = {
-    "models/Qwen3.6-27B-MTPLX-GDN8-Speed4",
-    "models/Qwen3.6-27B-MTPLX-Optimized-Speed",
+    "mtplx/Qwen3.6-27B-MTPLX-GDN8-Speed4-CyanKiwiMTP",
     "Youssofal/Qwen3.6-27B-MTPLX-Optimized",
 }
 CONFIG_VALUE_KEYS = (
@@ -260,17 +267,9 @@ def _apply_model_default(args: Any, config: UserConfig) -> None:
     if (
         config.model
         and (current in default_refs or is_verified_default_model_ref(current))
-        and not _is_legacy_default_model_ref(config.model)
+        and config.model not in LEGACY_DEFAULT_MODEL_REFS
     ):
         args.model = config.model
-
-
-def _is_legacy_default_model_ref(model: str) -> bool:
-    normalized = str(Path(model).expanduser()) if model.startswith(("~", "/")) else model
-    return any(
-        normalized == ref or normalized.endswith("/" + ref)
-        for ref in LEGACY_DEFAULT_MODEL_REFS
-    )
 
 
 def _apply_cache_default(args: Any, config: UserConfig) -> None:

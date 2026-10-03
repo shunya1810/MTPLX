@@ -1,0 +1,7 @@
+# Killing the `mtplx serve` wrapper orphans its Python child with the whole model wired; stop the `mtplx.server.openai` child first, and never boot a 77 GB pack beside running test suites
+
+Symptom (2026-09-27 04:41, overnight QA smoke): `pkill -f "mtplx serve --yes --model ..."` returned, the wrapper was gone, `pgrep mtplx serve` found nothing, and `vm_stat` still showed 92 GB wired and 0.3 GB free. `ps` showed `python -P -m mtplx.server.openai --model ...` with PPID 1 and 33 GB RSS: the CLI wrapper spawns the server module as a child, and killing the wrapper alone leaves that child holding every Metal buffer. Free memory had already fallen to 2.7 GB with the model up because five agents were running pytest suites on the same Mac.
+
+Cause: the wrapper and the module are two processes; the kill pattern matched only the wrapper. Booting a 77 GB pack while other work used 30+ GB left the desktop within a few GB of the watchdog-reboot zone the field reports describe.
+
+Fix / rule: stop the server by the child's pattern (`mtplx.server.openai --model <pack>`) or by the process group gpulock starts it in, wait for the child to exit, then the wrapper; confirm with `vm_stat` (wired back to single digits) before calling the machine idle. Never boot a large pack while pytest or another engine is running; check free memory and `pgrep pytest` first, and prefer a reduced `MTPLX_MEMORY_LIMIT_BYTES` for QA serves on the development Mac.

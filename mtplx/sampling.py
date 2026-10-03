@@ -11,6 +11,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .attention_context import kv_attention_failure_line
+
 # OpenAI/vLLM valid range for presence_penalty / frequency_penalty.
 PENALTY_MIN = -2.0
 PENALTY_MAX = 2.0
@@ -61,6 +63,11 @@ class NonFiniteLogitsError(RuntimeError):
         self.nan_count = nan_count
         self.inf_count = inf_count
         self.vocab_size = vocab_size
+        # Which KV cache and attention route served the request's last
+        # full-attention call, captured here, where the fault is raised on the
+        # model thread: by the time the server formats the error another
+        # request may have run attention (attention_context has the record).
+        self.kv_attention = kv_attention_failure_line()
 
 
 def non_finite_logits_error(logits: np.ndarray, where: str) -> NonFiniteLogitsError:

@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 import mlx.core as mx
+import pytest
 
 from mtplx.cache_bank import SessionBankColdTier
 from mtplx.cache_bank.codec import (
@@ -220,10 +221,19 @@ def test_cache_bank_codec_rejects_prefix_decode_for_coupled_cache_metadata():
     assert payload_supports_prefix_decode(encoded.spec) is False
 
 
-def test_cold_tier_keeps_tiny_recurrent_prefix_without_boundary(tmp_path, monkeypatch):
-    """Tiny tokenizer-drift restores retain the pre-prefix-decode behavior."""
+@pytest.mark.parametrize("boundary_true", ["1", "0"])
+def test_cold_tier_offers_a_tiny_recurrent_prefix_only_with_the_legacy_switch(
+    tmp_path, monkeypatch, boundary_true
+):
+    """A hybrid entry with no recurrent boundary cannot serve a sub-prefix,
+    not even a one-token tokenizer-drift seam: its recurrent state has read
+    the token the prompt does not have (boundary-true restore, 2026-09-08).
+    The SSD tier refuses it before reading its tensors (2026-10-01: a 131K
+    entry decoded in full for a turn that could never use it). The legacy
+    off-switch keeps the old offer."""
 
     monkeypatch.setenv("MTPLX_SESSION_BLOCK_PREFIX_RESTORE", "1")
+    monkeypatch.setenv("MTPLX_SESSION_BOUNDARY_TRUE_RESTORE", boundary_true)
     cold = SessionBankColdTier(
         base_dir=tmp_path / "session-bank",
         mode="on",
@@ -269,9 +279,13 @@ def test_cold_tier_keeps_tiny_recurrent_prefix_without_boundary(tmp_path, monkey
             policy_fingerprint="policy-a",
         )
 
-        assert candidates
-        assert candidates[0][1] == 40
-        assert getattr(candidates[0][0], "cache_source") == "ssd"
+        if boundary_true == "1":
+            assert candidates == []
+            assert cold.stats()["last_miss_reason"] == "ssd_prefix_no_recurrent_boundary"
+        else:
+            assert candidates
+            assert candidates[0][1] == 40
+            assert getattr(candidates[0][0], "cache_source") == "ssd"
     finally:
         cold.close()
 

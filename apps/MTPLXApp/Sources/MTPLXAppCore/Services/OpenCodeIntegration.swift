@@ -78,20 +78,24 @@ public struct OpenCodeIntegration: Sendable {
     private static let desktopGlobalStoreName = "opencode.global.dat"
     private static let sessionHeadersPluginName = "mtplx-session-headers.js"
 
-    /// The managed OpenCode plugin both writers install (byte-identical to
-    /// `mtplx.opencode.OPENCODE_SESSION_HEADERS_PLUGIN_SOURCE`; both compare
-    /// content before rewriting, so the lanes never fight). It carries the
-    /// session headers and strips exactly the client-injected values —
-    /// OpenCode's 32,000 output ceiling (provider/transform.ts
-    /// OUTPUT_TOKEN_MAX, min'd against limit.output on every request) and
-    /// the qwen-keyed sampler OpenCode <= 1.18.20 injects — so MTPLX owns
-    /// the uncapped generation contract while every explicit client choice
-    /// passes through untouched.
+    /// The managed OpenCode plugin the app installs, with the same
+    /// `chat.params` rules as the CLI's package plugin
+    /// (`mtplx.opencode.OPENCODE_SESSION_HEADERS_PLUGIN_SOURCE`); both writers
+    /// compare content before rewriting, so the lanes never fight. It carries
+    /// the session headers and strips exactly the values OpenCode injects:
+    /// its output ceiling (provider/transform.ts maxOutputTokens,
+    /// min(limit.output, 32,000) on every request, which on a small window is
+    /// the reply reserve `outputLimit(forContextWindow:)` writes) and the
+    /// qwen-keyed sampler OpenCode <= 1.18.20 sends. MTPLX then owns the
+    /// uncapped generation contract while every explicit client choice
+    /// passes through untouched, and an answer cap the user gave the CLI
+    /// (the model's `x-mtplx-max-response-tokens` header) is sent whole.
     private static let sessionHeadersPluginSource = """
     const mtplxProviderID = (input) =>
       input?.model?.providerID || input?.provider?.id;
 
     const mtplxInjectedOutputCap = 32000;
+    const mtplxRequestedOutputHeader = "x-mtplx-max-response-tokens";
     const mtplxInjectedQwenTemperature = 0.55;
     const mtplxInjectedQwenTopP = 1;
 
@@ -108,13 +112,32 @@ public struct OpenCodeIntegration: Sendable {
       "chat.params": async (input, output) => {
         const providerID = mtplxProviderID(input);
         if (providerID && providerID !== "mtplx") return;
-        // OpenCode injects maxOutputTokens = min(limit.output, 32000) on every
-        // request even when the configured model advertises a larger native
-        // context. Strip exactly that injected default so MTPLX owns the
-        // uncapped generation contract; an explicit client cap (any other
-        // value) passes through untouched.
-        if (output.maxOutputTokens === mtplxInjectedOutputCap) {
-          output.maxOutputTokens = undefined;
+        // OpenCode sends maxOutputTokens = min(limit.output, 32000) with every
+        // request and hands this hook the model with its limit and headers.
+        // MTPLX writes limit.output as OpenCode's reply reserve, half the window
+        // and at most 32,000 (#480), so by default that value is OpenCode's own
+        // and is stripped: the server's own limits apply. An answer cap the user
+        // asked MTPLX for (--max-response-tokens) is the model's
+        // x-mtplx-max-response-tokens header and is sent whole, past OpenCode's
+        // 32,000 ceiling; a limit.output that is not MTPLX's reserve is sent the
+        // same way. Any other value is a cap set in OpenCode itself and passes
+        // through untouched.
+        const positive = (value) => (Number.isInteger(value) && value > 0 ? value : null);
+        const limit = input?.model?.limit;
+        const configuredOutput = positive(limit?.output);
+        const opencodeDefault = configuredOutput === null
+          ? mtplxInjectedOutputCap
+          : Math.min(configuredOutput, mtplxInjectedOutputCap);
+        if (output.maxOutputTokens === opencodeDefault) {
+          const context = positive(limit?.context);
+          const mtplxReserve = context === null
+            ? null
+            : Math.min(mtplxInjectedOutputCap, Math.max(1, Math.floor(context / 2)));
+          const requested = positive(Number(input?.model?.headers?.[mtplxRequestedOutputHeader]));
+          output.maxOutputTokens = requested
+            ?? (configuredOutput !== null && configuredOutput !== mtplxReserve
+              ? configuredOutput
+              : undefined);
         }
         // OpenCode <= 1.18.20 (Desktop 1.18.18 included) injects a qwen-keyed
         // sampler (temperature 0.55, topP 1) for any model id containing
@@ -168,24 +191,40 @@ public struct OpenCodeIntegration: Sendable {
             .appendingPathComponent("default.dat")
     }
 
+    /// `servedWindow` is the window the running daemon published
+    /// (`/health` `execution_window`); the limits follow it. Without it (the
+    /// write before the daemon starts) the limits already written for this
+    /// model are kept, so a launch never rewrites them twice; a model with no
+    /// limits yet gets the window setting.
     @discardableResult
-    public func sync(configuration: MTPLXAppConfiguration) throws -> OpenCodeConfigResult {
+    public func sync(
+        configuration: MTPLXAppConfiguration,
+        servedWindow: ServedExecutionWindow? = nil
+    ) throws -> OpenCodeConfigResult {
         let modelID = Self.modelID(for: configuration.model)
         let modelReference = "mtplx/\(modelID)"
         let baseURL = Self.baseURLString(host: configuration.host, port: configuration.port)
-        let contextLimit = configuration.effectiveContextWindow(default: 262_144)
         let sessionHeadersPluginURL = configURL.deletingLastPathComponent()
             .appendingPathComponent(Self.sessionHeadersPluginName)
         var backupURL: URL?
 
-        var root = try loadRoot()
+        // A file OpenCode accepts (comments, trailing commas) is merged; one
+        // that does not parse throws before anything is written.
+        let existingRoot = try loadRoot()
+        var root = existingRoot ?? [:]
         var providers = root["provider"]?.objectValue ?? [:]
+        let limits = Self.modelLimits(
+            configuration: configuration,
+            servedWindow: servedWindow,
+            existingProvider: providers["mtplx"],
+            modelID: modelID
+        )
         providers["mtplx"] = .object(
             Self.providerConfig(
                 modelID: modelID,
                 baseURL: baseURL,
                 apiKey: configuration.apiKey,
-                contextLimit: contextLimit,
+                limits: limits,
                 vision: MTPLXModelOption.supportsVision(model: configuration.model),
                 reasoningEffort: Self.resolvedReasoningEffort(
                     forModelID: modelID,
@@ -216,8 +255,9 @@ public struct OpenCodeIntegration: Sendable {
             at: sessionHeadersPluginURL
         )
 
-        let existingData = try? Data(contentsOf: configURL)
-        if existingData == nextData {
+        // A file that already says this is left exactly as the user wrote
+        // it, comments and formatting included.
+        if let existingRoot, existingRoot == root {
             let visibility = try ensureReasoningSummariesVisible()
             try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
             return OpenCodeConfigResult(
@@ -233,7 +273,7 @@ public struct OpenCodeIntegration: Sendable {
             )
         }
 
-        if existingData != nil {
+        if fileManager.fileExists(atPath: configURL.path) {
             let backup = uniqueBackupURL(reason: "bak")
             try fileManager.copyItem(at: configURL, to: backup)
             backupURL = backup
@@ -624,22 +664,12 @@ public struct OpenCodeIntegration: Sendable {
         return Self.repairDeadWorkspaceState(globalStoreURL: globalStoreURL)
     }
 
-    private func loadRoot() throws -> [String: JSONValue] {
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: configURL.path) else {
-            return [:]
-        }
-        let data = try Data(contentsOf: configURL)
-        guard !data.isEmpty else {
-            return [:]
-        }
-        do {
-            return try JSONDecoder().decode([String: JSONValue].self, from: data)
-        } catch {
-            let backup = uniqueBackupURL(reason: "invalid")
-            try fileManager.moveItem(at: configURL, to: backup)
-            return [:]
-        }
+    /// The current `opencode.json`, read as OpenCode reads it (JSON with
+    /// comments and trailing commas), or nil when there is none. A file that
+    /// does not parse is left in place and reported (`ClientConfigFileError`);
+    /// it used to be moved aside and replaced by MTPLX's provider alone.
+    private func loadRoot() throws -> [String: JSONValue]? {
+        try ClientConfigFile.readObject(at: configURL)
     }
 
     /// Register the managed plugin in the config's `plugin` list, replacing
@@ -924,15 +954,44 @@ public struct OpenCodeIntegration: Sendable {
     /// 1.18.29). Mirroring the context into the output limit left a zero-token
     /// conversation window on small seats, so every reply was summarised
     /// (issue #480). Half the window, capped at the 32,000 OpenCode injects.
+    /// OpenCode also sends this reserve as every request's max_tokens; the
+    /// managed plugin strips it there (`mtplxReserve`), so the server's own
+    /// limits apply at every window. SYNC: mtplx/opencode.py
+    /// `opencode_output_limit`.
     static func outputLimit(forContextWindow context: Int) -> Int {
         min(32_000, max(1, context / 2))
+    }
+
+    /// `limit.context` and `limit.output` for the MTPLX model: from the
+    /// served window when known, else the limits this model already has,
+    /// else the window setting. The output limit is OpenCode's reply reserve
+    /// for that window (`outputLimit(forContextWindow:)`).
+    static func modelLimits(
+        configuration: MTPLXAppConfiguration,
+        servedWindow: ServedExecutionWindow?,
+        existingProvider: JSONValue?,
+        modelID: String
+    ) -> (context: Int, output: Int) {
+        if servedWindow == nil,
+           let limit = existingProvider?.objectValue?["models"]?.objectValue?[modelID]?
+               .objectValue?["limit"]?.objectValue,
+           let context = limit["context"]?.intValue, context > 0,
+           let output = limit["output"]?.intValue, output > 0 {
+            return (context, output)
+        }
+        let context = ClientContextBudget.window(
+            configuration: configuration,
+            served: servedWindow,
+            defaultWindow: 262_144
+        )
+        return (context, outputLimit(forContextWindow: context))
     }
 
     private static func providerConfig(
         modelID: String,
         baseURL: String,
         apiKey: String?,
-        contextLimit: Int,
+        limits: (context: Int, output: Int),
         vision: Bool,
         reasoningEffort: String?
     ) -> [String: JSONValue] {
@@ -964,8 +1023,8 @@ public struct OpenCodeIntegration: Sendable {
             "tool_call": .bool(true),
             "temperature": .bool(true),
             "limit": .object([
-                "context": .number(Double(contextLimit)),
-                "output": .number(Double(Self.outputLimit(forContextWindow: contextLimit))),
+                "context": .number(Double(limits.context)),
+                "output": .number(Double(limits.output)),
             ]),
             "modalities": .object([
                 "input": .array(vision ? [.string("text"), .string("image")] : [.string("text")]),

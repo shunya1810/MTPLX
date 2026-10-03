@@ -18,7 +18,11 @@ from .constants import (
     EXPECTED_QWEN_MOE_SWITCH_MLP_PREQUANTIZED_MTP_KEYS,
     expand_mtp_layer_keys,
 )
-from .expert_layout import num_experts_from_config, stack_numbered_experts
+from .expert_layout import (
+    num_experts_from_config,
+    split_fused_experts,
+    stack_numbered_experts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -340,10 +344,13 @@ def _stack_mtp_moe_experts(
     weights: dict[str, Any],
     config: dict[str, Any],
 ) -> dict[str, Any]:
-    """Stack numbered MTP experts into mlx-lm's switch_mlp layout."""
+    """Stack numbered or fused MTP experts into mlx-lm's switch_mlp layout."""
     num_experts = num_experts_from_config(config)
     if num_experts <= 0:
         return weights
+    hidden_size = text_config(config).get("hidden_size")
+    if hidden_size:
+        weights = split_fused_experts(weights, hidden_size=int(hidden_size))
     return stack_numbered_experts(weights, num_experts=num_experts, strict=False)
 
 

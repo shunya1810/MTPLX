@@ -188,3 +188,91 @@ class NumberedExpertAccumulator:
             stack_fn=self.stack,
             strict=strict,
         )
+
+
+_FUSED_GATE_UP = ".mlp.experts.gate_up_proj"
+_FUSED_DOWN = ".mlp.experts.down_proj"
+
+
+def _fused_orientation(shape: tuple[int, ...], hidden: int, *, gate_up: bool) -> str | None:
+    """``"linear"`` or ``"bmm"`` when a fused tensor's shape names its layout.
+
+    Hub Linear layout: gate_up ``[E, 2*inter, hidden]``, down ``[E, hidden,
+    inter]``; transformers bmm layout: gate_up ``[E, hidden, 2*inter]``, down
+    ``[E, inter, hidden]``. A square tensor (``2*inter == hidden`` for
+    gate_up, ``inter == hidden`` for down) fits both and names neither.
+    """
+    if len(shape) != 3 or (shape[1] == hidden) == (shape[2] == hidden):
+        return None
+    if gate_up:
+        return "bmm" if shape[1] == hidden else "linear"
+    return "linear" if shape[1] == hidden else "bmm"
+
+
+def split_fused_experts(weights: dict[str, Any], *, hidden_size: int) -> dict[str, Any]:
+    """Map fused ``experts.gate_up_proj`` / ``experts.down_proj`` onto switch-MoE leaves.
+
+    Official Qwen3.5/3.6 MoE checkpoints store each MoE block's routed experts
+    as two fused tensors, the MTP layer included:
+
+        layers.N.mlp.experts.gate_up_proj   [E, 2*inter, hidden]
+        layers.N.mlp.experts.down_proj      [E, hidden, inter]
+
+    (or the transformers bmm layout ``[E, hidden, 2*inter]`` / ``[E, inter,
+    hidden]``). MLX's switch-MoE layers load them as ``switch_mlp.{gate,up,
+    down}_proj.weight``. Without this mapping ``load_weights(strict=False)``
+    drops both keys and the routed experts keep their random init. Gate is the
+    first half of the fused projection, as in transformers. Other keys pass
+    through unchanged. Every loader and the forge sidecar writer use this one
+    mapping.
+
+    A block's two tensors share one layout, and at most one of them can be
+    square (``2*inter == hidden`` and ``inter == hidden`` exclude each
+    other), so the block's tensors decide it together; a block whose layout
+    they cannot name, or name two ways, is refused rather than guessed. The
+    leaves are made contiguous, the layout the numbered-expert stack
+    produces, so a fused head computes exactly what the same head saved as
+    numbered experts computes.
+    """
+    if not any(key.endswith((_FUSED_GATE_UP, _FUSED_DOWN)) for key in weights):
+        return weights
+    import mlx.core as mx
+
+    hidden = int(hidden_size)
+    orientations: dict[str, set[str]] = {}
+    shapes: dict[str, list[tuple[int, ...]]] = {}
+    for key, value in weights.items():
+        for suffix, gate_up in ((_FUSED_GATE_UP, True), (_FUSED_DOWN, False)):
+            if key.endswith(suffix):
+                prefix = key[: -len(suffix)]
+                shape = tuple(int(dim) for dim in value.shape)
+                shapes.setdefault(prefix, []).append(shape)
+                found = orientations.setdefault(prefix, set())
+                orientation = _fused_orientation(shape, hidden, gate_up=gate_up)
+                if orientation is not None:
+                    found.add(orientation)
+    for prefix, found in orientations.items():
+        if len(found) != 1:
+            raise ValueError(
+                f"cannot tell the fused expert layout of {prefix}.mlp.experts: "
+                f"shapes {shapes[prefix]} at hidden size {hidden}"
+            )
+    result: dict[str, Any] = {}
+    for key, value in weights.items():
+        if key.endswith(_FUSED_GATE_UP):
+            prefix = key[: -len(_FUSED_GATE_UP)]
+            if orientations[prefix] == {"bmm"}:
+                gate, up = mx.split(value, 2, axis=-1)
+                gate, up = gate.swapaxes(1, 2), up.swapaxes(1, 2)
+            else:
+                gate, up = mx.split(value, 2, axis=1)
+            result[f"{prefix}.mlp.switch_mlp.gate_proj.weight"] = mx.contiguous(gate)
+            result[f"{prefix}.mlp.switch_mlp.up_proj.weight"] = mx.contiguous(up)
+        elif key.endswith(_FUSED_DOWN):
+            prefix = key[: -len(_FUSED_DOWN)]
+            if orientations[prefix] == {"bmm"}:
+                value = value.swapaxes(1, 2)
+            result[f"{prefix}.mlp.switch_mlp.down_proj.weight"] = mx.contiguous(value)
+        else:
+            result[key] = value
+    return result

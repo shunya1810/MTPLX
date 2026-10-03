@@ -53,6 +53,8 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from mtplx import moe_sorted_gather
+
 
 PACK_GATE_UP_ENV = "MTPLX_QWEN_MOE_PACK_GATE_UP"
 
@@ -148,7 +150,7 @@ class _PackedQuantizedProjection(nn.Module):
         )
 
     def gather(self, x: mx.array, indices: mx.array, sorted_indices: bool) -> mx.array:
-        return mx.gather_qmm(
+        return moe_sorted_gather.gather_qmm(
             x,
             self["weight"],
             self["scales"],

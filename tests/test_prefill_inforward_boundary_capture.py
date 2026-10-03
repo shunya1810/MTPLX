@@ -43,7 +43,6 @@ from mtplx.generation import (
     _prefill_committed_mtp_history_streaming,
     _prefill_spans_with_tail_grid,
     _iter_prefill_chunk_spans,
-    _thin_gdn_boundary_records,
 )
 from mtplx.models.qwen4_exp import TextArgs, TextModel
 

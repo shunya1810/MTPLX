@@ -298,6 +298,13 @@ public final class MTPLXBackendStore: ObservableObject {
     /// One-line, dismissable banner shown when `settings.json` could not be
     /// read at launch and was set aside (see `loadPersistedSettings`).
     @Published public private(set) var settingsRecoveryNotice: SettingsRecoveryNotice?
+    /// A configuration change (Settings, the model picker, Forge) that
+    /// failed before its restart reached the running daemon, which keeps
+    /// serving the previous configuration (#528). Shown as its own
+    /// dismissable notice, so the engine's badge keeps telling the truth
+    /// about the engine. Cleared by the next change, a start request or
+    /// Dismiss.
+    @Published public private(set) var configurationChangeFailure: String?
     @Published public private(set) var pendingModelDownload: PendingModelDownload?
     @Published public private(set) var modelDownloadProgress: DownloadProgressSnapshot?
     @Published public private(set) var modelDownloadFailure: String?
@@ -396,6 +403,9 @@ public final class MTPLXBackendStore: ObservableObject {
     /// performs external work. Production uses a no-op; lifecycle checks on
     /// both sides make delayed completions harmless.
     private let beforeClientHandoffLaunch: @Sendable (LaunchTarget) async -> Void
+    /// Test seam: after `refreshStaticState`'s requests have answered,
+    /// before the answers are read. Production uses the no-op.
+    private let beforeStaticStateAnswersAreRead: @Sendable () async -> Void
     /// Keeps the stale-handoff gate observable without asking package tests to
     /// start a real AppKit desktop client.
     private let cancelOpenCodeDesktop: (MTPLXDesktopHandoffIdentity) -> Bool
@@ -432,6 +442,27 @@ public final class MTPLXBackendStore: ObservableObject {
     private var recoveredAutomaticRestartGeneration = 0
     private var lastAppliedSupervisionRevision = -1
     private var lastTerminalCleanupLifecycleEpoch = 0
+    /// The start request running now (#528). It runs on a task this store
+    /// owns; the window's launch task, a menu item or Hermes only await it.
+    /// When the start ran on the caller's own task, closing the main window
+    /// during a model load cancelled that task, the cancellation reached
+    /// the supervisor's health wait, the supervisor stopped the loading
+    /// daemon, and the badge read "Degraded — CancellationError()".
+    /// Requests that arrive while it runs wait for it instead of racing it
+    /// for the supervisor: the loser used to get `alreadyRunning`, publish
+    /// Degraded over the daemon the winner launched, and replace the
+    /// winner's launch id so the winner could not finish either.
+    /// `stopGeneration` is the count of Stops and reaps when it began.
+    private var runningStart: (id: UUID, task: Task<Void, Never>, stopGeneration: Int)?
+    /// Bumped by Stop and by the reap path. A start that began under an
+    /// older value has been cancelled, however far it still has to unwind,
+    /// and a later request must not settle for its outcome.
+    private var stopGeneration = 0
+    /// Set when another server answered on the port of the daemon of this
+    /// lifecycle and the app let that daemon go (#528). The terminal
+    /// cleanup then shows this reason as Degraded instead of Stopped, so the
+    /// cause stays on screen rather than inviting a Start that moves ports.
+    private var portLoss: (lifecycleEpoch: Int, reason: String)?
     private let daemonStartupTimeoutSeconds: TimeInterval = 600
 
     public init(
@@ -450,6 +481,7 @@ public final class MTPLXBackendStore: ObservableObject {
         beforePostStartRefresh: (@Sendable () async -> Void)? = nil,
         beforeThermalStatusRefresh: (@Sendable () async -> Void)? = nil,
         beforeClientHandoffLaunch: (@Sendable (LaunchTarget) async -> Void)? = nil,
+        beforeStaticStateAnswersAreRead: (@Sendable () async -> Void)? = nil,
         openCodeDesktopCanceller: ((MTPLXDesktopHandoffIdentity) -> Bool)? = nil,
         modelUpdateChecker: (@Sendable () async throws -> [ModelUpdateInfo])? = nil,
         // Test seam for the browser sign-in ticket request. Production
@@ -482,6 +514,7 @@ public final class MTPLXBackendStore: ObservableObject {
         self.beforePostStartRefresh = beforePostStartRefresh ?? {}
         self.beforeThermalStatusRefresh = beforeThermalStatusRefresh ?? {}
         self.beforeClientHandoffLaunch = beforeClientHandoffLaunch ?? { _ in }
+        self.beforeStaticStateAnswersAreRead = beforeStaticStateAnswersAreRead ?? {}
         self.cancelOpenCodeDesktop = openCodeDesktopCanceller
             ?? { identity in openCodeIntegration.cancelLaunchedDesktop(identity) }
         self.supervisor.setAutomaticRestartEnabled(configuration.automaticDaemonRestart)
@@ -536,6 +569,10 @@ public final class MTPLXBackendStore: ObservableObject {
 
     public func dismissSettingsRecoveryNotice() {
         settingsRecoveryNotice = nil
+    }
+
+    public func dismissConfigurationChangeFailure() {
+        configurationChangeFailure = nil
     }
 
     public func saveSettings(_ next: MTPLXAppConfiguration) throws {
@@ -741,6 +778,12 @@ public final class MTPLXBackendStore: ObservableObject {
         await awaitDaemonTeardown()
         let launchID = UUID().uuidString
         let recoveryTarget = target
+        // What a failure before the restart reaches the running daemon has
+        // to put back (#528).
+        let holdBeforeChange = supervisor.currentHold()
+        let presentationBeforeChange = (state: daemonState, phase: startupPhase)
+        let terminalCleanupEpochBeforeChange = lastTerminalCleanupLifecycleEpoch
+        configurationChangeFailure = nil
         do {
             supervisor.setAutomaticRestartEnabled(next.automaticDaemonRestart)
             lastDaemonTarget = target
@@ -808,7 +851,7 @@ public final class MTPLXBackendStore: ObservableObject {
             activeLaunchID = launchID
             let startupHealth = try await supervisor.restart(
                 command: command,
-                healthBaseURL: baseURL,
+                healthBaseURL: configuredBaseURL,
                 apiKey: next.apiKey,
                 probeHealth: true,
                 timeoutSeconds: daemonStartupTimeoutSeconds,
@@ -844,6 +887,45 @@ public final class MTPLXBackendStore: ObservableObject {
         } catch {
             if activeLaunchID == launchID {
                 activeLaunchID = nil
+            }
+            if case DaemonSupervisorError.alreadyRunning = error {
+                // Another lifecycle claimed the supervisor between this
+                // restart's stop and its start (#528). Its daemon, fans and
+                // recovery are its own: no fan restore, no Degraded and no
+                // late recovery for a launch that never ran. The caller
+                // still learns that this restart did not happen.
+                await reconcileHeldDaemon()
+                throw error
+            }
+            if case .held = holdBeforeChange, supervisor.currentHold() == holdBeforeChange {
+                // The change failed before the restart reached the running
+                // daemon (runtime preparation, a client config write, or
+                // building the command), so that daemon still serves the
+                // previous configuration. The engine is fine: keep showing
+                // and monitoring it, leave its fans alone, and show the
+                // failed change on its own. This used to publish Degraded
+                // over the serving daemon, restore its max fans to auto and
+                // stop monitoring it.
+                let failureDescription = Self.humanizedStartFailure(
+                    error,
+                    port: configuration.port
+                )
+                configurationChangeFailure = failureDescription
+                daemonState = presentationBeforeChange.state
+                startupPhase = presentationBeforeChange.phase
+                // The restart claimed this daemon's terminal callback before
+                // it built the command; hand it back so an exit of the
+                // daemon that keeps serving is still noticed.
+                lastTerminalCleanupLifecycleEpoch = terminalCleanupEpochBeforeChange
+                await supervisor.logs.append(
+                    "configuration change failed before the running daemon was restarted; it keeps serving the previous configuration: \(failureDescription)",
+                    stream: .system
+                )
+                await refreshLogs()
+                // The restart may already have closed the live stats and the
+                // watchdog; reconnect them to the daemon that keeps serving.
+                await reconcileHeldDaemon()
+                throw error
             }
             let failedPhase = startupPhase
             // A failed swap must not leave fans pinned at max with no
@@ -898,7 +980,7 @@ public final class MTPLXBackendStore: ObservableObject {
             )
             guard let adoptedHealth = try await supervisor.adoptExistingIfAppOwned(
                 command: command,
-                healthBaseURL: baseURL,
+                healthBaseURL: configuredBaseURL,
                 apiKey: configuration.apiKey,
                 requireActualFanRamp: requiresStartupFanRamp(configuration)
             ) else {
@@ -924,6 +1006,113 @@ public final class MTPLXBackendStore: ObservableObject {
     /// merged onto the user's Settings. Picking a target persists it as
     /// `lastLaunchTarget` so a subsequent click can skip the picker.
     public func startDaemon(target: LaunchTarget?) async {
+        // The window's launch task runs again when a window reopens, Start
+        // can be pressed while a model loads, and Hermes or the benchmark
+        // ask for a ready daemon. A start already running owns the outcome;
+        // a second request waits for it (#528).
+        while let running = runningStart {
+            // Deciding and awaiting must not be split by another await; the
+            // log lines go out on their own tasks.
+            if running.stopGeneration == stopGeneration {
+                Task { [supervisor] in
+                    await supervisor.logs.append(
+                        "start requested while another start is in flight; joining it",
+                        stream: .system
+                    )
+                }
+                await running.task.value
+                return
+            }
+            // A Stop cancelled that start after it began (Restart is Stop
+            // then Start). Joining it would end this request with the
+            // cancelled one and launch nothing, so wait for it to unwind
+            // and then start.
+            Task { [supervisor] in
+                await supervisor.logs.append(
+                    "start requested after a Stop cancelled the start in flight; starting once it has unwound",
+                    stream: .system
+                )
+            }
+            await running.task.value
+        }
+        let id = UUID()
+        let generation = stopGeneration
+        // Not a child of the caller's task: cancelling the caller (a closed
+        // window) must not cancel the launch. Awaiting the value from a
+        // cancelled task still waits for it.
+        let task = Task { @MainActor [self] in
+            await runStartRequest(target: target, stopGeneration: generation)
+            if runningStart?.id == id {
+                runningStart = nil
+            }
+        }
+        runningStart = (id, task, generation)
+        await task.value
+    }
+
+    /// Whether a Stop (or a reap) came after the start request that began
+    /// under `generation` (#528). Stop could finish while a start was still
+    /// preparing (the runtime check, the port preflight): nothing had been
+    /// launched, so Stop had nothing to cancel, and the start went on to
+    /// launch after Stop. The start checks this after every await before
+    /// it launches.
+    private func startWasStopped(since generation: Int) -> Bool {
+        stopGeneration != generation
+    }
+
+    /// End a start that a Stop overtook before it launched anything. The
+    /// Stop owns the engine state; undo only what the start itself changed.
+    private func abandonStoppedStart(during step: String) async {
+        if let fallback = activePortFallback {
+            // The fallback port belonged to the launch that is not happening.
+            var next = configuration
+            next.port = fallback.configured
+            configuration = next
+            activePortFallback = nil
+        }
+        portFallbackNotice = nil
+        if startupPhase == .launching {
+            startupPhase = .idle
+        }
+        await supervisor.logs.append(
+            "start abandoned: Stop was pressed while it was \(step); nothing was launched",
+            stream: .system
+        )
+    }
+
+    private func runStartRequest(target: LaunchTarget?, stopGeneration generation: Int) async {
+        // A Stop or a reap may still be tearing the previous daemon down;
+        // what the supervisor holds is only known once that has finished.
+        await awaitDaemonTeardown()
+        if startWasStopped(since: generation) {
+            await abandonStoppedStart(during: "waiting for the previous daemon to stop")
+            return
+        }
+        portLoss = nil
+        configurationChangeFailure = nil
+        switch supervisor.currentHold() {
+        case .held(let held):
+            // This app already runs a daemon: reconnect to it. Asking the
+            // supervisor to start again threw `alreadyRunning`, which the
+            // badge showed as "Degraded" over a healthy daemon until the
+            // app was quit (#528). No launch, no fan change, no port change.
+            await supervisor.logs.append(
+                "start requested while daemon launch \(held.launchID ?? "unknown") is running; reconnecting to it instead of launching",
+                stream: .system
+            )
+            await reconcileHeldDaemon()
+            return
+        case .settling:
+            // An automatic restart, a model swap or a stop holds the
+            // supervisor and publishes its own outcome.
+            await supervisor.logs.append(
+                "start requested while a launch, restart or stop is in progress; leaving it to finish",
+                stream: .system
+            )
+            return
+        case .none:
+            break
+        }
         clientHandoffNotice = nil
         portFallbackNotice = nil
         if let fallback = activePortFallback {
@@ -935,7 +1124,7 @@ public final class MTPLXBackendStore: ObservableObject {
             configuration = next
             activePortFallback = nil
         }
-        await startDaemon(target: target, attemptedPortRemediation: false)
+        await startDaemon(target: target, attemptedPortRemediation: false, stopGeneration: generation)
     }
 
     /// `attemptedPortRemediation` bounds the relaunch to one retry: a
@@ -944,7 +1133,8 @@ public final class MTPLXBackendStore: ObservableObject {
     /// surfaces through the normal degraded path.
     private func startDaemon(
         target: LaunchTarget?,
-        attemptedPortRemediation: Bool
+        attemptedPortRemediation: Bool,
+        stopGeneration generation: Int
     ) async {
         // `mtplx serve` refuses non-loopback binds without an API key
         // (validate_server_security_args) — the process exits at argparse
@@ -990,19 +1180,37 @@ public final class MTPLXBackendStore: ObservableObject {
         // process in the background; wait for it so supervisor.start()
         // doesn't trip `.alreadyRunning`.
         await awaitDaemonTeardown()
+        if startWasStopped(since: generation) {
+            await abandonStoppedStart(during: "waiting for the previous daemon to stop")
+            return
+        }
         healthWatchTask?.cancel()
         healthWatchTask = nil
         let launchID = UUID().uuidString
+        var supersededPresentation: (DaemonState, DaemonStartupPhase)?
+        var supersededLaunchID: String?
         do {
             supervisor.setAutomaticRestartEnabled(configuration.automaticDaemonRestart)
             lastDaemonTarget = target
             try await prepareRuntimeForDaemonStart()
+            if startWasStopped(since: generation) {
+                await abandonStoppedStart(during: "checking the runtime")
+                return
+            }
             // Pre-flight the configured port before any integration writes
             // its config: adoptable app-owned daemons are left for the
             // supervisor, stale app-owned daemons are replaced in place,
             // and everything else moves us to the next free port so the
             // user never sees a raw "port occupied" failure.
-            await preflightConfiguredPort(target: target, launchID: launchID)
+            await preflightConfiguredPort(
+                target: target,
+                launchID: launchID,
+                isCurrent: { !self.startWasStopped(since: generation) }
+            )
+            if startWasStopped(since: generation) {
+                await abandonStoppedStart(during: "checking who holds the port")
+                return
+            }
             if target == .openCode {
                 let result = try openCodeIntegration.sync(configuration: configuration)
                 await supervisor.logs.append(
@@ -1035,12 +1243,23 @@ public final class MTPLXBackendStore: ObservableObject {
                 target: target,
                 launchID: launchID
             )
+            // The last check before the launch. From here on a Stop cancels
+            // the launch through `activeLaunchID` and the supervisor.
+            if startWasStopped(since: generation) {
+                await abandonStoppedStart(during: "preparing the launch")
+                return
+            }
+            // Another lifecycle can claim the supervisor while this request
+            // prepares (an adoption, an automatic restart, a model swap).
+            // Keep what this request replaces so it can hand it back.
+            supersededPresentation = (daemonState, startupPhase)
+            supersededLaunchID = activeLaunchID
             daemonState = .starting
             startupPhase = .launching
             activeLaunchID = launchID
             let startupHealth = try await supervisor.start(
                 command: command,
-                healthBaseURL: baseURL,
+                healthBaseURL: configuredBaseURL,
                 apiKey: configuration.apiKey,
                 probeHealth: true,
                 timeoutSeconds: daemonStartupTimeoutSeconds,
@@ -1072,8 +1291,29 @@ public final class MTPLXBackendStore: ObservableObject {
                 activeLaunchID = nil
             }
         } catch {
+            if case DaemonSupervisorError.alreadyRunning = error {
+                // The supervisor was claimed between this request's check
+                // and its launch (#528). The daemon that holds it is not
+                // this request's to judge: hand back the state and launch
+                // id it replaced, restore no fans, publish no Degraded and
+                // schedule no recovery for a launch that never ran. Then
+                // reconnect if that daemon is already up.
+                cancelledLaunchIDs.remove(launchID)
+                if activeLaunchID == launchID {
+                    activeLaunchID = supersededLaunchID
+                }
+                if daemonState == .starting,
+                   startupPhase == .launching,
+                   case let (previousState, previousPhase)? = supersededPresentation {
+                    daemonState = previousState
+                    startupPhase = previousPhase
+                }
+                await reconcileHeldDaemon()
+                return
+            }
             if !attemptedPortRemediation,
                !cancelledLaunchIDs.contains(launchID),
+               !startWasStopped(since: generation),
                Self.failureIndicatesPortConflict(error),
                await remediatePortConflict(target: target, launchID: launchID) {
                 if activeLaunchID == launchID {
@@ -1083,7 +1323,7 @@ public final class MTPLXBackendStore: ObservableObject {
                     "retrying daemon launch after port remediation",
                     stream: .system
                 )
-                await startDaemon(target: target, attemptedPortRemediation: true)
+                await startDaemon(target: target, attemptedPortRemediation: true, stopGeneration: generation)
                 return
             }
             let failureDescription = Self.humanizedStartFailure(
@@ -1152,19 +1392,25 @@ public final class MTPLXBackendStore: ObservableObject {
     /// - CLI-started MTPLX server or a foreign app: never touch someone
     ///   else's process; move to the next free port, persist it, and
     ///   surface a one-line banner.
+    ///
+    /// `isCurrent` is false once a Stop has overtaken the start that runs
+    /// this preflight (#528): nothing is terminated and the port is not moved
+    /// after that.
     func preflightConfiguredPort(
         target: LaunchTarget?,
-        launchID: String
+        launchID: String,
+        isCurrent: () -> Bool = { true }
     ) async {
         // Issue #409: a foreign-looking occupant is re-probed over the
         // settle window before the port is moved — a draining MTPLX
         // daemon (stop/start, or the predecessor of an in-app update)
         // clears on its own and must never cost the user their port.
         let occupant = await PortPreflight.classifySettled(
-            baseURL: baseURL,
+            baseURL: configuredBaseURL,
             apiKey: configuration.apiKey,
             settleTimeoutSeconds: portSettleTimeoutSeconds
         )
+        guard isCurrent() else { return }
         let occupantDescription: String
         switch occupant {
         case .free:
@@ -1189,6 +1435,7 @@ public final class MTPLXBackendStore: ObservableObject {
                     "replacing stale app-owned daemon pid \(stalePID) on port \(configuration.port)",
                     stream: .system
                 )
+                guard isCurrent() else { return }
                 await supervisor.terminateExternalDaemon(rootPID: pid_t(stalePID))
                 return
             }
@@ -1205,12 +1452,14 @@ public final class MTPLXBackendStore: ObservableObject {
             let wedged = await Task.detached(priority: .userInitiated) {
                 PortPreflight.appOwnedListener(port: port)
             }.value
+            guard isCurrent() else { return }
             if let wedged {
                 await supervisor.logs.append(
                     "port preflight: \(port) held by a wedged app-owned daemon "
                     + "pid \(wedged.pid) (launch \(wedged.launchID)); reaping it and keeping the port",
                     stream: .system
                 )
+                guard isCurrent() else { return }
                 await supervisor.terminateExternalDaemon(rootPID: wedged.pid)
                 if await PortPreflight.waitUntilBindable(
                     port,
@@ -1226,6 +1475,7 @@ public final class MTPLXBackendStore: ObservableObject {
             }
             occupantDescription = tr("another app")
         }
+        guard isCurrent() else { return }
         let occupiedPort = configuration.port
         guard
             let freePort = PortPreflight.nextFreePort(
@@ -1306,7 +1556,7 @@ public final class MTPLXBackendStore: ObservableObject {
     ) async -> Bool {
         let occupiedPort = configuration.port
         let occupant = await PortPreflight.classifySettled(
-            baseURL: baseURL,
+            baseURL: configuredBaseURL,
             apiKey: configuration.apiKey,
             settleTimeoutSeconds: portSettleTimeoutSeconds
         )
@@ -1458,7 +1708,7 @@ public final class MTPLXBackendStore: ObservableObject {
     /// the API key in browser history, so the open path below asks the
     /// daemon for a one-time ticket first and uses this when it cannot.
     private func authenticatedBrowserURL(nextPath: String, fallback: URL) -> URL {
-        guard let apiKey = configuration.apiKey, !apiKey.isEmpty else {
+        guard let apiKey = activeAPIKey, !apiKey.isEmpty else {
             return fallback
         }
         let authURL = baseURL
@@ -1483,7 +1733,7 @@ public final class MTPLXBackendStore: ObservableObject {
     /// the button never goes dead.
     func browserURL(nextPath: String, plain: URL) async -> URL {
         let fallback = authenticatedBrowserURL(nextPath: nextPath, fallback: plain)
-        guard let apiKey = configuration.apiKey, !apiKey.isEmpty else {
+        guard let apiKey = activeAPIKey, !apiKey.isEmpty else {
             return plain
         }
         let client = browserAuthSession.map { MTPLXAPIClient(baseURL: baseURL, apiKey: apiKey, session: $0) }
@@ -1537,6 +1787,7 @@ public final class MTPLXBackendStore: ObservableObject {
         // This path owns its local client/metrics cleanup. Mark the active
         // lifecycle before asking the supervisor to stop so its terminal
         // snapshot cannot run a duplicate passive cleanup afterward.
+        stopGeneration &+= 1
         let stoppingLifecycleEpoch = supervisor.supervisionSnapshot().lifecycleEpoch
         if stoppingLifecycleEpoch > 0 {
             lastTerminalCleanupLifecycleEpoch = max(
@@ -1549,7 +1800,8 @@ public final class MTPLXBackendStore: ObservableObject {
             activeLaunchID = nil
         }
         let shouldWarnIfFanRestoreFails = shouldRestoreFanModeOnStop()
-        let startupPID = health?.startup?.pid.map(pid_t.init)
+        let startupPID = heldDaemonStartupPID()
+        portLoss = nil
         let piHandoffsToStop = Array(launchedPiHandoffLeases.values)
         let hermesHandoffsToStop = Array(launchedHermesHandoffLeases.values)
         modelDownloadTask?.cancel()
@@ -1828,7 +2080,13 @@ public final class MTPLXBackendStore: ObservableObject {
 
     @discardableResult
     public func ensureDaemonReadyForBenchmark() async throws -> HealthPayload {
-        if let existing = try? await apiClient.health(), existing.ok {
+        // Only the app's own daemon is a ready daemon (#528). Any healthy
+        // server at the configured port used to count: with nothing held,
+        // `mtplx serve` started in a terminal got the benchmark, and the
+        // pending live settings were posted to it.
+        let holdBeforeProbe = supervisor.currentHold()
+        if let existing = try? await apiClient.health(), existing.ok,
+           try answerIsTheHeldDaemon(existing, askedOf: holdBeforeProbe) {
             health = existing
             currentFanMode = verifiedFanMode(from: existing)
                 ?? currentFanMode
@@ -1851,7 +2109,9 @@ public final class MTPLXBackendStore: ObservableObject {
             throw BenchmarkDaemonReadinessError.startupFailed(reason)
         }
 
-        if let ready = try? await apiClient.health(), ready.ok {
+        let holdAfterStart = supervisor.currentHold()
+        if let ready = try? await apiClient.health(), ready.ok,
+           try answerIsTheHeldDaemon(ready, askedOf: holdAfterStart) {
             health = ready
             currentFanMode = verifiedFanMode(from: ready)
                 ?? currentFanMode
@@ -2049,6 +2309,7 @@ public final class MTPLXBackendStore: ObservableObject {
         isCurrent: (() -> Bool)? = nil,
         markUnreachableOnTransportFailure: Bool = true
     ) async throws {
+        let hold = supervisor.currentHold()
         let client = apiClient
         do {
             async let health = client.health()
@@ -2057,7 +2318,20 @@ public final class MTPLXBackendStore: ObservableObject {
             let fetchedHealth = try await health
             let fetchedCapabilities = try await capabilities
             let fetchedSessions = try await sessions
+            await beforeStaticStateAnswersAreRead()
             guard isCurrent?() ?? true else { return }
+            switch source(of: fetchedHealth, askedOf: hold) {
+            case .stale:
+                return
+            case .anotherServer(let held):
+                releaseDaemonToAnotherServer(fetchedHealth, held: held)
+                throw DaemonSupervisorError.portOccupied(
+                    pid: fetchedHealth.startup?.pid,
+                    launchID: fetchedHealth.startup?.launchId
+                )
+            case .heldDaemon, .unattributed:
+                break
+            }
             self.health = fetchedHealth
             self.capabilities = fetchedCapabilities
             self.sessions = fetchedSessions
@@ -2603,10 +2877,27 @@ public final class MTPLXBackendStore: ObservableObject {
             await client.connect(
                 snapshotIntervalMs: interval,
                 onState: { state in
-                    await MainActor.run {
-                        guard self?.daemonTransportGeneration == transportGeneration else { return }
-                        if keepOpen, state == .connecting { return }
+                    let reconnected = await MainActor.run { () -> Bool in
+                        guard self?.daemonTransportGeneration == transportGeneration else { return false }
+                        if keepOpen, state == .connecting { return false }
+                        let wasReconnecting: Bool
+                        if case .reconnecting? = self?.connectionState {
+                            wasReconnecting = true
+                        } else {
+                            wasReconnecting = false
+                        }
                         self?.connectionState = state
+                        return wasReconnecting && state == .open
+                    }
+                    // The stream came back after dropping (a sleep, a
+                    // network blip): check the engine against the daemon
+                    // this app holds, so a stale badge heals without a
+                    // restart (#528). Off the stream's own loop, which
+                    // must keep reading.
+                    if reconnected {
+                        Task { @MainActor in
+                            await self?.reconcileHeldDaemon()
+                        }
                     }
                 },
                 onEvent: { event in
@@ -2682,6 +2973,17 @@ public final class MTPLXBackendStore: ObservableObject {
                 // store state.
                 guard snapshot.lifecycleEpoch > lastTerminalCleanupLifecycleEpoch
                 else { break }
+                if let loss = portLoss, loss.lifecycleEpoch == snapshot.lifecycleEpoch {
+                    // The app let this daemon go because another server
+                    // answers on its port (#528). Stopped would hide why.
+                    cleanupTerminalDaemonSessionIfNeeded(
+                        lifecycleEpoch: snapshot.lifecycleEpoch,
+                        terminalState: .degraded(loss.reason),
+                        terminalStartupPhase: .failed(loss.reason),
+                        terminalConnectionState: .failed(loss.reason)
+                    )
+                    break
+                }
                 cleanupTerminalDaemonSessionIfNeeded(
                     lifecycleEpoch: snapshot.lifecycleEpoch,
                     terminalState: .stopped,
@@ -2883,6 +3185,238 @@ public final class MTPLXBackendStore: ObservableObject {
         await refreshLogs()
     }
 
+    /// View → Refresh and the toolbar refresh button (#528). The engine
+    /// state comes first and does not depend on the data panels decoding:
+    /// reconnect to the daemon this app holds, then reload the panels.
+    public func refresh() async {
+        await reconcileHeldDaemon()
+        // The panels describe a running engine. Read from the port while the
+        // engine starts, is degraded or is stopped, they show whatever
+        // answers there, and a failed read during a model load reached the
+        // unreachable-daemon path and reaped the loading daemon.
+        guard daemonState == .running else { return }
+        try? await refreshStaticState()
+        try? await refreshSnapshot()
+    }
+
+    /// Who answered a healthy /health (#528).
+    private enum HealthSource {
+        /// The daemon this app runs: the answer carries its launch id.
+        case heldDaemon
+        /// Something else answers where the held daemon listens.
+        case anotherServer(HeldDaemon)
+        /// No daemon is held yet, or the held one has no launch id.
+        case unattributed
+        /// The supervisor holds something else than when the request went
+        /// out (a restart, a stop or an adoption landed meanwhile). The
+        /// answer describes a daemon that is no longer the app's: dropped,
+        /// never acted on.
+        case stale
+    }
+
+    /// `health` supplies the pid that Stop and the reap path signal and the
+    /// watchdog's process evidence, so only an answer carrying the held
+    /// daemon's launch id may become `health`. A server that took the port
+    /// answers /health too. `hold` is what the supervisor held when the
+    /// request went out: an answer from the daemon a restart replaced names
+    /// the old launch id, and read against the replacement it looked like
+    /// another server, which made the app reap its own new daemon.
+    private func source(of payload: HealthPayload, askedOf hold: DaemonHold) -> HealthSource {
+        guard supervisor.currentHold() == hold else { return .stale }
+        guard case .held(let held) = hold,
+              let heldLaunchID = held.launchID
+        else { return .unattributed }
+        return payload.startup?.launchId == heldLaunchID ? .heldDaemon : .anotherServer(held)
+    }
+
+    /// The pid /health reported for the daemon this app runs, when that
+    /// answer carried the daemon's launch id. Stop and the reap path add it
+    /// to the process family they signal (the model server can outlive its
+    /// wrapper). A pid from any other answer may belong to a server that
+    /// took the port, and is never signalled (#528).
+    private func heldDaemonStartupPID() -> pid_t? {
+        guard let startup = health?.startup,
+              let pid = startup.pid,
+              let launchID = startup.launchId,
+              launchID == supervisor.activeLaunchID()
+        else { return nil }
+        return pid_t(pid)
+    }
+
+    /// Another server answers /health where this app's daemon listens: the
+    /// daemon lost its port. Typically an adopted daemon exited (the app
+    /// gets no exit callback for a process it did not launch) and
+    /// `mtplx serve`, started in a terminal, took the port. The app lets its
+    /// daemon go through the reap path, keeps the other server's pid out of
+    /// `health` so Stop never signals it, and stays Degraded naming the
+    /// other server rather than falling to Stopped (#528).
+    /// `answer` is nil when the server did not identify itself (an
+    /// undecodable /health, or 401/403) and the held daemon is known gone.
+    private func releaseDaemonToAnotherServer(_ answer: HealthPayload?, held: HeldDaemon) {
+        switch daemonState {
+        case .stopped, .stopping, .crashed:
+            return
+        case .running, .warming, .starting, .degraded:
+            break
+        }
+        let port = held.baseURL.port.map { String($0) } ?? held.baseURL.absoluteString
+        let reason: String
+        let identity: String
+        if let answer {
+            if let pid = answer.startup?.pid {
+                reason = tr(
+                    "Another MTPLX server holds port %@ (pid %@); this app is not connected to it.",
+                    port,
+                    String(pid)
+                )
+            } else {
+                reason = tr("Another MTPLX server holds port %@; this app is not connected to it.", port)
+            }
+            let answeredLaunch = answer.startup?.launchId ?? "none"
+            let answeredPID = answer.startup?.pid.map { String($0) } ?? "unknown"
+            identity = "launch \(answeredLaunch), pid \(answeredPID)"
+        } else {
+            reason = tr("Another server holds port %@; this app is not connected to it.", port)
+            identity = "it did not identify itself, and daemon launch \(held.launchID ?? "unknown") no longer runs"
+        }
+        if health?.startup?.launchId != held.launchID {
+            health = nil
+        }
+        let heldLaunch = held.launchID ?? "unknown"
+        let address = held.baseURL.absoluteString
+        Task { [supervisor] in
+            await supervisor.logs.append(
+                "another server answers /health at \(address) (\(identity)); letting go of daemon launch \(heldLaunch) and leaving that server alone",
+                stream: .system
+            )
+        }
+        portLoss = (held.lifecycleEpoch, reason)
+        reapDaemon(reason: reason)
+    }
+
+    /// Something answered at the held daemon's address without identifying
+    /// itself (an undecodable /health, or 401/403). That proves a live
+    /// server, not a live daemon of this app: an adopted daemon gives no
+    /// exit callback, and one that exited left its port to whatever took
+    /// it, which kept the badge Running for good (#528). If the held
+    /// daemon's process is gone, let it go. Returns whether it did.
+    private func releaseIfTheHeldDaemonIsGone(askedOf hold: DaemonHold) -> Bool {
+        guard case .held(let held) = hold,
+              supervisor.currentHold() == hold,
+              !supervisor.heldDaemonIsRunning()
+        else { return false }
+        releaseDaemonToAnotherServer(nil, held: held)
+        return true
+    }
+
+    /// The benchmark's readiness check: true only for an answer from the
+    /// daemon the app holds. Another server on the held daemon's port ends
+    /// the check with that server named; an answer from a server the app
+    /// does not hold, or a stale one, is simply not a ready daemon.
+    private func answerIsTheHeldDaemon(_ payload: HealthPayload, askedOf hold: DaemonHold) throws -> Bool {
+        switch source(of: payload, askedOf: hold) {
+        case .heldDaemon:
+            return true
+        case .anotherServer(let held):
+            releaseDaemonToAnotherServer(payload, held: held)
+            if case .degraded(let reason) = daemonState {
+                throw BenchmarkDaemonReadinessError.startupFailed(reason)
+            }
+            throw BenchmarkDaemonReadinessError.unreachable(held.baseURL)
+        case .unattributed:
+            if case .none = hold, payload.startup?.launchId?.isEmpty != false {
+                // A server the app never launched (no app launch id, such
+                // as `mtplx serve` from a terminal) holds the configured
+                // port. It is not the app's daemon, and loading a second
+                // model beside it is not the benchmark's call: say so, as
+                // Play's port check does.
+                let port = String(configuration.port)
+                throw BenchmarkDaemonReadinessError.startupFailed(
+                    tr("Port %@ is held by an MTPLX server started outside the app. Press Ctrl-C in its terminal or run `mtplx stop --port %@`, then press Play.", port, port)
+                )
+            }
+            // An app-owned daemon the app does not hold yet: the start that
+            // follows adopts it, or replaces it when it no longer matches.
+            return false
+        case .stale:
+            return false
+        }
+    }
+
+    /// Reconnect the store to the daemon the supervisor already holds
+    /// (#528). A start request that finds one, Refresh, and a live-stats
+    /// stream that comes back after dropping all run this. It never
+    /// launches, stops or restarts a daemon, never touches the fans, and
+    /// keeps the metrics on screen.
+    ///
+    /// One /health probe, at the address the daemon was verified at, decides:
+    /// - the held daemon answers healthy under its own launch id: the engine
+    ///   is running. The badge says so, and a missing or dropped live-stats
+    ///   stream and a missing watchdog start again.
+    /// - a server answers there under another launch id, or none: this
+    ///   app's daemon no longer holds its port. The app lets it go and
+    ///   names the other server (`releaseDaemonToAnotherServer`).
+    /// - no answer it can attribute (busy, 401, an undecodable payload):
+    ///   nothing changes. A busy daemon stays Running and only the
+    ///   watchdog decides that a silent one is gone (#487).
+    func reconcileHeldDaemon() async {
+        await awaitDaemonTeardown()
+        // The probe and any restarted transport go to the address the held
+        // daemon was verified at, which is `baseURL` while it is held.
+        guard case .held(let held) = supervisor.currentHold() else { return }
+        let stateBefore = daemonState
+        // A model swap replaces the daemon; its own outcome is the one to show.
+        guard stateBefore != .stopping else { return }
+        let probeClient = MTPLXAPIClient.livenessProbe(
+            baseURL: held.baseURL,
+            apiKey: activeAPIKey
+        )
+        let answer = await probeClient.livenessWithinDeadline(
+            seconds: Self.watchdogProbeDeadlineSeconds
+        )
+        probeClient.session.finishTasksAndInvalidate()
+        // A Stop, a reap, a swap or a newer daemon that arrived while the
+        // probe was out owns the state now.
+        guard supervisor.currentHold() == .held(held), daemonState == stateBefore else { return }
+        guard case .healthy(let payload) = answer, payload.ok,
+              let heldLaunchID = held.launchID
+        else {
+            switch answer {
+            case .aliveUndecodable, .aliveUnauthorized:
+                if releaseIfTheHeldDaemonIsGone(askedOf: .held(held)) {
+                    return
+                }
+            case .healthy, .unreachable:
+                break
+            }
+            if shouldProbeDaemonHealth, healthWatchTask == nil {
+                startDaemonHealthWatchdog()
+            }
+            return
+        }
+        guard payload.startup?.launchId == heldLaunchID else {
+            releaseDaemonToAnotherServer(payload, held: held)
+            return
+        }
+        health = payload
+        daemonUnresponsiveFor = nil
+        currentFanMode = verifiedFanMode(from: payload)
+            ?? currentFanMode
+            ?? MTPLXFanMode.normalized(configuration.fanMode).rawValue
+        // A recovery still waiting for some other launch has nothing to do.
+        lateHealthRecoveryTask?.cancel()
+        lateHealthRecoveryTask = nil
+        if daemonState != .running {
+            daemonState = .running
+            startupPhase = .ready
+        }
+        if streamTask == nil || connectionState != .open {
+            startMetricsStream()
+        } else if healthWatchTask == nil {
+            startDaemonHealthWatchdog()
+        }
+    }
+
     public func markDaemonUnreachable(reason: String) {
         Task { @MainActor [weak self] in
             await self?.markDaemonUnreachableUnlessAlive(reason: reason)
@@ -2931,8 +3465,10 @@ public final class MTPLXBackendStore: ObservableObject {
     /// the supervisor's root (the wrapper), an adopted daemon has neither
     /// and is judged by its port alone.
     private func gatherDaemonLivenessEvidence() async -> DaemonLivenessEvidence {
-        let pid = health?.startup?.pid.map(pid_t.init) ?? supervisor.daemonProcessIdentifier()
-        let processAlive = pid.map(DaemonSupervisor.processIsAlive)
+        let pid = heldDaemonStartupPID() ?? supervisor.daemonProcessIdentifier()
+        // Alive means still the app's daemon, not merely an occupied pid
+        // (#528): a pid is reused once its process has exited.
+        let processAlive = pid.map { supervisor.pidRunsHeldDaemon($0) }
         let url = baseURL
         // Read the main-actor constant here; the detached probe must not
         // touch actor-isolated state.
@@ -2974,7 +3510,7 @@ public final class MTPLXBackendStore: ObservableObject {
         let watchdogTransportGeneration = daemonTransportGeneration
         let probeClient = MTPLXAPIClient.livenessProbe(
             baseURL: baseURL,
-            apiKey: configuration.apiKey
+            apiKey: activeAPIKey
         )
         healthWatchTask = Task { @MainActor [weak self] in
             defer { probeClient.session.finishTasksAndInvalidate() }
@@ -2992,6 +3528,7 @@ public final class MTPLXBackendStore: ObservableObject {
                     tracker.recordAnswer()
                     continue
                 }
+                let holdAtProbe = self.supervisor.currentHold()
                 let liveness = await probeClient.livenessWithinDeadline(
                     seconds: Self.watchdogProbeDeadlineSeconds
                 )
@@ -3000,6 +3537,20 @@ public final class MTPLXBackendStore: ObservableObject {
                 else { return }
                 switch liveness {
                 case .healthy(let health) where health.ok:
+                    switch self.source(of: health, askedOf: holdAtProbe) {
+                    case .stale:
+                        // The daemon this probe asked is no longer the one
+                        // held; the next round asks the current one.
+                        continue
+                    case .anotherServer(let held):
+                        // The answer is not this app's daemon: an adopted
+                        // daemon exited and another server took its port
+                        // (#528). Its pid must never become `health`.
+                        self.releaseDaemonToAnotherServer(health, held: held)
+                        return
+                    case .heldDaemon, .unattributed:
+                        break
+                    }
                     tracker.recordAnswer()
                     loggedBusy = false
                     self.daemonUnresponsiveFor = nil
@@ -3021,6 +3572,11 @@ public final class MTPLXBackendStore: ObservableObject {
                     // to kill a serving process (2026-07-06: the watchdog
                     // reaped a healthy daemon 95 s after an OpenCode run
                     // because one /health field stopped matching Codable).
+                    // Unless the app's daemon no longer runs: then the
+                    // answer comes from another server on its port (#528).
+                    if self.releaseIfTheHeldDaemonIsGone(askedOf: holdAtProbe) {
+                        return
+                    }
                     tracker.recordAnswer()
                     self.daemonUnresponsiveFor = nil
                     if !loggedUndecodable {
@@ -3035,7 +3591,11 @@ public final class MTPLXBackendStore: ObservableObject {
                     continue
                 case .aliveUnauthorized:
                     // 401/403 proves a live daemon; an API-key mismatch is a
-                    // configuration problem, never grounds to reap.
+                    // configuration problem, never grounds to reap. Unless
+                    // the app's daemon no longer runs (#528).
+                    if self.releaseIfTheHeldDaemonIsGone(askedOf: holdAtProbe) {
+                        return
+                    }
                     tracker.recordAnswer()
                     self.daemonUnresponsiveFor = nil
                     if !loggedUndecodable {
@@ -3095,8 +3655,16 @@ public final class MTPLXBackendStore: ObservableObject {
         case .stopped, .degraded, .stopping, .crashed:
             return
         }
+        reapDaemon(reason: reason)
+    }
 
-        let startupPID = health?.startup?.pid.map(pid_t.init)
+    /// Show `reason` as Degraded and stop the supervisor's daemon family in
+    /// the background.
+    private func reapDaemon(reason: String) {
+        let startupPID = heldDaemonStartupPID()
+        // The reap stops the supervisor like Stop does; a start request
+        // after it must launch rather than join a start the reap ended.
+        stopGeneration &+= 1
         healthWatchTask?.cancel()
         healthWatchTask = nil
         streamTask?.cancel()
@@ -3863,6 +4431,8 @@ public final class MTPLXBackendStore: ObservableObject {
                 recoveryGeneration: nil
             )
         }
+        await syncClientWindowWithDaemon(target: target, configuration: configuration)
+        guard isCurrent() else { return false }
         if target == .hermes {
             let handoffID = UUID()
             guard await launchHermesTerminalHandoff(
@@ -3910,6 +4480,51 @@ public final class MTPLXBackendStore: ObservableObject {
         guard isCurrent() else { return false }
         onDaemonReady?(target)
         return isCurrent()
+    }
+
+    /// Brings Pi's or OpenCode's window to the one the running daemon
+    /// executes (`/health` `execution_window`) before the client launches.
+    /// The write before the daemon started could only use the window setting,
+    /// which on 2026-09-29 told Pi 262,144 tokens the engine could not serve.
+    private func syncClientWindowWithDaemon(
+        target: LaunchTarget?,
+        configuration: MTPLXAppConfiguration
+    ) async {
+        guard target == .pi || target == .openCode,
+              let served = health?.executionWindow,
+              served.tokens > 0
+        else { return }
+        do {
+            if target == .openCode {
+                let result = try openCodeIntegration.sync(
+                    configuration: configuration,
+                    servedWindow: served
+                )
+                if result.didChange {
+                    await supervisor.logs.append(
+                        "OpenCode window set to the daemon's \(served.tokens) tokens, output limit \(OpenCodeIntegration.outputLimit(forContextWindow: served.tokens))",
+                        stream: .system
+                    )
+                }
+            }
+            if target == .pi {
+                let result = try piIntegration.sync(
+                    configuration: configuration,
+                    servedWindow: served
+                )
+                if result.didChange {
+                    await supervisor.logs.append(
+                        "Pi window set to the daemon's \(served.tokens) tokens",
+                        stream: .system
+                    )
+                }
+            }
+        } catch {
+            await supervisor.logs.append(
+                "could not set the client window from the daemon: \(String(describing: error))",
+                stream: .system
+            )
+        }
     }
 
     private func refreshPostStartState(
@@ -4270,7 +4885,20 @@ public final class MTPLXBackendStore: ObservableObject {
     /// can stay in sync with port / API-key changes without holding a
     /// stale reference.
     public var apiClient: MTPLXAPIClient {
-        MTPLXAPIClient(baseURL: baseURL, apiKey: configuration.apiKey)
+        MTPLXAPIClient(baseURL: baseURL, apiKey: activeAPIKey)
+    }
+
+    /// The API key requests to the running daemon carry: the one it was
+    /// launched or adopted with while a daemon is held, else the configured
+    /// one (#528). A configuration change that failed before its restart
+    /// left the new key in `configuration` while the old daemon kept the
+    /// old one, and every request, the chat included, got 401 under a
+    /// Running badge.
+    public var activeAPIKey: String? {
+        if let connection = supervisor.activeConnection() {
+            return connection.apiKey
+        }
+        return configuration.apiKey
     }
 
     /// Connectable daemon base URL. The configured host is a BIND address;
@@ -4279,7 +4907,20 @@ public final class MTPLXBackendStore: ObservableObject {
     /// startup health wait, and the watchdog all fail against a healthy LAN
     /// daemon (issue #109). The verbatim bind host still flows to `--host`
     /// via MTPLXCommandBuilder.
+    ///
+    /// While a daemon runs (or is launching), this is where it listens, not
+    /// what the configuration says now (#528). A port fallback (#503) runs a
+    /// launch on another port while settings keep the configured one, and
+    /// reopening the window reloads settings from disk; the chat, the
+    /// dashboard, the watchdog and every other request used to follow the
+    /// reloaded port to whatever held it.
     public var baseURL: URL {
+        supervisor.activeBaseURL() ?? configuredBaseURL
+    }
+
+    /// Where the next launch will listen: the configured bind host and port,
+    /// connectable. Launches, adoption and the port preflight use this.
+    public var configuredBaseURL: URL {
         MTPLXServerURLs.baseURL(
             bindHost: configuration.host,
             port: configuration.port
@@ -4302,7 +4943,7 @@ public final class MTPLXBackendStore: ObservableObject {
             do {
                 self.startupPhase = .waitingForOwnedHealth
                 let recoveredHealth = try await self.supervisor.waitForExistingHealth(
-                    healthBaseURL: self.baseURL,
+                    healthBaseURL: self.configuredBaseURL,
                     apiKey: self.configuration.apiKey,
                     timeoutSeconds: self.daemonStartupTimeoutSeconds,
                     expectedLaunchID: launchID,
@@ -4395,7 +5036,8 @@ public final class MTPLXBackendStore: ObservableObject {
         // `in_flight[].last_progress`. During generation, accepting that
         // completed `latest` would make the hero gauge alternate between
         // the live current TPS and the previous/peak-like completed TPS.
-        if shouldAcceptSnapshotLatest(snapshot), let value = headlineDecodeTPS(from: latest) {
+        if shouldAcceptSnapshotLatest(snapshot),
+           let value = headlineDecodeTPS(from: latest, live: !snapshot.inFlight.isEmpty) {
             updateHeadlineDecode(value: value, isCompletion: snapshot.inFlight.isEmpty)
         }
         recordAIMEBackendMetrics(
@@ -4448,7 +5090,7 @@ public final class MTPLXBackendStore: ObservableObject {
                 let mergedLatest = MetricsLatest(values: merged)
                 latest = mergedLatest
                 updateSmoothedMetrics(mergedLatest)
-                if let value = headlineDecodeTPS(from: mergedLatest) {
+                if let value = headlineDecodeTPS(from: mergedLatest, live: true) {
                     updateHeadlineDecode(value: value, isCompletion: false)
                 }
                 if Self.hasDecodeProgress(progress) {
@@ -4479,7 +5121,7 @@ public final class MTPLXBackendStore: ObservableObject {
             // request has already finished.
             updateSmoothedMetrics(envelope, snapToFinal: true)
             smoothedFrozen = true
-            if let value = headlineDecodeTPS(from: envelope) {
+            if let value = headlineDecodeTPS(from: envelope, live: false) {
                 updateHeadlineDecode(value: value, isCompletion: true)
             }
             prefillStatus = nil
@@ -4595,16 +5237,36 @@ public final class MTPLXBackendStore: ObservableObject {
     /// Headline decode rate for the hero gauge.
     ///
     /// The center gauge means "current decode TPS", not best, rolling,
-    /// display-window, or cumulative average. Those other values have
-    /// their own UI homes. Keeping this source to `decode_tok_s` prevents
-    /// the gauge from bouncing between the current sample and an earlier
-    /// high/peak-like value.
-    private func headlineDecodeTPS(from latest: MetricsLatest?) -> Double? {
+    /// display-window, or cumulative average. While a request streams that
+    /// is the rate of the phase the answer is in (reasoning, answer, tool
+    /// call): the server's `phase_tok_s`. The cumulative `decode_tok_s`
+    /// divided every token by the time since the first one, so a slow
+    /// reasoning phase held the gauge near 40 through answers decoding at
+    /// 57 to 79 (2026-09-29). A phase-aware frame without a phase rate yet
+    /// (the first second of decode) leaves the gauge where it is rather
+    /// than showing the spiky early cumulative figure. A completed request
+    /// is held at its receipt's cumulative `decode_tok_s`, the honest
+    /// whole-request summary.
+    private func headlineDecodeTPS(from latest: MetricsLatest?, live: Bool) -> Double? {
         guard let latest else { return nil }
-        if let raw = latest.values["decode_tok_s"]?.doubleValue, raw.isFinite, raw > 0 {
-            return raw
+        return Self.headlineDecodeTPS(values: latest.values, live: live)
+    }
+
+    nonisolated static func headlineDecodeTPS(
+        values: [String: JSONValue],
+        live: Bool
+    ) -> Double? {
+        func positive(_ key: String) -> Double? {
+            guard let value = values[key]?.doubleValue, value.isFinite, value > 0 else {
+                return nil
+            }
+            return value
         }
-        return nil
+        if live {
+            if let phase = positive("phase_tok_s") { return phase }
+            if values["decode_phase"] != nil { return nil }
+        }
+        return positive("decode_tok_s")
     }
 
     /// Push a new headline reading through the lifecycle state machine.

@@ -349,6 +349,68 @@ def test_stack_mtp_moe_experts_stacks_quantized_numbered_experts() -> None:
     )
 
 
+def _fused_qwen_moe_mtp_weights(mx, *, num_experts: int, hidden: int, inter: int, bmm: bool):
+    """Official Qwen3.5/3.6 MoE MTP payload: fused experts plus the plain leaves."""
+    from mtplx.constants import EXPECTED_QWEN_MOE_MTP_KEYS
+
+    gate = mx.arange(num_experts * inter * hidden, dtype=mx.float32).reshape(num_experts, inter, hidden)
+    up = -gate - 1.0
+    down = mx.arange(num_experts * hidden * inter, dtype=mx.float32).reshape(num_experts, hidden, inter) + 0.5
+    weights = {}
+    for key in EXPECTED_QWEN_MOE_MTP_KEYS:
+        stripped = key.removeprefix("mtp.")
+        if stripped.endswith("mlp.experts.gate_up_proj"):
+            fused = mx.concatenate([gate, up], axis=1)  # [E, 2*inter, hidden]
+            weights[stripped] = fused.swapaxes(1, 2) if bmm else fused
+        elif stripped.endswith("mlp.experts.down_proj"):
+            weights[stripped] = down.swapaxes(1, 2) if bmm else down  # [E, hidden, inter]
+        else:
+            weights[stripped] = mx.ones((hidden,))
+    return weights, gate, up, down
+
+
+@pytest.mark.parametrize("bmm", [False, True])
+def test_finalize_maps_fused_qwen_moe_mtp_experts_onto_switch_mlp(bmm: bool) -> None:
+    """Fused experts must reach switch_mlp, or load_weights(strict=False) drops them."""
+    mx = pytest.importorskip("mlx.core")
+    from mtplx.constants import EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS
+
+    num_experts, hidden, inter = 4, 8, 3
+    weights, gate, up, down = _fused_qwen_moe_mtp_weights(
+        mx, num_experts=num_experts, hidden=hidden, inter=inter, bmm=bmm
+    )
+    config = {"text_config": {"num_experts": num_experts, "hidden_size": hidden}}
+
+    finalized = _finalize_mtp_weights(weights, config)
+
+    assert set(finalized) == {k.removeprefix("mtp.") for k in EXPECTED_QWEN_MOE_SWITCH_MLP_MTP_KEYS}
+    switch = "layers.0.mlp.switch_mlp"
+    assert mx.array_equal(finalized[f"{switch}.gate_proj.weight"], gate).item()
+    assert mx.array_equal(finalized[f"{switch}.up_proj.weight"], up).item()
+    assert mx.array_equal(finalized[f"{switch}.down_proj.weight"], down).item()
+
+
+def test_fused_and_numbered_mtp_experts_finalize_identically() -> None:
+    mx = pytest.importorskip("mlx.core")
+    num_experts, hidden, inter = 4, 8, 3
+    fused, gate, up, down = _fused_qwen_moe_mtp_weights(
+        mx, num_experts=num_experts, hidden=hidden, inter=inter, bmm=False
+    )
+    numbered = {k: v for k, v in fused.items() if ".mlp.experts." not in k}
+    for e in range(num_experts):
+        numbered[f"layers.0.mlp.experts.{e}.gate_proj.weight"] = gate[e]
+        numbered[f"layers.0.mlp.experts.{e}.up_proj.weight"] = up[e]
+        numbered[f"layers.0.mlp.experts.{e}.down_proj.weight"] = down[e]
+    config = {"text_config": {"num_experts": num_experts, "hidden_size": hidden}}
+
+    from_fused = _finalize_mtp_weights(fused, config)
+    from_numbered = _finalize_mtp_weights(numbered, config)
+
+    assert set(from_fused) == set(from_numbered)
+    for key in from_fused:
+        assert mx.array_equal(from_fused[key], from_numbered[key]).item(), key
+
+
 def test_prequantized_module_prefixes_uses_only_complete_quantized_triples() -> None:
     mx = pytest.importorskip("mlx.core")
     weights = {

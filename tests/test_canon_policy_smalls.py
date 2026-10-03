@@ -1,6 +1,6 @@
 """Session/canonicalization hardening smalls (audit F11 #5/#6/#8/#9/P2).
 
-Covers: the three repair re-encodes preserving committed reasoning, the
+Covers: the repair prompts preserving committed reasoning, the
 transient trailing-sentinel registry, the system-suffix conversion of the
 no-tools/post-tool contracts, the burst-pinned date line, single-call
 session resolution, reasoning_effort ladder mapping, and the warmup
@@ -24,45 +24,73 @@ OPENAI_PY = Path(oa.__file__)
 # --- repair-encode preserves committed reasoning (x3 sites) ---------------
 
 
-def test_all_three_repair_encodes_preserve_committed_reasoning():
-    """The stream retry/repair helpers re-encode the gate's canonical
-    messages; every one of them must pass allow_committed_reasoning=True or
-    the repair prompt drops the substituted think and re-poisons what
-    canonicalization just fixed (audit F11 #5). AST-pinned so a fourth
-    repair site added without the flag fails this test."""
+def test_every_repair_prompt_keeps_committed_reasoning():
+    """The stream's recovery passes build their prompts from the gate's
+    canonical messages; a re-encode without allow_committed_reasoning=True
+    drops the substituted think and re-poisons what canonicalization just
+    fixed (audit F11 #5). Since 2026-09-30 both re-generations take their
+    prompt from served_retry_prompt_ids (the served ids, then the repair
+    turn), whose two renders must carry the flag, and the reasoning-completion
+    repair extends the served ids without re-encoding. AST-pinned so a
+    repair site that re-encodes on its own, or a builder render without the
+    flag, fails this test."""
     tree = ast.parse(OPENAI_PY.read_text())
-    repair_calls: list[tuple[int, bool]] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        targets = [
-            target.id
-            for target in node.targets
-            if isinstance(target, ast.Name)
-        ]
-        if "repair_prompt_ids" not in targets:
-            continue
-        call = node.value
-        if not isinstance(call, ast.Call):
-            continue
-        func = call.func
-        name = getattr(func, "id", getattr(func, "attr", ""))
-        if name != "_encode_messages":
-            continue
-        has_flag = any(
+
+    def called(call: ast.Call) -> str:
+        return getattr(call.func, "id", getattr(call.func, "attr", ""))
+
+    def has_flag(call: ast.Call) -> bool:
+        return any(
             keyword.arg == "allow_committed_reasoning"
             and isinstance(keyword.value, ast.Constant)
             and keyword.value.value is True
             for keyword in call.keywords
         )
-        repair_calls.append((node.lineno, has_flag))
-    assert len(repair_calls) == 3, (
-        f"expected exactly the three known repair encodes, found {repair_calls}"
+
+    builders = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "served_retry_prompt_ids"
+    ]
+    assert len(builders) == 1, f"expected one retry prompt builder, found {len(builders)}"
+    renders = [
+        node
+        for node in ast.walk(builders[0])
+        if isinstance(node, ast.Call) and called(node) == "_encode_messages"
+    ]
+    assert len(renders) == 2, (
+        f"expected the builder's two renders, found {[n.lineno for n in renders]}"
     )
-    missing = [line for line, has_flag in repair_calls if not has_flag]
+    missing = [node.lineno for node in renders if not has_flag(node)]
     assert not missing, (
-        f"repair encodes missing allow_committed_reasoning=True at lines {missing}"
+        f"builder renders missing allow_committed_reasoning=True at lines {missing}"
     )
+
+    sources: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        names: set[str] = set()
+        for target in node.targets:
+            elements = target.elts if isinstance(target, ast.Tuple) else [target]
+            names.update(
+                element.id for element in elements if isinstance(element, ast.Name)
+            )
+        if "repair_prompt_ids" not in names:
+            continue
+        value = node.value
+        sources.append(
+            (
+                node.lineno,
+                called(value) if isinstance(value, ast.Call) else type(value).__name__,
+            )
+        )
+    assert sorted(name for _line, name in sources) == [
+        "_reasoning_completion_repair_prompt_ids",
+        "served_retry_prompt_ids",
+        "served_retry_prompt_ids",
+    ], f"repair prompts must come from the served-ids builder, found {sources}"
 
 
 # --- sentinel-registry trailing boundary (x3 sentinels) -------------------

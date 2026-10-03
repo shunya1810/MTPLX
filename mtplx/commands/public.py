@@ -9726,6 +9726,7 @@ def cmd_serve_public(args: Any) -> int:
                 _print_serve_start_line("MTPLX is already running.")
                 _print_serve_start_line(f"OpenAI API Base URL: {base}/v1")
                 _print_serve_start_line(f"Pi model: {pi_model_ref(str(model_id))}")
+                _quickstart_attach_client("pi", args, health, model_id=str(model_id))
                 _quickstart_launch_pi_now(model_id=str(model_id))
                 _print_serve_start_line(
                     f"Manual fallback: {pi_launch_command(str(model_id))}"
@@ -9776,6 +9777,9 @@ def cmd_serve_public(args: Any) -> int:
                 _print_serve_start_line("MTPLX is already running.")
                 _print_serve_start_line(f"OpenAI API Base URL: {base}/v1")
                 _print_serve_start_line(f"OpenCode model: mtplx/{model_id}")
+                _quickstart_attach_client(
+                    "opencode", args, health, model_id=str(model_id)
+                )
                 _quickstart_launch_opencode_now()
                 _print_serve_start_line(
                     "Use the existing server, or stop that terminal with Ctrl-C to restart."
@@ -10095,6 +10099,10 @@ def cmd_serve_public(args: Any) -> int:
         )
     if bool(getattr(args, "allow_swap", False)):
         cmd.append("--allow-swap")
+    memory_limit = getattr(args, "memory_limit", None)
+    if memory_limit is not None and str(memory_limit).strip():
+        # Issue #548: the module resolves 'max' against this Mac's RAM.
+        cmd.extend(["--memory-limit", str(memory_limit).strip()])
     mtp_adapter = getattr(args, "mtp_adapter", None)
     if mtp_adapter:
         cmd.extend(["--mtp-adapter", str(mtp_adapter)])
@@ -12716,6 +12724,9 @@ def _quickstart_pi_payload(
                 api_key=api_key,
                 context_window=context_window,
                 vision=vision_enabled,
+                # The served window replaces this guess at the handoff, once
+                # the model is loaded (_sync_launched_client_window).
+                keep_window=True,
             )
         except (InvalidConfigFile, OSError) as exc:
             raise SystemExit(_client_config_refusal("Pi", exc)) from exc
@@ -12741,9 +12752,10 @@ def _live_server_capabilities(
 
     ``mtplx connect`` names a host and a port, never a pack, so the pack
     probe the quickstart lane uses has nothing to look at there. The daemon
-    reports its public model id and the same vision block the app reads;
-    when it answers, that is the source. Unreachable (or keyed off) answers
-    ``{}`` and callers keep the pack-metadata fallback (#472).
+    reports its public model id, the same vision block the app reads and the
+    window it serves (``execution_window``); when it answers, that is the
+    source. Unreachable (or keyed off) answers ``{}`` and callers keep the
+    pack-metadata fallback (#472).
     """
     base = f"http://{_connect_host_for_bind(str(host))}:{int(port)}"
     health = _http_json(base + "/health", timeout=timeout, api_key=api_key)
@@ -12758,6 +12770,9 @@ def _live_server_capabilities(
     vision = health.get("vision")
     if isinstance(vision, dict) and vision.get("enabled") is not None:
         live["vision"] = bool(vision.get("enabled"))
+    served = health.get("execution_window")
+    if isinstance(served, dict) and int(served.get("tokens") or 0) > 0:
+        live["context_window"] = int(served["tokens"])
     return live
 
 
@@ -12848,28 +12863,14 @@ def _quickstart_opencode_payload(
     base_url = f"http://{_connect_host_for_bind(host)}:{port}/v1"
     context_window = _inspection_context_window(inspection, args=args)
     reasoning_mode = _reasoning_mode(args, default="auto")
-    # The declared OpenCode reasoning capability mirrors the model contract:
-    # a family with a verified codec (unless the user forced --reasoning off),
-    # never an unknown model. The resolved public id is the fallback ref so
-    # inspection-less lanes (`mtplx integrate opencode`) still resolve the
-    # family from its marker.
-    reasoning_policy = reasoning_policy_for_model(
-        model_ref=str(getattr(args, "model", "") or "") or model_id,
-        inspection=inspection,
-    )
-    enable_thinking = reasoning_mode != "off" and reasoning_policy.supported
-    # The app/CLI dial is OpenCode's source of truth for reasoning effort:
-    # an explicit --reasoning-effort wins, otherwise the family's AGENT-lane
-    # default (codec.agent_effort — Qwen3.8: medium; Flash-Next: medium by
-    # the 2026-08-28 wall-clock A/B, chat default stays xhigh). The family's
-    # effort levels drive OpenCode's effort picker so it mirrors the dial.
-    reasoning_effort = getattr(args, "reasoning_effort", None)
-    if reasoning_effort in (None, "auto"):
-        reasoning_effort = reasoning_policy.agent_effort
-    if not enable_thinking:
-        reasoning_effort = None
-    reasoning_effort_levels = (
-        tuple(reasoning_policy.effort_levels) if reasoning_policy.supported else None
+    # The resolved public id is the fallback ref so inspection-less lanes
+    # (`mtplx integrate opencode`) still resolve the family from its marker.
+    enable_thinking, reasoning_effort, reasoning_effort_levels = (
+        _opencode_reasoning_fields(
+            args,
+            model_ref=str(getattr(args, "model", "") or "") or model_id,
+            inspection=inspection,
+        )
     )
     tool_prompt_mode = _inspection_tool_prompt_mode(args, inspection)
     chat_template_profile = str(
@@ -12877,7 +12878,10 @@ def _quickstart_opencode_payload(
         or OPENCODE_CHAT_TEMPLATE_PROFILE_DEFAULT
     )
     opencode_max_response_tokens = getattr(args, "max_response_tokens", None)
-    output_limit = opencode_output_limit(context_window, opencode_max_response_tokens)
+    # Only a cap the user typed reaches OpenCode's config; a pack's default
+    # cap is the server's to apply, and the reply reserve stays the default.
+    requested_output = _explicit_max_response_tokens(args)
+    output_limit = opencode_output_limit(context_window, requested_output)
     max_response_suffix = (
         f"--max-response-tokens {int(opencode_max_response_tokens)} "
         if opencode_max_response_tokens is not None
@@ -12924,7 +12928,7 @@ def _quickstart_opencode_payload(
         model_name=f"MTPLX {model_id}",
         api_key=getattr(args, "api_key", None),
         context_window=context_window,
-        output_limit=output_limit,
+        output_limit=requested_output,
         enable_thinking=enable_thinking,
         top_p=float(getattr(args, "top_p", 0.95)),
         top_k=int(getattr(args, "top_k", 20)),
@@ -13002,13 +13006,16 @@ def _quickstart_opencode_payload(
                 model_name=f"MTPLX {model_id}",
                 api_key=getattr(args, "api_key", None),
                 context_window=context_window,
-                output_limit=output_limit,
+                output_limit=requested_output,
                 enable_thinking=enable_thinking,
                 top_p=float(getattr(args, "top_p", 0.95)),
                 top_k=int(getattr(args, "top_k", 20)),
                 reasoning_effort=reasoning_effort,
                 reasoning_effort_levels=reasoning_effort_levels,
                 vision=_model_vision_enabled(str(getattr(args, "model", ""))),
+                # The served window replaces this guess at the handoff, once
+                # the model is loaded (_sync_launched_client_window).
+                keep_window=True,
             )
         except (InvalidConfigFile, OSError) as exc:
             raise SystemExit(_client_config_refusal("OpenCode", exc)) from exc
@@ -13256,6 +13263,205 @@ def _quickstart_print_opencode_handoff(
     _quickstart_line("      Keep this terminal open for the MTPLX server.")
     _quickstart_line("      OpenCode will open automatically when MTPLX is ready.")
     _quickstart_line()
+
+
+def _opencode_reasoning_fields(
+    args: Any,
+    *,
+    model_ref: str,
+    inspection: dict[str, Any] | None = None,
+) -> tuple[bool, str | None, tuple[str, ...] | None]:
+    """OpenCode's reasoning flag, effort and effort levels for a model.
+
+    The declared reasoning capability mirrors the model contract: a family
+    with a verified codec (unless the user forced --reasoning off), never an
+    unknown model. The app/CLI dial is OpenCode's source of truth for
+    reasoning effort: an explicit --reasoning-effort wins, otherwise the
+    family's AGENT-lane default (codec.agent_effort; Qwen3.8: medium;
+    Flash-Next: medium by the 2026-08-28 wall-clock A/B, chat default stays
+    xhigh). The family's effort levels drive OpenCode's effort picker so it
+    mirrors the dial.
+    """
+
+    reasoning_policy = reasoning_policy_for_model(
+        model_ref=model_ref,
+        inspection=inspection,
+    )
+    enable_thinking = (
+        _reasoning_mode(args, default="auto") != "off" and reasoning_policy.supported
+    )
+    reasoning_effort = getattr(args, "reasoning_effort", None)
+    if reasoning_effort in (None, "auto"):
+        reasoning_effort = reasoning_policy.agent_effort
+    if not enable_thinking:
+        reasoning_effort = None
+    reasoning_effort_levels = (
+        tuple(reasoning_policy.effort_levels) if reasoning_policy.supported else None
+    )
+    return enable_thinking, reasoning_effort, reasoning_effort_levels
+
+
+def _explicit_max_response_tokens(args: Any) -> int | None:
+    """The answer cap the user typed with --max-response-tokens, if any.
+
+    A pack can also set ``max_response_tokens`` as its default
+    (``default_max_response_tokens``); the server applies that one itself,
+    so it is not the user's choice to write into a client's config.
+    """
+
+    cli_flags = getattr(args, "_cli_flags", set()) or set()
+    value = getattr(args, "max_response_tokens", None)
+    if "max-response-tokens" not in cli_flags or value is None or int(value) <= 0:
+        return None
+    return int(value)
+
+
+def _quickstart_sync_client_window(
+    client: str,
+    health: dict[str, Any],
+    *,
+    model_id: str,
+    requested_output: int | None = None,
+) -> None:
+    """Give Pi or OpenCode the window a running server serves.
+
+    The config written before the handoff has only a guess at the window.
+    ``/health`` ``execution_window`` is the server's
+    ``served_execution_window``, the value the app configures both clients
+    from; a server too old to publish it leaves the config as written.
+    ``requested_output`` is the answer cap the user typed for this launch
+    (OpenCode only): the running server was started without it, so only
+    OpenCode's request can carry it.
+    """
+
+    served = health.get("execution_window")
+    window = int(served.get("tokens") or 0) if isinstance(served, dict) else 0
+    if window <= 0:
+        return
+    label = "Pi" if client == "pi" else "OpenCode"
+    try:
+        if client == "pi":
+            from mtplx.pi import refresh_pi_models_window
+
+            result = refresh_pi_models_window(model_id, window)
+        else:
+            from mtplx.opencode import refresh_opencode_window
+
+            result = refresh_opencode_window(
+                model_id, window, requested_output=requested_output
+            )
+    except (InvalidConfigFile, OSError) as exc:
+        _print_serve_start_line(f"Could not set the {label} window: {exc}")
+        return
+    if result["written"]:
+        _print_serve_start_line(
+            f"{label} window set to the {window:,} tokens this server serves."
+        )
+
+
+def _quickstart_attach_client(
+    client: str,
+    args: Any,
+    health: dict[str, Any],
+    *,
+    model_id: str,
+) -> None:
+    """Set Pi or OpenCode up for the model a running server serves.
+
+    ``mtplx start pi|opencode`` writes the client's config for the model it
+    resolved, then finds a server already answering on the port, and the
+    client opens on the model that server serves (``model_id``, from
+    ``/health``). When the config already lists that model (OpenCode: and
+    selects it), its entry takes the served window
+    (:func:`_quickstart_sync_client_window`). Otherwise the client's own
+    writer registers it with that window, and OpenCode selects it, as a
+    launch of that model would: the client never opens on a model its config
+    does not list, or with the window of a model the server is not running.
+    A config that cannot be read or written stops the handoff before the
+    client opens.
+    """
+
+    from mtplx.opencode import opencode_selects_model
+    from mtplx.pi import pi_lists_model
+
+    requested_output = (
+        _explicit_max_response_tokens(args) if client == "opencode" else None
+    )
+    label = "Pi" if client == "pi" else "OpenCode"
+    try:
+        ready = (
+            pi_lists_model(model_id)
+            if client == "pi"
+            else opencode_selects_model(model_id)
+        )
+    except (InvalidConfigFile, OSError) as exc:
+        raise SystemExit(_client_config_refusal(label, exc)) from exc
+    if ready:
+        _quickstart_sync_client_window(
+            client, health, model_id=model_id, requested_output=requested_output
+        )
+        return
+    served = health.get("execution_window")
+    served_window = int(served.get("tokens") or 0) if isinstance(served, dict) else 0
+    vision_block = health.get("vision")
+    vision = isinstance(vision_block, dict) and bool(vision_block.get("enabled"))
+    host = str(getattr(args, "host", "127.0.0.1"))
+    port = int(getattr(args, "port", 8000))
+    base_url = f"http://{_connect_host_for_bind(host)}:{port}/v1"
+    try:
+        if client == "pi":
+            from mtplx.pi import (
+                PI_DEFAULT_CONTEXT_WINDOW,
+                PI_LOCAL_API_KEY,
+                write_pi_models_config,
+            )
+
+            write_pi_models_config(
+                base_url=base_url,
+                model_id=model_id,
+                model_name=f"MTPLX {model_id}",
+                api_key=str(getattr(args, "api_key", None) or PI_LOCAL_API_KEY),
+                # A server too old to publish its window: the window it was
+                # started with, and an entry this model already has keeps its own.
+                context_window=served_window
+                or int(health.get("context_window") or PI_DEFAULT_CONTEXT_WINDOW),
+                vision=vision,
+                keep_window=served_window <= 0,
+            )
+        else:
+            from mtplx.opencode import (
+                OPENCODE_DEFAULT_CONTEXT_WINDOW,
+                write_opencode_config,
+            )
+
+            enable_thinking, reasoning_effort, reasoning_effort_levels = (
+                _opencode_reasoning_fields(args, model_ref=model_id)
+            )
+            write_opencode_config(
+                base_url=base_url,
+                model_id=model_id,
+                model_name=f"MTPLX {model_id}",
+                api_key=getattr(args, "api_key", None),
+                context_window=served_window
+                or int(health.get("context_window") or OPENCODE_DEFAULT_CONTEXT_WINDOW),
+                output_limit=requested_output,
+                enable_thinking=enable_thinking,
+                reasoning_effort=reasoning_effort,
+                reasoning_effort_levels=reasoning_effort_levels,
+                vision=vision,
+                keep_window=served_window <= 0,
+            )
+    except (InvalidConfigFile, OSError) as exc:
+        raise SystemExit(_client_config_refusal(label, exc)) from exc
+    picked = str(getattr(args, "model_id", "") or "")
+    instead = f", not {picked}" if picked and picked != model_id else ""
+    window_note = (
+        f" with the {served_window:,} tokens it serves" if served_window > 0 else ""
+    )
+    _print_serve_start_line(
+        f"It serves {model_id}{instead}, so {label} is set up for that model"
+        f"{window_note}."
+    )
 
 
 def _quickstart_launch_opencode_now() -> None:
@@ -15220,6 +15426,7 @@ def cmd_integrate_public(args: Any) -> int:
         }
     elif action == "opencode":
         from mtplx.opencode import (
+            OPENCODE_DEFAULT_CONTEXT_WINDOW,
             build_opencode_provider_config,
             opencode_config_path,
             write_opencode_config,
@@ -15241,6 +15448,13 @@ def cmd_integrate_public(args: Any) -> int:
             if "vision" in live
             else _model_vision_enabled(str(getattr(args, "model", "") or model_id))
         )
+        # The window that daemon serves when it serves this model, as the app
+        # configures OpenCode; otherwise the default window, as before.
+        context_window = (
+            int(live["context_window"])
+            if live.get("context_window") and live.get("model_id") == model_id
+            else OPENCODE_DEFAULT_CONTEXT_WINDOW
+        )
         api_key_suffix = _api_key_command_suffix(args)
         reasoning_policy = reasoning_policy_for_model(model_ref=model_id)
         payload = {
@@ -15259,6 +15473,7 @@ def cmd_integrate_public(args: Any) -> int:
                 base_url=api_base_url,
                 model_id=model_id,
                 model_name="MTPLX local",
+                context_window=context_window,
                 api_key=(
                     f"${args.api_key_env}"
                     if getattr(args, "api_key", None)
@@ -15291,6 +15506,7 @@ def cmd_integrate_public(args: Any) -> int:
                 model_id=model_id,
                 model_name=f"MTPLX {model_id}",
                 api_key=getattr(args, "api_key", None),
+                context_window=context_window,
                 enable_thinking=reasoning_policy.supported,
                 vision=vision,
                 reasoning_effort=reasoning_policy.default_effort,

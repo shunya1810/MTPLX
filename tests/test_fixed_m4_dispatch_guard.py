@@ -56,6 +56,7 @@ def _bank(fn, *, rope_args=()):
         ),
         "prepare_aux": lambda *_a: "aux",
         "fn": fn,
+        "host": None,
         "capture_leaves": 6,
         "capture_plan": ((gdn, 0, 6),),
         # What install_fixed_m4 binds for the request's positions: nothing

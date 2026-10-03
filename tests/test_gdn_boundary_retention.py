@@ -1,26 +1,53 @@
-"""GDN boundary retention: geometric coverage instead of oldest+dense-tail.
+"""Recurrent checkpoint retention keeps explicit anchors instead of re-thinning.
 
-Regression for the 2026-07-17 Hermes-lane finding (MEASUREMENTS 01:05 §B):
-near-miss prefix restores landed on the OLDEST retained recurrent boundary
-(2,048) despite a ~22.5k matched prefix, because the previous pop(1)
-retention left a mid-prefix coverage hole after append churn (postcommit
-re-forward chunk edges, clone/lease inheritance re-thinning). Result was a
-20k+ re-prefill and 35-50s TTFT on the founder's follow-up turns.
+History, in order:
 
-The invariant pinned here: re-prefill cost after thinning stays proportional
-to the true divergence distance from the tail (<= ~3x + one capture-grid
-interval), for any churn sequence.
+* 2026-07-17, Hermes lane (MEASUREMENTS 01:05 §B): the pop(1) policy ("keep
+  the oldest plus a dense tail") ate the middle, and a ~22.5k near-miss
+  restored at the OLDEST boundary, 2,048: a 20k+ re-prefill.
+* Its replacement kept one record per power-of-two distance from the NEWEST
+  record and re-thinned after every capture. 2026-09-29, Pi (B-cache 2.6):
+  thinning again each time the newest record moved eroded the middle anyway,
+  and a 16,371-token match restored at 4,096. B-cache reproduced it with the
+  real function: a restore at 4,096 followed by a 42.8K prefill kept
+  [4096, 34816, 38912, 40960, 43008, 45056, 46873, 46937].
+
+``mtplx.checkpoint_anchors`` now keeps the prompt-end anchor, the restore
+point, the stable edge and the newest checkpoint first, then the first
+checkpoint of every 8,192-token cell (coarser cells first when the budget
+cannot hold them all), then the newest of the rest. These tests drive the
+real capture, inheritance and prefill-plan functions:
+
+* the 16,371 case restores at the best anchor at or below 16,371, 8,192, not
+  4,096 (fails on the old code);
+* an agent session's churn does not erode deep coverage (fails on the old
+  code);
+* the 2026-07-17 near-tail case stays tight;
+* coverage of a uniform grid stays proportional to the divergence;
+* an inherited set keeps its restore point.
+
+The old ``test_random_churn_stays_proportional`` pinned a property of the
+retired policy on context-free lists: every divergence within ~4K of the
+newest record re-prefills at most the divergence plus a slack, which a
+cluster of records at the newest one provided. With the same eight records,
+explicit anchors put that budget on the grid instead (the 16,371 case needs
+it); near the prompt end they keep the prompt-end anchor, the restore point
+(the previous prompt's end) and the newest checkpoint, which is where agent
+turns diverge (B-cache 5).
 """
+
 from __future__ import annotations
 
-import random
 from types import SimpleNamespace
 
 from mtplx.generation import (
-    _gdn_boundary_max_count,
+    _capture_gdn_boundary,
     _inherited_gdn_boundaries,
-    _thin_gdn_boundary_records,
+    _prefill_spans_with_tail_grid,
 )
+
+CHUNK = 2048
+INTERVAL = 256
 
 
 def _rec(pos: int):
@@ -32,119 +59,161 @@ def _at_or_below(kept_positions, matched):
     return max(usable) if usable else 0
 
 
-def _assert_proportional(kept_positions, all_positions, grid: int, cap: int = 8) -> None:
+def _capture_prefill(sink: list, *, start: int, prompt_len: int) -> None:
+    """Every checkpoint one prefill of ``[start, prompt_len)`` captures: the
+    span ends of the real chunk plan with its tail ladder, in order, through
+    the real capture function (an empty cache snapshots to an empty record)."""
+
+    body = prompt_len - start - 1
+    for _span_start, end in _prefill_spans_with_tail_grid(
+        body, tail_interval=INTERVAL, chunk_size=CHUNK
+    ):
+        _capture_gdn_boundary(sink, start + end, [])
+
+
+def _positions(records) -> list[int]:
+    return [int(record[0]) for record in records]
+
+
+def test_the_16371_match_restores_at_8192_not_4096():
+    """B-cache 2.6: the retry restored at 4,096 and prefilled to 46,938
+    tokens; its next request matched 16,371. The old list's best boundary at
+    or below 16,371 was 4,096; the grid keeps 8,192, and nothing past the
+    match is ever a candidate.
+
+    Eight checkpoints over 47K tokens only guarantee the 16K grid: 8,192
+    survives here because the inherited set held one checkpoint. Had it also
+    held 2,048, a production sink (which protects its restore point) would
+    keep both in the first 8K cell and give the last slot to a newer cell, so
+    this match would restore at 4,096 again; ten checkpoints restore it at
+    8,192. The general bound is pinned in tests/test_checkpoint_anchors.py."""
+
+    previous = SimpleNamespace(gdn_boundaries=[_rec(4096)])
+    sink = list(_inherited_gdn_boundaries(previous, 4096))
+    _capture_prefill(sink, start=4096, prompt_len=46938)
+    kept = _positions(sink)
+    assert len(kept) <= 8
+    restore = _at_or_below(kept, 16371)
+    assert restore == 8192, f"restored at {restore}; kept={kept}"
+    # The anchors the next agent turn needs are there too.
+    assert 46937 - 64 in kept and 46937 in kept
+
+
+def _agent_session(first_prompt: int, deltas: list[int]) -> tuple[list, int]:
+    """An agent session through the real capture and inheritance paths: a
+    cold prefill, then each turn diverges five tokens before the previous
+    prompt's end (the generation prompt re-rendered as the assistant turn),
+    restores at the newest checkpoint at or below that, and prefills the
+    rest of its longer prompt."""
+
+    sink: list = []
+    _capture_prefill(sink, start=0, prompt_len=first_prompt)
+    prompt_len = first_prompt
+    for delta in deltas:
+        matched = prompt_len - 5
+        restore = _at_or_below(_positions(sink), matched)
+        assert 0 < restore <= matched
+        sink = list(
+            _inherited_gdn_boundaries(SimpleNamespace(gdn_boundaries=sink), restore)
+        )
+        prompt_len += delta
+        _capture_prefill(sink, start=restore, prompt_len=prompt_len)
+    return sink, prompt_len
+
+
+# Thirty-six turns of 1,500 to 6,161 tokens after a 20K cold start end at
+# 154,530 tokens.
+DELTAS = [(1500 + (turn * 2731) % 5000) for turn in range(36)]
+
+
+def test_agent_session_churn_does_not_erode_deep_coverage():
+    """The old policy ended this session holding five records,
+    [2048, 29627, 127221, 154428, 154529]: a match anywhere between 29,627
+    and 127,221 re-prefilled up to 97,541 tokens. The anchors hold one
+    checkpoint per 32,768-token cell through every turn."""
+
+    sink, prompt_len = _agent_session(20000, DELTAS)
+    kept = _positions(sink)
+    assert prompt_len == 20000 + sum(DELTAS) == 154530
+    assert len(kept) <= 8
+    # Eight records over 154K: the first checkpoint, the prompt-end anchor,
+    # the newest, one grid anchor per 32,768-token cell and the newest
+    # 16,384-token cell's. A match anywhere re-prefills at most one 32K cell
+    # plus the chunk the next cell's first checkpoint may sit in.
+    bound = 32768 + CHUNK
+    worst = max(
+        (matched - _at_or_below(kept, matched), matched)
+        for matched in range(CHUNK, prompt_len - 4, 97)
+    )
+    re_prefill, matched = worst
+    assert re_prefill <= bound, (
+        f"matched={matched} restored at {matched - re_prefill} "
+        f"(re-prefill {re_prefill} > {bound}); kept={kept}"
+    )
+
+
+def test_retention_keeps_the_cap_and_both_ends():
+    sink: list = []
+    for pos in range(2048, 22785, 2048):
+        _capture_gdn_boundary(sink, pos, [])
+    positions = _positions(sink)
+    assert len(positions) <= 8
+    assert positions[0] == 2048  # the oldest anchor survives
+    assert positions[-1] == 22528  # the newest survives
+    assert positions == sorted(positions)
+
+
+def _assert_proportional(kept_positions, all_positions, grid: int) -> None:
     newest = max(all_positions)
-    oldest = min(all_positions)
-    span = max(1, newest - oldest)
-    # Mirror the adaptive first floor: cap-2 doubling scales must cover span.
-    base = 256
-    scales = max(1, cap - 2)
-    while base * (1 << (scales - 1)) < span and base < span:
-        base *= 2
-    slack = 2 * grid + 2 * base
+    slack = 2 * grid + 2 * 1024
     for matched in all_positions:
         if matched == newest:
             continue
         divergence = newest - matched
-        restore = _at_or_below(kept_positions, matched)
-        re_prefill = matched - restore
-        # Contract: tight near the tail (where agent/RAG divergence lands —
-        # the fielded 2026-07-17 case), loosely proportional elsewhere. The
-        # thin-time guarantee is 2x spacing; incremental re-thinning of an
-        # already-thinned list drifts (discarded bands cannot be re-covered),
-        # empirically <= ~5x over seeded random churns — 8x is the pin. The
-        # retired policy measured 74x on the fielded case.
-        if divergence <= max(2 * grid, base):
-            bound = divergence + slack
-        else:
-            bound = 8 * divergence + slack
+        re_prefill = matched - _at_or_below(kept_positions, matched)
+        bound = divergence + slack if divergence <= 2 * grid else 8 * divergence + slack
         assert re_prefill <= bound, (
-            f"matched={matched} (divergence {divergence}) restored at {restore}: "
-            f"re-prefill {re_prefill} exceeds bound {bound}; "
-            f"kept={kept_positions}"
+            f"matched={matched} (divergence {divergence}) re-prefills "
+            f"{re_prefill} > {bound}; kept={kept_positions}"
         )
 
 
-def test_thin_keeps_cap_and_endpoints():
-    grid = list(range(2048, 22785, 2048))
-    records = [_rec(p) for p in grid]
-    kept = _thin_gdn_boundary_records(records, cap=8)
-    positions = [r[0] for r in kept]
-    assert len(kept) <= 8
-    assert positions[0] == min(grid)  # oldest anchor survives
-    assert positions[-1] == max(grid)  # newest survives
-    assert positions == sorted(positions)
-
-
-def test_thin_coverage_is_proportional_on_uniform_grid():
+def test_coverage_is_proportional_on_a_uniform_grid():
     grid = 512
-    records = [_rec(p) for p in range(grid, 64 * grid + 1, grid)]
-    kept = [r[0] for r in _thin_gdn_boundary_records(records, cap=8)]
-    _assert_proportional(kept, [r[0] for r in records], grid)
+    sink: list = []
+    for pos in range(grid, 64 * grid + 1, grid):
+        _capture_gdn_boundary(sink, pos, [])
+    _assert_proportional(_positions(sink), list(range(grid, 64 * grid + 1, grid)), grid)
 
 
 def test_capture_churn_never_reopens_the_2048_cliff():
-    """The observed production shape: cold-prefill chunk edges, then repeated
-    re-forward churn appending the same grid again (postcommit rounds). Under
-    the old pop(1) policy a long enough append stream left [oldest, tail...]
-    with an unbounded mid hole; the geometric policy must keep the near-tail
-    restore proportional. Mirrors matched=22,509 on a 22,784-token entry
-    restoring at 2,048 (74x the divergence distance)."""
+    """The 2026-07-17 shape: cold-prefill chunk edges, then postcommit-style
+    rounds appending the same grid again. matched=22,509 on a 22,784-token
+    entry once restored at 2,048 (74x the divergence)."""
+
     grid = 2048
     sink: list = []
-    cap = 8
-
-    def append(pos: int) -> None:
-        sink.append(_rec(pos))
-        if len(sink) > cap:
-            sink[:] = _thin_gdn_boundary_records(sink, cap)
-
     for pos in range(grid, 22531, grid):
-        append(pos)
-    append(22530)
-    for _ in range(3):  # three postcommit-style churn rounds
+        _capture_gdn_boundary(sink, pos, [])
+    _capture_gdn_boundary(sink, 22530, [])
+    for _ in range(3):
         for pos in range(grid, 22785, grid):
-            append(pos)
-        append(22784)
-
-    kept = [r[0] for r in sink]
+            _capture_gdn_boundary(sink, pos, [])
+        _capture_gdn_boundary(sink, 22784, [])
+    kept = _positions(sink)
     matched = 22509
     restore = _at_or_below(kept, matched)
-    divergence = 22784 - matched  # 275
-    re_prefill = matched - restore
-    assert re_prefill <= 3 * divergence + 2 * grid, (
-        f"near-tail miss restored at {restore} (re-prefill {re_prefill}); kept={kept}"
+    divergence = 22784 - matched
+    assert matched - restore <= 3 * divergence + 2 * grid, (
+        f"near-tail miss restored at {restore}; kept={kept}"
     )
-    # And explicitly: never the old failure mode.
     assert restore > 2048
 
 
-def test_random_churn_stays_proportional():
-    rng = random.Random(20260717)
-    grid = 1024
-    for _ in range(25):
-        sink: list = []
-        cap = _gdn_boundary_max_count()
-        seen: set[int] = set()
-        newest = 0
-        for _ in range(rng.randrange(20, 120)):
-            newest += rng.choice((grid, grid, grid // 2, grid * 2))
-            seen.add(newest)
-            sink.append(_rec(newest))
-            if len(sink) > cap:
-                sink[:] = _thin_gdn_boundary_records(sink, cap)
-        kept = [r[0] for r in sink]
-        _assert_proportional(kept, sorted(seen), grid * 2)
-
-
-def test_inherited_boundaries_thin_geometrically():
-    entry = SimpleNamespace(
-        gdn_boundaries=[_rec(p) for p in range(2048, 22785, 2048)]
-    )
-    kept = _inherited_gdn_boundaries(entry, restore_point=20480)
-    positions = [r[0] for r in kept]
-    assert all(p <= 20480 for p in positions)
-    assert len(positions) <= _gdn_boundary_max_count()
-    # Coverage must include a near-restore-point record, not just the oldest.
-    assert max(positions) == 20480
-    _assert_proportional(positions, list(range(2048, 20481, 2048)), 2048)
+def test_an_inherited_set_keeps_its_restore_point():
+    entry = SimpleNamespace(gdn_boundaries=[_rec(p) for p in range(2048, 22785, 2048)])
+    kept = _positions(_inherited_gdn_boundaries(entry, restore_point=20480))
+    assert all(p <= 20480 for p in kept)
+    assert len(kept) <= 8
+    assert max(kept) == 20480
+    _assert_proportional(kept, list(range(2048, 20481, 2048)), 2048)

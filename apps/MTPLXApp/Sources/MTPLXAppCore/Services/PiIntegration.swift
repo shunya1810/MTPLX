@@ -280,8 +280,16 @@ public struct PiIntegration: Sendable {
         return cancellationMarked && commandRemoved && receiptRemoved
     }
 
+    /// `servedWindow` is the window the running daemon published
+    /// (`/health` `execution_window`). With it, the window fields MTPLX wrote
+    /// earlier are brought to what the engine executes; without it (the write
+    /// before the daemon starts) existing window fields are left alone, so a
+    /// launch never rewrites them twice.
     @discardableResult
-    public func sync(configuration: MTPLXAppConfiguration) throws -> PiConfigResult {
+    public func sync(
+        configuration: MTPLXAppConfiguration,
+        servedWindow: ServedExecutionWindow? = nil
+    ) throws -> PiConfigResult {
         let modelID = Self.modelID(for: configuration.model)
         let modelReference = "\(Self.providerID)/\(modelID)"
         let baseURL = OpenCodeIntegration.baseURLString(
@@ -291,10 +299,17 @@ public struct PiIntegration: Sendable {
         let apiKey = configuration.apiKey?.isEmpty == false
             ? configuration.apiKey!
             : Self.localAPIKey
-        let contextWindow = configuration.effectiveContextWindow(default: 131_072)
+        let contextWindow = ClientContextBudget.window(
+            configuration: configuration,
+            served: servedWindow,
+            defaultWindow: 131_072
+        )
         var backupURL: URL?
 
-        var root = try loadRoot()
+        // A file Pi accepts (comments, trailing commas) is merged; one that
+        // does not parse throws before anything is written (#282).
+        let existingRoot = try loadRoot()
+        var root = existingRoot ?? [:]
         var providers = root["providers"]?.objectValue ?? [:]
         providers[Self.providerID] = .object(
             Self.mergedProviderConfig(
@@ -306,7 +321,8 @@ public struct PiIntegration: Sendable {
                     contextWindow: contextWindow,
                     vision: MTPLXModelOption.supportsVision(model: configuration.model),
                     reasoningEnabled: OpenCodeIntegration.reasoningEnabled(forModelID: modelID)
-                )
+                ),
+                refreshManagedWindow: servedWindow != nil
             )
         )
         root["providers"] = .object(providers)
@@ -332,8 +348,9 @@ public struct PiIntegration: Sendable {
             source: Self.settingsExtensionSource()
         )
 
-        let existingData = try? Data(contentsOf: configURL)
-        if existingData == nextData {
+        // A file that already says this is left exactly as the user wrote
+        // it, comments and formatting included.
+        if let existingRoot, existingRoot == root {
             try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configURL.path)
             return PiConfigResult(
                 configPath: configURL.path,
@@ -345,7 +362,7 @@ public struct PiIntegration: Sendable {
             )
         }
 
-        if existingData != nil {
+        if fileManager.fileExists(atPath: configURL.path) {
             let backup = uniqueBackupURL(reason: "bak")
             try fileManager.copyItem(at: configURL, to: backup)
             backupURL = backup
@@ -557,10 +574,13 @@ public struct PiIntegration: Sendable {
     /// x-mtplx-client header — because ports move between launches. Every
     /// other key the user edited wins; model entries merge by id, and
     /// user-added models or fields (vision input, custom thinkingLevelMap,
-    /// explicit maxTokens) survive a sync untouched.
+    /// explicit maxTokens) survive a sync untouched. With
+    /// `refreshManagedWindow`, a contextWindow/maxTokens pair MTPLX wrote
+    /// (`windowFieldsWereWrittenByMTPLX`) takes the served window.
     static func mergedProviderConfig(
         existing: JSONValue?,
-        fresh: [String: JSONValue]
+        fresh: [String: JSONValue],
+        refreshManagedWindow: Bool = false
     ) -> [String: JSONValue] {
         guard let existingObject = existing?.objectValue else { return fresh }
         var defaults = fresh
@@ -605,6 +625,12 @@ public struct PiIntegration: Sendable {
                 if freshObject["input"]?.arrayValue?.contains(.string("image")) == true {
                     entry["input"] = freshObject["input"]
                 }
+                if refreshManagedWindow, Self.windowFieldsWereWrittenByMTPLX(existingEntry) {
+                    // The engine's executed window is engine truth, like
+                    // `input` above; a pair the user edited stays theirs.
+                    entry["contextWindow"] = freshObject["contextWindow"]
+                    entry["maxTokens"] = freshObject["maxTokens"]
+                }
                 resultModels[index] = .object(entry)
             } else {
                 resultModels.append(freshModel)
@@ -612,6 +638,18 @@ public struct PiIntegration: Sendable {
         }
         merged["models"] = .array(resultModels)
         return merged
+    }
+
+    /// Whether a model entry's `contextWindow`/`maxTokens` pair is one MTPLX
+    /// wrote: `maxTokens` equal to the window. Any other pair is a user edit
+    /// and survives every sync (#282). SYNC PAIR: mtplx/pi.py
+    /// `_window_fields_written_by_mtplx`.
+    static func windowFieldsWereWrittenByMTPLX(_ entry: [String: JSONValue]) -> Bool {
+        guard let window = entry["contextWindow"]?.intValue,
+              let maxTokens = entry["maxTokens"]?.intValue,
+              window > 0
+        else { return false }
+        return maxTokens == window
     }
 
     private static func providerConfig(
@@ -659,9 +697,11 @@ public struct PiIntegration: Sendable {
                     "contextWindow": .number(Double(contextWindow)),
                     // Pi silently substitutes a 16,384 output ceiling for
                     // models whose metadata omits maxTokens. Advertise the
-                    // real context ceiling; the request-policy extension
-                    // strips only Pi's generated 16,384 leftover, so an
-                    // explicit user cap still passes through untouched.
+                    // real context ceiling: Pi clamps each request to the
+                    // room its prompt leaves, and the server caps each answer
+                    // to the memory actually free. The request-policy
+                    // extension strips only Pi's generated 16,384 leftover,
+                    // so an explicit user cap still passes through untouched.
                     "maxTokens": .number(Double(contextWindow)),
                     "cost": .object([
                         "input": .number(0),
@@ -674,22 +714,13 @@ public struct PiIntegration: Sendable {
         ]
     }
 
-    private func loadRoot() throws -> [String: JSONValue] {
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: configURL.path) else {
-            return [:]
-        }
-        let data = try Data(contentsOf: configURL)
-        guard !data.isEmpty else {
-            return [:]
-        }
-        do {
-            return try JSONDecoder().decode([String: JSONValue].self, from: data)
-        } catch {
-            let backup = uniqueBackupURL(reason: "invalid")
-            try fileManager.moveItem(at: configURL, to: backup)
-            return [:]
-        }
+    /// The current `models.json`, read as Pi reads it, or nil when there is
+    /// none. A file that does not parse is left in place and reported
+    /// (`ClientConfigFileError`); it used to be moved aside and replaced by
+    /// MTPLX's provider alone, which dropped every other provider and any
+    /// window pair the user set.
+    private func loadRoot() throws -> [String: JSONValue]? {
+        try ClientConfigFile.readObject(at: configURL)
     }
 
     private func uniqueBackupURL(reason: String) -> URL {

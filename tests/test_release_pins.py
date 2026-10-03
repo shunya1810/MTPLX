@@ -16,7 +16,9 @@ Added for 2.9.3 (founder directive, 2026-08-26) against two burn classes:
    +29% decode / +41% prefill @88.4k, clean shipped-wheel A/B, MEASUREMENTS
    2026-08-26 07:20) that an installed venv silently forfeits by sitting on
    an older mlx (the app bootstrapper's -U uses pip's only-if-needed
-   strategy, so old venvs never converge on their own).
+   strategy, so old venvs never converge on their own). Since 2026-10-01 the
+   pin is exact: a range let fresh installs resolve 0.32.3, whose Flash-Next
+   output is not bit-identical to the 0.32.2 every release check ran on.
 """
 
 from __future__ import annotations
@@ -94,17 +96,41 @@ def test_operator_compiled_verify_ceiling_survives_profile_apply():
 # ---------------------------------------------------------------------------
 
 
-def _pyproject_mlx_floor() -> tuple[int, ...]:
+def _pyproject_mlx_pin() -> str:
     text = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text()
-    match = re.search(r'"mlx>=([0-9.]+),<', text)
-    assert match, "pyproject no longer declares an mlx floor requirement"
-    return tuple(int(part) for part in match.group(1).split("."))
+    match = re.search(r'"mlx==([0-9.]+);', text)
+    assert match, "pyproject no longer pins one exact mlx version"
+    return match.group(1)
 
 
-def test_pyproject_mlx_floor_is_the_receipted_version():
-    """The floor itself is a release decision with measurements behind it;
-    lowering it must be deliberate, not a merge accident."""
-    assert _pyproject_mlx_floor() >= (0, 32, 2)
+def test_pyproject_pins_the_receipted_mlx():
+    """One exact MLX: the release's exactness tests and real-model checks ran
+    on it, the app bundles it and the native extension links its C++ ABI.
+    Moving it must be deliberate, not a merge accident or a fresh resolve."""
+    assert _pyproject_mlx_pin() == "0.32.2"
+
+
+def test_lock_resolves_the_pinned_mlx():
+    root = Path(__file__).resolve().parent.parent
+    lock = tomllib.loads((root / "uv.lock").read_text(encoding="utf-8"))
+    pin = _pyproject_mlx_pin()
+    resolved = {
+        package["name"]: package["version"]
+        for package in lock["package"]
+        if package["name"] in ("mlx", "mlx-metal")
+    }
+    assert resolved == {"mlx": pin, "mlx-metal": pin}
+    (editable,) = [
+        package
+        for package in lock["package"]
+        if package["name"] == "mtplx" and package.get("source") == {"editable": "."}
+    ]
+    specifiers = [
+        requirement["specifier"]
+        for requirement in editable["metadata"]["requires-dist"]
+        if requirement["name"] == "mlx"
+    ]
+    assert specifiers == [f"=={pin}"]
 
 
 def test_editable_lock_version_matches_project_version():
@@ -123,16 +149,14 @@ def test_editable_lock_version_matches_project_version():
     assert editable[0]["version"] == project["project"]["version"]
 
 
-def test_installed_mlx_meets_the_pyproject_floor():
+def test_installed_mlx_is_the_pinned_version():
     """Catches venv drift: an environment (the app runtime included) running
-    an mlx older than the wheel's floor forfeits the receipts the floor was
-    raised for, silently."""
+    another mlx than the pin runs a stack the release's receipts do not
+    cover, silently."""
     mlx = pytest.importorskip("mlx.core")
-    installed = tuple(
-        int(part) for part in re.match(r"(\d+)\.(\d+)\.(\d+)", mlx.__version__).groups()
-    )
-    assert installed >= _pyproject_mlx_floor(), (
-        f"installed mlx {mlx.__version__} is below the pyproject floor "
-        f"{'.'.join(map(str, _pyproject_mlx_floor()))} — this venv is running "
-        "a stack the release's receipts do not cover"
+    installed = re.match(r"\d+\.\d+\.\d+", mlx.__version__).group(0)
+    assert installed == _pyproject_mlx_pin(), (
+        f"installed mlx {mlx.__version__} is not the pinned "
+        f"{_pyproject_mlx_pin()}: this venv is running a stack the "
+        "release's receipts do not cover"
     )

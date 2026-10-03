@@ -174,8 +174,9 @@ QWEN4_EXP_SETTINGS: dict[str, ModelTunedSetting] = _block(
             "(overnight-20260918 cells pfx-default4 against pfx-dense-2k): 4K "
             "810 to 1,250 tok/s, 16K 1,208 to 1,340, 64K 1,002 to 1,126 with "
             "the tail ladder; 8,192 ties on speed with 3.4 GB more peak. "
-            "Granted per request against live memory "
-            "(generation.qwen4_wide_prefill_chunk_tokens), else the 2,048 plan"
+            "Granted per request by the prefill admission after its "
+            "reclamation (prefill_safety.settle_wide_prefill_chunk), else the "
+            "2,048 plan"
         ),
         env=("MTPLX_QWEN4_PREFILL_WIDE_CHUNK",),
         engine_default=0,

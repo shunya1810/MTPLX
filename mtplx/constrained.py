@@ -1,10 +1,12 @@
-"""Grammar-constrained decoding (structured output) for the serial AR path.
+"""Grammar-constrained decoding (structured output) for the serial lanes.
 
-Phase 1 of the plan in upstream issue #186: ``response_format`` of type
-``json_object`` / ``json_schema`` is enforced with llguidance token bitmasks
-applied to target logits before sampling, on the serial AR lane only.
-Constrained requests never ride the batched AR pump or the MTP lanes; the
-server pins them to ``generation_mode="ar"`` and bypasses the batch scheduler.
+Issue #186: ``response_format`` of type ``json_object`` / ``json_schema`` (and
+opt-in strict tool calls) is enforced with llguidance token bitmasks applied
+to target logits before sampling. Constrained requests run on the serial AR
+lane and the serial MTP lane and bypass the batched AR pump. The AR lane masks
+each step's row; an MTP verify window masks each of its rows at that row's own
+grammar position (``mask_window_logits``), so both lanes commit every token
+from the same masked law.
 
 llguidance is an optional dependency: requests that do not use
 ``response_format`` never touch it, and requests that do get a clear 400 when
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -45,7 +48,80 @@ SUPPORTED_RESPONSE_FORMAT_TYPES = ("text", "json_object", "json_schema")
 
 # ``json_object`` promises a JSON object (OpenAI semantics), not merely any
 # JSON value, so the generic grammar pins the top-level type.
-_JSON_OBJECT_SCHEMA = '{"type": "object"}'
+_JSON_OBJECT_SCHEMA: dict[str, Any] = {"type": "object"}
+
+# Whitespace the JSON grammars admit wherever JSON allows it: the `space` rule
+# of llama.cpp's json-schema-to-grammar (`| " " | "\n"{1,2} [ \t]{0,20}`), i.e.
+# one space, or one or two newlines followed by at most 20 spaces or tabs.
+# llguidance's default is `[\x20\x0A\x0D\x09]+` at every such point: unbounded,
+# CR included. Whitespace leaves the grammar exactly where it was, so once a
+# whitespace token narrowly beats every legal value token under greedy decoding
+# it wins again at the next step, and the document never finishes (#547:
+# `"tests_run":`, two spaces, then 640 CR tokens until max_tokens).
+_JSON_WHITESPACE_PATTERN = r"\x20|\x0A{1,2}[\x20\x09]{0,20}"
+
+
+def _llguidance_release() -> tuple[int, int, int] | None:
+    match = re.search(r"llguidance@(\d+)\.(\d+)\.(\d+)", LLGUIDANCE_VERSION or "")
+    if match is None:
+        return None
+    major, minor, patch = (int(part) for part in match.groups())
+    return major, minor, patch
+
+
+# llguidance matches the JSON whitespace pattern at most once per position from
+# 1.8.0 on (guidance-ai/llguidance#370, "single-match skip lexemes"). Earlier
+# releases re-apply it any number of times at one position, so a bound written
+# into the pattern bounds nothing there.
+_JSON_WHITESPACE_SINGLE_MATCH = (_llguidance_release() or (0, 0, 0)) >= (1, 8, 0)
+
+
+def _json_compile_options() -> dict[str, Any]:
+    """llguidance JSON options under which no whitespace run is unbounded."""
+    if _JSON_WHITESPACE_SINGLE_MATCH:
+        return {"whitespace_pattern": _JSON_WHITESPACE_PATTERN}
+    # Without single-match whitespace the only finite layout is whitespace the
+    # grammar matches exactly once: one optional space after each separator,
+    # as in {"a": 1, "b": [true, false]} (no pretty-printed newlines).
+    return {
+        "whitespace_flexible": False,
+        "item_separator": r",\x20?",
+        "key_separator": r":\x20?",
+    }
+
+
+# The x-guidance keys that together decide JSON whitespace. They interact:
+# whitespace_pattern overrides whitespace_flexible, and with flexible
+# whitespace off the separators carry whatever whitespace is allowed. A client
+# that sets any of them therefore gets exactly its own policy, none of ours.
+_WHITESPACE_OPTION_KEYS = frozenset(
+    {"whitespace_flexible", "whitespace_pattern", "item_separator", "key_separator"}
+)
+
+
+def _grammar_schema_json(schema: dict[str, Any]) -> str:
+    """The JSON Schema text llguidance compiles for a request.
+
+    llguidance fixes object properties to the order they appear in the schema
+    (and resolves allOf/anyOf/additionalProperties precedence by position), so
+    key order is part of the grammar: this text keeps the client's order, and
+    the grammar caches key on exactly this text. Sorting the keys here used to
+    force alphabetical properties (#547).
+
+    The compile options travel as the schema's own top-level ``x-guidance``
+    object, the one place both ``grammar_from_json_schema`` and a lark
+    ``%json`` block read them. The bounded-whitespace defaults apply only when
+    the client's ``x-guidance`` sets no whitespace option of its own.
+    """
+    client_options = schema.get("x-guidance", {})
+    if not isinstance(client_options, dict):
+        raise ResponseFormatError("JSON Schema 'x-guidance' must be an object")
+    if _WHITESPACE_OPTION_KEYS.isdisjoint(client_options):
+        options = {**_json_compile_options(), **client_options}
+    else:
+        options = dict(client_options)
+    return json.dumps({**schema, "x-guidance": options}, separators=(",", ":"))
+
 
 # Strict tool-call constraint markers. These are the Qwen/Hermes-family
 # native tool-call and thinking tokens; strict mode only activates when the
@@ -155,7 +231,7 @@ def constraint_spec_from_response_format(
             "silently return unconstrained output"
         )
     if format_type == "json_object":
-        schema_json = _JSON_OBJECT_SCHEMA
+        schema = _JSON_OBJECT_SCHEMA
     else:
         wrapper = response_format.get("json_schema")
         if wrapper is None and isinstance(response_format.get("schema"), dict):
@@ -171,7 +247,7 @@ def constraint_spec_from_response_format(
                 "response_format type 'json_schema' requires json_schema.schema "
                 "to be a JSON Schema object"
             )
-        schema_json = _canonical_schema_json(schema)
+    schema_json = _grammar_schema_json(schema)
     grammar = _cached_grammar_for_schema(schema_json, think_prelude=False)
     think_start_id = (
         _single_token_id(tokenizer, THINK_START) if tokenizer is not None else None
@@ -234,13 +310,15 @@ def tool_call_constraint_spec(
         _single_token_id(tokenizer, THINK_START) is not None
         and _single_token_id(tokenizer, THINK_END) is not None
     )
+    # Key order inside each tool schema is part of its grammar (see
+    # _grammar_schema_json), so the key keeps it rather than sorting it away.
     cache_key = "structtool:" + json.dumps(
         {
             "functions": [[name, schema] for name, schema in functions],
             "think": include_think,
             "llg": LLGUIDANCE_VERSION,
+            "json_options": _json_compile_options(),
         },
-        sort_keys=True,
         separators=(",", ":"),
     )
     with _CACHE_LOCK:
@@ -345,8 +423,8 @@ def _tool_call_lark_grammar(
         head = f'\n{{"name": "{name_inner}", "arguments": '
         alternatives.append(
             f"TAG_TEXT <tool_call> {_lark_string(head)} %json "
-            f"{json.dumps(schema)} {_lark_string('}')} {_lark_string(chr(10))} "
-            "</tool_call>"
+            f"{_grammar_schema_json(schema)} {_lark_string('}')} "
+            f"{_lark_string(chr(10))} </tool_call>"
         )
     if include_think:
         alternatives.append("TAG_TEXT <think> TAG_TEXT </think>")
@@ -405,18 +483,79 @@ class GrammarConstraint:
         self._matcher = matcher
         self._bitmask = _llg_mlx.allocate_token_bitmask(1, n_vocab)
 
-    def mask_logits_row(self, row: Any) -> Any:
-        """Apply the current-step token mask to a 1-D logits row (mx.array)."""
+    def mask_logits_row(
+        self, row: Any, *, prefix: list[int] | tuple[int, ...] = ()
+    ) -> Any:
+        """Return a masked copy of a 1-D logits row (mx.array).
+
+        The mask is the grammar's at the current step or, with ``prefix``, at
+        the step after those tokens (the bonus row that follows accepted
+        drafts). ``row`` itself is left raw: a row that outlives this request
+        (the next cycle's row, the session bank's final state) must never
+        carry its grammar. The matcher ends where it started.
+        """
         if self._matcher is None:
             self._bind(int(row.shape[-1]))
         if self._matcher.is_stopped():
             return row
+        prefix = [int(t) for t in prefix]
+        if prefix and self._matcher.validate_tokens(prefix) != len(prefix):
+            return row
         started = time.perf_counter()
-        _llg_mlx.fill_next_token_bitmask(self._matcher, self._bitmask)
+        if prefix and not self._matcher.consume_tokens(prefix):
+            raise RuntimeError(
+                f"constrained decoding desync on a mask prefix: {self._matcher.get_error()}"
+            )
+        try:
+            _llg_mlx.fill_next_token_bitmask(self._matcher, self._bitmask)
+        finally:
+            if prefix and not self._matcher.rollback(len(prefix)):
+                raise RuntimeError("constrained decoding could not roll back a mask prefix")
         masked = _llg_mlx.apply_token_bitmask(row.reshape(1, -1), self._bitmask)
         self.mask_time_s += time.perf_counter() - started
         self.masked_steps += 1
         return masked.reshape(row.shape)
+
+    def mask_window_logits(self, logits: Any, window_tokens: list[int]) -> Any:
+        """Return a copy of a speculative window's rows, each masked at its own
+        grammar position.
+
+        ``logits`` is ``(1, T, V)``: row ``j`` scores the token after the
+        committed stream and ``window_tokens[:j]``. Every row up to the
+        grammar-legal prefix of the window gets exactly the mask
+        ``mask_logits_row`` computes at that position, so a verify window
+        accepts, corrects and samples from the same masked law the AR lane
+        samples each step from. Rows past an illegal window token are copied
+        as they are: the row before them gives that token zero probability, so
+        no window commits past it. ``logits`` itself is left raw (see
+        ``mask_logits_row``); use the copy only to verify and sample. The
+        matcher ends where it started (llguidance advances through the window
+        and rolls back).
+        """
+        import mlx.core as mx
+
+        if self._matcher is None:
+            self._bind(int(logits.shape[-1]))
+        if self._matcher.is_stopped():
+            return logits
+        started = time.perf_counter()
+        rows = int(logits.shape[1])
+        drafts = [int(t) for t in window_tokens[: max(0, rows - 1)]]
+        # One mask row per window position; rows llguidance does not reach
+        # (past an illegal token, or after the document ends) stay all-legal.
+        bitmask = _llg_mlx.allocate_token_bitmask(len(drafts) + 1, int(logits.shape[-1]))
+        self._matcher.unsafe_compute_mask_ptr_with_draft_token(
+            bitmask.ctypes.data, bitmask.shape[1] * bitmask.itemsize, drafts
+        )
+        head = _llg_mlx.apply_token_bitmask(logits[0, : len(drafts) + 1, :], bitmask)
+        masked = (
+            mx.concatenate([head[None], logits[:, len(drafts) + 1 :, :]], axis=1)
+            if len(drafts) + 1 < rows
+            else head[None]
+        )
+        self.mask_time_s += time.perf_counter() - started
+        self.masked_steps += len(drafts) + 1
+        return masked
 
     def advance(self, token_id: int) -> None:
         if self._matcher is None or self._matcher.is_stopped():
@@ -461,20 +600,17 @@ class GrammarConstraint:
 
 # --- caches ---------------------------------------------------------------
 #
-# A compiled grammar is schema- and engine-version-specific; the LLTokenizer
-# wrap is tokenizer-object- and vocab-width-specific. Both caches hold strong
-# references (the server keeps one tokenizer for its lifetime) and are
-# bounded, so id() reuse after GC cannot alias a live entry.
+# A compiled grammar is schema- and engine-version-specific (key order
+# included: two schemas that differ only in property order are different
+# grammars); the LLTokenizer wrap is tokenizer-object- and vocab-width-specific.
+# Both caches hold strong references (the server keeps one tokenizer for its
+# lifetime) and are bounded, so id() reuse after GC cannot alias a live entry.
 
 _GRAMMAR_CACHE: OrderedDict[str, str] = OrderedDict()
 _GRAMMAR_CACHE_MAX = 64
 _TOKENIZER_CACHE: OrderedDict[tuple[int, int], tuple[Any, Any]] = OrderedDict()
 _TOKENIZER_CACHE_MAX = 4
 _CACHE_LOCK = threading.Lock()
-
-
-def _canonical_schema_json(schema: dict[str, Any]) -> str:
-    return json.dumps(schema, sort_keys=True, separators=(",", ":"))
 
 
 def _cached_grammar_for_schema(schema_json: str, *, think_prelude: bool = False) -> str:

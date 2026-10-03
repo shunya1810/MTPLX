@@ -496,6 +496,41 @@ class PrefillHistory:
         return self._capacity
 
 
+# ---- RereadLedger ---------------------------------------------------------
+
+
+class RereadLedger:
+    """Why each recent request re-reads part of its prompt.
+
+    The prefill event that starts the replay carries the explanation
+    (mtplx/prefill_plan.py); the ledger keeps it for the same request's later
+    prefill events, which replace the in-flight prefill state, and for its
+    receipt. Written on the generation thread, read on request threads.
+    Bounded: a request that never reaches its receipt ages out.
+    """
+
+    def __init__(self, *, capacity: int = 64) -> None:
+        self._capacity = max(1, int(capacity))
+        self._rows: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def put(self, request_id: str, explanation: dict[str, Any]) -> None:
+        with self._lock:
+            self._rows[str(request_id)] = dict(explanation)
+            self._rows.move_to_end(str(request_id))
+            while len(self._rows) > self._capacity:
+                self._rows.popitem(last=False)
+
+    def get(self, request_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._rows.get(str(request_id))
+            return dict(row) if row is not None else None
+
+    def pop(self, request_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            return self._rows.pop(str(request_id), None)
+
+
 # ---- ProgressEventGate ----------------------------------------------------
 
 
@@ -635,6 +670,7 @@ class DashboardState:
     rolling: RollingMetrics = field(default_factory=RollingMetrics)
     lifetime: LifetimeCounters = field(default_factory=LifetimeCounters)
     prefill_history: PrefillHistory = field(default_factory=PrefillHistory)
+    rereads: RereadLedger = field(default_factory=RereadLedger)
     progress_events: ProgressEventGate = field(default_factory=ProgressEventGate)
     last_thermal: dict[str, Any] | None = None
     last_thermal_when_s: float = 0.0

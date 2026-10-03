@@ -4,10 +4,10 @@ Through 2.11.3 the final prefill chunk was cut into ``tail_interval`` pieces
 end to end, so every cold prompt closed with up to eight 256-row forwards (and
 a prompt shorter than the chunk ran ENTIRELY at 256 rows).  Measured on
 Flash-Next, a 256-row forward runs at about 750 tok/s against 1,720 at 2,048
-rows.  The boundary list keeps one record per power-of-two distance from the
-newest, so the dense grid captured records that retention discarded.  The
-geometric layout captures the distances retention keeps, and no rung behind
-the nearest boundary is narrower than MTPLX_GDN_BOUNDARY_TAIL_MIN_RUNG (1,024
+rows.  The boundary list keeps only a few anchors, so the dense grid captured
+records that retention discarded.  The geometric layout captures one boundary
+per power-of-two distance from the prompt end, and no rung behind the nearest
+boundary is narrower than MTPLX_GDN_BOUNDARY_TAIL_MIN_RUNG (1,024
 rows by default: a 512-row forward runs at 1,199 tok/s and a 256-row one at
 842, against 1,763 at 2,048 rows).
 """
@@ -16,10 +16,10 @@ from __future__ import annotations
 
 import pytest
 
+from mtplx.checkpoint_anchors import AnchorPlan, retain_checkpoints
 from mtplx.generation import (
     _geometric_tail_edges,
     _prefill_spans_with_tail_grid,
-    _thin_gdn_boundary_records,
 )
 
 INTERVAL = 256
@@ -127,7 +127,7 @@ def test_retention_keeps_every_captured_tail_boundary_of_a_short_prompt(
     spans = _plan(tokens, chunk)
     records = [(end, object(), None) for _start, end in spans]
     kept_positions = sorted(
-        int(record[0]) for record in _thin_gdn_boundary_records(records, 8)
+        int(record[0]) for record in retain_checkpoints(records, AnchorPlan(record_count=8))
     )
     assert kept_positions == sorted(end for _start, end in spans)
     for distance in (1, 5, 64, 200, 256, 300, 600, 1000, 1500, 2000):
@@ -153,7 +153,7 @@ def test_retention_keeps_the_nearest_tail_boundary_of_a_long_prompt(chunk):
     spans = _plan(tokens, chunk)
     records = [(end, object(), None) for _start, end in spans]
     kept_positions = sorted(
-        int(record[0]) for record in _thin_gdn_boundary_records(records, 8)
+        int(record[0]) for record in retain_checkpoints(records, AnchorPlan(record_count=8))
     )
     assert kept_positions[-1] == tokens
     assert spans[-1][0] in kept_positions

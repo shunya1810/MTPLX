@@ -1,13 +1,17 @@
 """Vision restore-span guard (2026-08-07 pillar alias-leg regression).
 
-The near-prefix lane matches on raw token ids, where every image pad equals
-every image pad — so a match can run into an image span whose embeddings
-came from different pixels, and a boundary restore there resurrects the
-wrong image's KV. The guard caps that lane's matched length at the first
-pad position; full-image warm reuse belongs to the exact content-keyed path.
+On raw token ids every image pad equals every image pad, so a near-prefix
+match could run into an image span whose embeddings came from different
+pixels, and a boundary restore there resurrected the wrong image's KV. The
+lane was capped at the first pad for that. It now matches an image prompt in
+its content-keyed view (where rows of different pixels differ), and a restore
+never cuts an image (tests/test_vision_keyed_restore_rules.py); these tests
+pin the span helpers and that the lane never asks the bank with raw ids.
 """
 
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import mlx.core as mx
 
@@ -19,6 +23,8 @@ from mtplx.vision.splice import (
 )
 
 PAD = 151655
+# What the lane reads of a runtime before it restores anything.
+RUNTIME = SimpleNamespace(model_path="m", mtp_enabled=True)
 
 
 def _splice(pad_counts, digests):
@@ -59,19 +65,21 @@ def test_keyed_ids_differ_from_first_pad_for_different_pixels():
     assert all(x != y for x, y in zip(a[3:7], b[3:7]))
 
 
-def test_near_prefix_matched_ceiling_caps_candidates():
+def test_near_prefix_lane_asks_the_bank_with_the_keyed_view():
     from mtplx import generation as g
 
-    calls = {}
+    raw = [1, 2, 3] + [PAD] * 4 + [7] * 60
+    keyed = vision_bank_key_ids(raw, _splice([4], [0xAA]))
+    seen = {}
 
     class Bank:
         def near_prefix_candidates(self, prompt_ids, **kw):
-            calls["seen"] = True
+            seen["ids"] = list(prompt_ids)
             return []
 
     out = g._restore_near_prefix_prompt_state(
-        None,
-        [1] * 64,
+        RUNTIME,
+        raw,
         base_hidden_variant="b",
         mtp_hidden_variant="m",
         mtp_history_policy="cycle",
@@ -79,20 +87,19 @@ def test_near_prefix_matched_ceiling_caps_candidates():
         template_hash=None,
         draft_head_identity=None,
         policy_fingerprint=None,
-        matched_ceiling=1,
+        match_ids=keyed,
     )
-    # Ceiling < 2 -> lane refuses outright (nothing restorable before the
-    # image); the bank is never consulted.
     assert out is None
-    assert "seen" not in calls
+    # The raw ids would match any image with the same pad count.
+    assert seen["ids"] == keyed != raw
 
 
 def test_near_prefix_lane_accepts_and_threads_vision_splice():
     """#296 wiring: the near lane takes the splice (it was vision-blind —
     image pads in the suffix were forwarded as plain ids and the rows never
-    reached the KV). With the ceiling refusing the restore the splice must
-    pass through untouched; consumption is guarded downstream by the
-    unconsumed-rows assert in _suffix_chunk_embeddings."""
+    reached the KV). With nothing to restore the splice must pass through
+    untouched; consumption is guarded downstream by the unconsumed-rows
+    assert in _suffix_chunk_embeddings."""
     from mtplx import generation as g
 
     class Splice:
@@ -108,7 +115,7 @@ def test_near_prefix_lane_accepts_and_threads_vision_splice():
 
     splice = Splice()
     out = g._restore_near_prefix_prompt_state(
-        None,
+        RUNTIME,
         [1] * 64,
         base_hidden_variant="b",
         mtp_hidden_variant="m",
@@ -117,7 +124,6 @@ def test_near_prefix_lane_accepts_and_threads_vision_splice():
         template_hash=None,
         draft_head_identity=None,
         policy_fingerprint=None,
-        matched_ceiling=1,
         vision_splice=splice,
     )
     assert out is None

@@ -471,6 +471,10 @@ MODEL_RUNTIME_ENV_OVERRIDE_KEYS = frozenset(
         # the per-request memory gate in generation; 0 or unset leaves the
         # live allocator gate alone in charge.
         "MTPLX_QWEN4_FIXED_M4_MAX_CONTEXT",
+        # Fixed-M4 rows-gather bank capacity bucket in rows (2026-09-27,
+        # default 8,192; 0 keeps the 256-row step): consecutive requests of a
+        # growing session replay one compiled verify trace.
+        "MTPLX_QWEN4_FIXED_M4_CAPACITY_BUCKET",
         "MTPLX_FUSE_GDN_POST_CONV",
         "MTPLX_A3B_GDN_POSTCONV_IMPL",
         "MTPLX_LINEAR_GDN_FROM_CONV_TGY",

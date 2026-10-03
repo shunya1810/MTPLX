@@ -23,8 +23,8 @@ from mtplx.generation import (
     _iter_prefill_chunk_spans,
     _prefill_spans_with_tail_grid,
     _split_spans_at,
-    _thin_gdn_boundary_records,
 )
+from mtplx.checkpoint_anchors import AnchorPlan, retain_checkpoints
 from mtplx.server import openai as oa
 from mtplx.session_bank import SessionBank
 
@@ -285,7 +285,9 @@ def test_thinning_retains_tail_adjacent_stable_edge():
     records = [(pos, snap, None) for pos in range(512, 15873, 512)]
     stable_edge = (15723, snap, "hidden")
     records.append(stable_edge)
-    thinned = _thin_gdn_boundary_records(sorted(records, key=lambda r: r[0]), 8)
+    thinned = retain_checkpoints(
+        sorted(records, key=lambda r: r[0]), AnchorPlan(record_count=8)
+    )
     assert len(thinned) <= 8
     assert any(r[0] == 15723 for r in thinned), (
         "tail-adjacent stable edge must survive geometric thinning"

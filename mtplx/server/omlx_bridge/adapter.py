@@ -221,6 +221,16 @@ def normalize_messages_for_template(
 
     del max_tool_result_tokens  # MTPLX currently does not truncate OpenCode tools here.
     native_tools = bool(getattr(tokenizer, "has_tool_calling", True))
+    if not native_tools and tokenizer is not None:
+        # Gemma 4 packs ship no chat template, so mlx-lm reports no tool
+        # calling, but MTPLX's own Gemma 4 encoder renders structured tool
+        # calls as the same <tool_call> XML the tool contract asks the model
+        # to emit, and tool results as tool_response turns. Flattening them
+        # here showed the model its own calls as "[Calling tool: ...]" and
+        # its tool results as user turns, contradicting the contract.
+        from mtplx.chat_encoding import is_gemma4_tokenizer
+
+        native_tools = is_gemma4_tokenizer(tokenizer)
     processed: list[dict[str, Any]] = []
     for message in messages:
         role = _message_role(message)

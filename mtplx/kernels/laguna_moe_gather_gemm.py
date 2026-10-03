@@ -54,6 +54,8 @@ from functools import lru_cache
 
 import mlx.core as mx
 
+from mtplx import moe_sorted_gather
+
 
 _BITS = 4
 _GROUP_SIZE = 128
@@ -259,7 +261,7 @@ def grouped_gather_gemm(
 
     _, _, start, count = sorted_run_layout(row_expert_sorted, num_experts)
     if not is_grouped_gather_eligible(x_sorted, w, scales, biases, start, count):
-        y = mx.gather_qmm(
+        y = moe_sorted_gather.gather_qmm(
             x_sorted.reshape(int(x_sorted.shape[0]), 1, int(x_sorted.shape[1])),
             w, scales, biases,
             rhs_indices=row_expert_sorted,

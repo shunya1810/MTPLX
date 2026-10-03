@@ -199,16 +199,20 @@ def test_flash_next_96g_catalog_planner_and_fixed_m4_gate_agree():
     assert live + (context + 1_024) * promotion_per_token > old_line
 
 
-def test_flash_next_128g_is_unchanged():
+def test_flash_next_128g_desktop_seat():
+    # G5 (09-29): 90 GiB on a 128 GB desktop (96 GiB before), which still
+    # covers Flash-Next's 83.3 GiB resident floor, so the floor does not lift it.
     caps, fit, window = _seat(FLASH_NEXT, 128)
-    assert caps["memory_limit_bytes"] == 96 * GIB
+    assert caps["memory_limit_bytes"] == 90 * GIB
     assert caps["memory_limit_source"] == "default"
     assert caps["wired_limit_bytes"] == caps["minimum_resident_bytes"]
-    assert fit.usable_bytes == 96 * GIB
+    assert fit.usable_bytes == 90 * GIB
     assert fit.usable_source == "formula"
     assert window == MODEL_MAX
     _caps, _fit, dense_window = _seat(FLASH_NEXT, 128, sparse_prefill=False)
-    assert dense_window == 114_688
+    # The dense-prefill lane prices the indexer's per-token peak, so the six
+    # GiB the desktop keeps cost it context: 114,688 at 96 GiB, 65,536 at 90.
+    assert dense_window == 65_536
 
 
 @pytest.mark.parametrize("ram_gb", [16, 24, 36, 48, 64])
@@ -260,4 +264,7 @@ def test_48g_seat_plan_is_unchanged():
         dense_decode_ceiling=131_072,
     )
     assert round(final.bank_idle_max_bytes / GIB, 1) == 13.7
-    assert round(final.bank_steady_bytes / GIB, 1) == 5.7
+    # The under-load figure reserves the whole 204,800-token window (#525);
+    # it reserved the 131,072-token dense ceiling and read 5.7 GiB before.
+    assert final.kv_reserve_tokens == 204_800
+    assert round(final.bank_steady_bytes / GIB, 1) == 1.2

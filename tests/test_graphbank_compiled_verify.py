@@ -67,6 +67,17 @@ class ToyHybridRuntime:
         self.w_conv = scale * mx.random.normal((self.K * self.D, self.D)).astype(mx.float32)
         self.w_q = scale * mx.random.normal((self.D, self.D)).astype(mx.float32)
         self.w_out = scale * mx.random.normal((self.D, self.V)).astype(mx.float32)
+        # Weights are materialized, as a loaded checkpoint's are (mlx_lm
+        # loads with lazy=False). A still-lazy array is not a constant to
+        # mx.compile: the trace walks into its graph, so the compiled verify
+        # step regenerated each weight on every call (random bits, uniform,
+        # erfinv, scale) in one fused JIT kernel, which rounds its scalar
+        # constants to 7 significant digits and takes the fast log inside
+        # erfinv, while the eager reference evaluated the same graph with the
+        # precompiled kernels. Float32 GEMM on a Metal 4 tensor-unit GPU reads
+        # TF32 inputs, which hid the difference on M5; M1 to M4 (and
+        # MLX_ENABLE_TF32=0) read all 23 mantissa bits.
+        mx.eval(self.embed, self.w_conv, self.w_q, self.w_out)
         self.calls: list[str] = []
 
     def make_cache(self) -> list:
@@ -562,16 +573,13 @@ def test_fallback_reasons_for_unsupported_cache_containers():
 class ToyQuantPagedRuntime(ToyHybridRuntime):
     """ToyHybridRuntime whose full-attention layer lives in QUANTIZED pages.
 
-    The model dim stays at the parent's compile-bit-stable D=4 (the D=64
-    variant of the toy diverges under ``mx.compile`` by ~0.4 with a PLAIN
-    paged adapter too — a toy-graph fusion property, not an adapter one);
-    fixed projections lift K/V/Q to head dim 64, which puts the head inside
-    the packed-quant kernel's supported set so promotion takes the
-    quantized-adapter lane (5 leaves) end-to-end. The toy's attention math
-    reads the densified ``update_and_fetch`` state, so no Metal kernel is
-    dispatched — this exercises the promotion, spec, reseed, in-graph
-    quantized writes, state movement, mirror-commit, trim, and demote
-    plumbing.
+    The model dim stays at the parent's D=4; fixed projections lift K/V/Q
+    to head dim 64, which puts the head inside the packed-quant kernel's
+    supported set so promotion takes the quantized-adapter lane (5 leaves)
+    end-to-end. The toy's attention math reads the densified
+    ``update_and_fetch`` state, so no Metal kernel is dispatched — this
+    exercises the promotion, spec, reseed, in-graph quantized writes, state
+    movement, mirror-commit, trim, and demote plumbing.
     """
 
     HEAD_DIM = 64
@@ -584,6 +592,8 @@ class ToyQuantPagedRuntime(ToyHybridRuntime):
         self.w_vp = 0.4 * mx.random.normal((self.D, self.HEAD_DIM)).astype(mx.float32)
         self.w_qp = 0.4 * mx.random.normal((self.D, self.HEAD_DIM)).astype(mx.float32)
         self.w_ao = 0.4 * mx.random.normal((self.HEAD_DIM, self.D)).astype(mx.float32)
+        # Materialized for the same reason as the parent's weights.
+        mx.eval(self.w_kp, self.w_vp, self.w_qp, self.w_ao)
 
     def make_cache(self) -> list:
         from mtplx.kv_quant import PagedKVQuantConfig
@@ -711,17 +721,14 @@ def test_kv_quant_paged_entries_promote_and_run_compiled(monkeypatch, mode):
 def test_kv_quant_compiled_state_evolution_matches_eager_reference(mode, monkeypatch):
     """Accept-path session over quantized adapters: compiled vs pure eager.
 
-    The strong claim is STATE EVOLUTION: quantized payloads, fp32 scale
-    planes, offsets, and GDN slots must stay bit-identical between the
-    compiled-bank session and the pure-eager session at every step — that
-    is exactly the surface the quantized adapter owns (in-graph quantized
-    writes, mirror-commit, commit/trim interplay). Logits/hidden get a
-    small tolerance instead: ``mx.compile`` fuses this toy's readout with
-    different fp ordering than eager (measured 3e-5 on q8 with the state
-    bit-identical, and 0.385 on a PLAIN unquantized paged D=64 toy — no
-    quantization involved), so per-call output bit-exactness is the parity
-    harness's job (see test_kv_quant_parity_mode_passes_on_quantized_toy
-    and the production Gate A receipts), not a toy-graph property.
+    Quantized payloads, fp32 scale planes, offsets and GDN slots (the
+    surface the quantized adapter owns: in-graph quantized writes,
+    mirror-commit, commit/trim interplay) and the logits and hidden states
+    read from them stay bit-identical between the compiled-bank session and
+    the pure-eager session at every step. The readout once had a 0.1
+    tolerance here, blamed on ``mx.compile`` fusing it with a different
+    fp ordering; the gap (3e-5 on q8, 3e-2 on q4) was the toy's weights
+    still being lazy when the verify step was traced (see ToyHybridRuntime).
     """
     import mtplx.graphbank as graphbank_module
 
@@ -789,9 +796,7 @@ def test_kv_quant_compiled_state_evolution_matches_eager_reference(mode, monkeyp
             assert np.array_equal(got[name], want[name]), f"step {step}: {name}"
         for name in ("logits", "hidden"):
             assert got[name].shape == want[name].shape, f"step {step}: {name}"
-            assert np.allclose(
-                got[name], want[name], rtol=0.0, atol=1e-1
-            ), f"step {step}: {name}"
+            assert np.array_equal(got[name], want[name]), f"step {step}: {name}"
 
 
 def test_kv_quant_parity_mode_passes_on_quantized_toy(monkeypatch):
@@ -1330,6 +1335,32 @@ def test_parity_mode_passes_on_toy_model_and_commits_eager_state():
     assert cache[1].size() == 6
     assert cache[1].rollback_state[0] is not None
     assert 0 in captures
+
+
+class WideToyHybridRuntime(ToyHybridRuntime):
+    """The toy at model dim 64: 4,096-entry projections instead of 16."""
+
+    D = 64
+
+
+def test_parity_mode_passes_on_a_wide_toy_every_round():
+    # Per-call bit-exactness (eager authoritative, abort on the first
+    # mismatch) at a width where TF32 rounding on a tensor-unit GPU does not
+    # hide a weight that differs between the two legs: with the toy weights
+    # left lazy (regenerated inside the trace, see ToyHybridRuntime) the
+    # first round's compiled logits were off by 0.3 on an M5, while the D=4
+    # toy still matched there.
+    rt = WideToyHybridRuntime()
+    bank = CompiledVerifyBank(rt, parity=True)
+    cache = _prefill(rt, [0, 1, 2])
+
+    for window in VERIFY_WINDOWS:
+        bank.forward_ar_capture(mx.array([window]), cache=cache)
+
+    assert bank.stats["parity_checks"] == len(VERIFY_WINDOWS)
+    assert bank.stats["parity_failures"] == 0
+    assert bank.stats["compiled_calls"] == len(VERIFY_WINDOWS)
+    assert cache[1].size() == 3 + sum(len(window) for window in VERIFY_WINDOWS)
 
 
 def test_parity_mode_uses_same_compiled_aux_for_eager_reference(monkeypatch):
@@ -2521,6 +2552,77 @@ def test_compiled_verify_quant_bits_gate(monkeypatch):
     # parity diagnostics bypass the gate deliberately
     parity_bank = CompiledVerifyBank(runtime_with_bits(6), parity2=True)
     assert parity_bank.permanent_eager is False
+
+
+def _gdn_runtime(*, embed, norm=None, head_k_dim=128, quantized_embed=False):
+    """The attributes admission reads: embedding, layer norms, GDN key head size."""
+    from types import SimpleNamespace
+
+    if quantized_embed:
+        embed_tokens = SimpleNamespace(
+            weight=mx.zeros((2,), dtype=mx.uint32), scales=mx.zeros((2,), dtype=embed)
+        )
+    else:
+        embed_tokens = SimpleNamespace(weight=mx.zeros((2,), dtype=embed))
+    layer = SimpleNamespace(
+        linear_attn=SimpleNamespace(head_k_dim=head_k_dim),
+        input_layernorm=SimpleNamespace(weight=mx.zeros((2,), dtype=norm or embed)),
+    )
+    inner = SimpleNamespace(embed_tokens=embed_tokens, layers=[layer])
+    return SimpleNamespace(model=SimpleNamespace(model=inner))
+
+
+def test_float32_gdn_key_scale_demotes_at_admission(monkeypatch, capsys):
+    """A float32 stream through GDN layers of key head size 128 verifies eagerly.
+
+    The fused kernels of the compiled verifier hold 128**-0.5 as 0.08838835
+    (7 significant digits), so its GDN states, hidden states and logits
+    differ from the eager verifier's from the first round; a half-precision
+    stream holds the scale exactly, and so does head size 64 in float32.
+    """
+    import mtplx.graphbank as graphbank_module
+    from mtplx.graphbank import CompiledVerifyBank, _float32_gdn_key_scale_head_dim
+
+    monkeypatch.setattr(graphbank_module, "_PERMANENT_EAGER_LOGGED", set())
+    monkeypatch.setattr(
+        graphbank_module,
+        "compiled_verify_status",
+        dict(graphbank_module.compiled_verify_status),
+    )
+    # A speed override; it does not reach a correctness gate.
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_FORCE", "1")
+
+    assert _float32_gdn_key_scale_head_dim(_gdn_runtime(embed=mx.float32)) == 128
+    assert _float32_gdn_key_scale_head_dim(_gdn_runtime(embed=mx.float32, head_k_dim=32)) == 32
+    # One float32 norm weight promotes a half-precision stream.
+    assert _float32_gdn_key_scale_head_dim(_gdn_runtime(embed=mx.bfloat16, norm=mx.float32)) == 128
+    for embed in (mx.bfloat16, mx.float16):
+        assert _float32_gdn_key_scale_head_dim(_gdn_runtime(embed=embed)) is None
+        assert (
+            _float32_gdn_key_scale_head_dim(_gdn_runtime(embed=embed, quantized_embed=True))
+            is None
+        )
+    assert _float32_gdn_key_scale_head_dim(_gdn_runtime(embed=mx.float32, head_k_dim=64)) is None
+
+    bank = CompiledVerifyBank(_gdn_runtime(embed=mx.float32))
+    assert bank.permanent_eager is True
+    assert bank.permanent_eager_reason == "float32_gdn_key_scale:head_k_dim=128"
+    assert bank.to_dict()["permanent_eager_reason"] == "float32_gdn_key_scale:head_k_dim=128"
+    CompiledVerifyBank(_gdn_runtime(embed=mx.float32))  # the next request: no second line
+    lines = [line for line in capsys.readouterr().out.splitlines() if "permanent-eager" in line]
+    assert len(lines) == 1
+    assert "float32_gdn_key_scale:head_k_dim=128" in lines[0]
+    assert "128**-0.5" in lines[0] and "7 significant digits" in lines[0]
+
+    for embed in (mx.bfloat16, mx.float16):
+        assert CompiledVerifyBank(_gdn_runtime(embed=embed)).permanent_eager is False
+        assert (
+            CompiledVerifyBank(_gdn_runtime(embed=embed, quantized_embed=True)).permanent_eager
+            is False
+        )
+    # The parity diagnostics measure the mismatch instead.
+    assert CompiledVerifyBank(_gdn_runtime(embed=mx.float32), parity=True).permanent_eager is False
+    assert CompiledVerifyBank(_gdn_runtime(embed=mx.float32), parity2=True).permanent_eager is False
 
 
 # -- A2.1 commit-first donation (speed-war Lane A2, 2026-07-06) ----------------

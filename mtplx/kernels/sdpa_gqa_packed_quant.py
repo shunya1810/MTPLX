@@ -29,11 +29,31 @@ from functools import lru_cache
 
 import mlx.core as mx
 
+from ..compile_state import is_compile_trace_error
+from .sdpa_2pass_paged import unnormalized_partials_dtype
 from .sdpa_gqa_packed import (  # shared, proven pieces
     _bail,
     _blocks_for_capacity,
     _paged_reduce_kernel,
 )
+
+
+def _concrete_offset(offset) -> int | None:
+    """The host value of an array offset, or None while ``mx.compile`` traces.
+
+    Eagerly this is one scalar sync. Inside a trace ``.item()`` raises MLX's
+    refusal, recognised by ``compile_state.is_compile_trace_error`` exactly
+    as ``cache_state._concrete_offset`` does; every other ValueError (a NaN
+    offset that ``int()`` cannot convert, a failed evaluation) is a real fault
+    and propagates instead of skipping the range check below.
+    """
+
+    try:
+        return int(offset.item())
+    except ValueError as exc:
+        if is_compile_trace_error(exc):
+            return None
+        raise
 
 
 def _static_blocks(capacity: int, max_offset: int | None) -> int:
@@ -339,14 +359,16 @@ def _quant_partials_kernel():
 
         for (int j = 0; j < QL; ++j) {
             const int o_offset = q_head_idx * QL + j;
-            device InT* p = partials
+            // PartT, not InT: the numerator is not yet divided by sum_exp
+            // (see sdpa_2pass.unnormalized_partials_dtype).
+            device PartT* p = partials
                 + ((size_t)o_offset * blocks + block_idx) * V
                 + simd_lid * v_per_thread;
             for (int i = 0; i < v_per_thread; ++i) {
                 const float4 ob = (j < 4) ? obank[i] : obank2[i];
                 const float val = (j % 4 == 0) ? ob.x
                     : (j % 4 == 1) ? ob.y : (j % 4 == 2) ? ob.z : ob.w;
-                p[i] = static_cast<InT>(val);
+                p[i] = static_cast<PartT>(val);
             }
             if (simd_lid == 0) {
                 const float se = (j < 4) ? sum_exp[j] : sum_exp2[j - 4];
@@ -443,6 +465,19 @@ def sdpa_gqa_packed_tail_quant(
     if isinstance(offset, mx.array):
         if offset.size != 1:
             return _bail("offset_shape")
+        # The integer branch below bails past the buffers; an array offset
+        # used to reach the kernel unchecked, and its walk reads offset rows
+        # of k_q/v_q and both scale planes whatever their size. An eager
+        # offset past the capacity means the cache already outran its
+        # buffers, so this refuses loudly instead of reading past them. A
+        # traced offset cannot be read here; the compiled verify bank only
+        # dispatches a bucket whose offset + window fits the capacity.
+        concrete = _concrete_offset(offset)
+        if concrete is not None and concrete > capacity:
+            raise ValueError(
+                f"packed-quant attention offset {concrete} is past the KV "
+                f"buffers' {capacity} rows; the cache wrote beyond its capacity"
+            )
         offset_arr = offset.astype(mx.int32).reshape(1)
     else:
         offset_int = int(offset)
@@ -465,6 +500,7 @@ def sdpa_gqa_packed_tail_quant(
 
     partial_shape = (bsz, hq, q_len, blocks, d)
     stats_shape = (bsz, hq, q_len, blocks)
+    partial_dtype = unnormalized_partials_dtype(queries.dtype)
     partials, sums, maxs = kernel(
         inputs=[
             queries,
@@ -480,6 +516,7 @@ def sdpa_gqa_packed_tail_quant(
         ],
         template=[
             ("InT", queries.dtype),
+            ("PartT", partial_dtype),
             ("D", d),
             ("V", d),
             ("GQA_F", gqa_factor),
@@ -489,7 +526,7 @@ def sdpa_gqa_packed_tail_quant(
         grid=(hk * 32, gqa_factor, blocks),
         threadgroup=(32, gqa_factor, 1),
         output_shapes=[partial_shape, stats_shape, stats_shape],
-        output_dtypes=[queries.dtype, mx.float32, mx.float32],
+        output_dtypes=[partial_dtype, mx.float32, mx.float32],
     )
 
     (out,) = reduce_kernel(

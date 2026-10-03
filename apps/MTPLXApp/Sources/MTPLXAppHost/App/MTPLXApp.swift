@@ -390,10 +390,7 @@ struct MTPLXApp: App {
                 Button(tr("Open Logs…")) { router.presentLogs() }
                     .keyboardShortcut("l", modifiers: [.command, .shift])
                 Button(tr("Refresh")) {
-                    Task {
-                        try? await backend.refreshStaticState()
-                        try? await backend.refreshSnapshot()
-                    }
+                    Task { await backend.refresh() }
                 }
                 .keyboardShortcut("r", modifiers: [.command, .option])
             }

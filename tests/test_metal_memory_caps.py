@@ -122,10 +122,12 @@ def test_apply_metal_memory_caps_preserves_128g_defaults(monkeypatch):
         total_ram_bytes=128 * GiB,
     )
 
+    # G5 (09-29): a 128 GB desktop leaves 38 GiB outside the engine, 90 GiB
+    # rather than the 75% rule's 96 GiB; the wired default is unchanged.
     assert result["applied"] is True
-    assert result["memory_limit_bytes"] == 96 * GiB
+    assert result["memory_limit_bytes"] == 90 * GiB
     assert result["wired_limit_bytes"] == int(128 * GiB * 0.60)
-    assert calls == [("memory", 96 * GiB), ("wired", int(128 * GiB * 0.60))]
+    assert calls == [("memory", 90 * GiB), ("wired", int(128 * GiB * 0.60))]
 
 
 def test_apply_metal_memory_caps_raises_default_wired_floor_for_laguna(
@@ -413,4 +415,5 @@ def test_wired_limit_under_the_system_limit_is_untouched(monkeypatch):
 
     assert result["wired_limit_bytes"] == floor
     assert "wired_limit_requested_bytes" not in result
-    assert calls == [("memory", 96 * GiB), ("wired", floor)]
+    # The 128 GB desktop default (90 GiB, G5) still covers the 83.3 GiB floor.
+    assert calls == [("memory", 90 * GiB), ("wired", floor)]

@@ -426,22 +426,26 @@ def test_first_run_callers_exit_cleanly_on_refusal(monkeypatch, capsys):
 
 
 def test_verified_default_refs_include_speed_and_fp16():
+    from mtplx.hf_loader import model_cache_dir
+
     assert is_verified_default_model_ref(DEFAULT_HF_MODEL_ID)
     assert is_verified_default_model_ref(DEFAULT_FP16_HF_MODEL_ID)
-    assert not is_verified_default_model_ref(
-        "/Users/example/.mtplx/hf-upload/Qwen3.6-27B-MTPLX-Optimized"
-    )
-    assert is_verified_default_model_ref(
-        "/Users/example/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed-V2"
-    )
-    assert not is_verified_default_model_ref(
-        "/Users/example/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed"
-    )
-    assert is_verified_default_model_ref(
-        "/Users/example/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed-FP16"
-    )
+    assert is_verified_default_model_ref(OPTIMIZED_SPEED_V2_HF_MODEL_ID)
     assert not is_verified_default_model_ref("someone/custom-model")
-    assert not is_verified_default_model_ref("/Users/example/models/custom-model")
+    # A folder is the user's own pick whatever its name and wherever it is,
+    # MTPLX's model library included: only a pick recorded as the default
+    # follows the default (#573).
+    library = model_cache_dir()
+    for folder in (
+        library / "Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+        library / "Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
+        "/Users/example/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed-V2",
+        "/Users/example/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed-FP16",
+        "/Users/example/Documents/MTPLX/models/Qwen3.6-27B-MTPLX-Optimized-Speed",
+        "/Users/example/.mtplx/hf-upload/Qwen3.6-27B-MTPLX-Optimized",
+        "/Users/example/models/custom-model",
+    ):
+        assert not is_verified_default_model_ref(str(folder))
 
 
 def test_optimized_speed_prefers_complete_local_env_model(tmp_path, monkeypatch):

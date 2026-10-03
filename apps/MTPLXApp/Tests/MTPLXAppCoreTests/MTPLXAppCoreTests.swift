@@ -5517,14 +5517,16 @@ final class MTPLXAppCoreTests: XCTestCase {
             )
         )
         // The plugin file is managed in place: stale content is replaced
-        // with the template that strips exactly OpenCode's injected 32,000
-        // output cap and the <=1.18.20 qwen sampler pair.
+        // with the template that replaces exactly OpenCode's own output
+        // default, min(limit.output, 32,000), and strips the <=1.18.20 qwen
+        // sampler pair.
         let pluginSource = try XCTUnwrap(
             String(data: Data(contentsOf: managedPluginURL), encoding: .utf8)
         )
         XCTAssertTrue(pluginSource.contains("const mtplxInjectedOutputCap = 32000;"))
         XCTAssertTrue(pluginSource.contains("const mtplxInjectedQwenTemperature = 0.55;"))
-        XCTAssertTrue(pluginSource.contains("output.maxOutputTokens === mtplxInjectedOutputCap"))
+        XCTAssertTrue(pluginSource.contains("if (output.maxOutputTokens === opencodeDefault)"))
+        XCTAssertTrue(pluginSource.contains("const mtplxRequestedOutputHeader = \"x-mtplx-max-response-tokens\";"))
         XCTAssertTrue(pluginSource.contains("x-mtplx-session-id"))
 
         // Repeat sync with unchanged configuration: no rewrite churn.
@@ -6640,28 +6642,36 @@ final class MTPLXAppCoreTests: XCTestCase {
         XCTAssertEqual(option.hfModelID, "Youssofal/Qwen3.6-27B-MTPLX-Optimized-Quality")
     }
 
-    func testBenchmarkReadinessUsesReachableDaemon() async throws {
+    /// A healthy server the app does not hold is not a ready daemon (#528):
+    /// the benchmark used to run against whatever answered on the port and
+    /// post settings to it. This one carries an app launch id, so readiness
+    /// goes to a start, which would adopt it; here the start first needs
+    /// the model downloaded, and stops there, before any launch step. The
+    /// app's own daemon passing the check is covered in
+    /// DaemonReconnectTests.
+    func testBenchmarkReadinessDoesNotTakeAServerTheAppDoesNotHold() async throws {
         let port = try freeTCPPort()
         let server = try await startFixtureHealthServer(
             port: port,
             healthJSON: Self.healthJSON
         )
         defer { server.terminate() }
-
+        let root = temporaryDirectory()
         let backend = await MTPLXBackendStore(
-            configuration: MTPLXAppConfiguration(port: port),
-            settingsStore: MTPLXSettingsStore(settingsURL: temporaryDirectory().appendingPathComponent("settings.json"))
+            configuration: MTPLXAppConfiguration(model: "Example/NewModel", port: port),
+            settingsStore: MTPLXSettingsStore(settingsURL: root.appendingPathComponent("settings.json")),
+            modelDownloader: ModelDownloader(modelCacheRoot: root.appendingPathComponent("cache", isDirectory: true))
         )
 
-        let health = try await backend.ensureDaemonReadyForBenchmark()
+        do {
+            _ = try await backend.ensureDaemonReadyForBenchmark()
+            XCTFail("a server the app does not hold is not a ready daemon")
+        } catch BenchmarkDaemonReadinessError.modelDownloadRequired {
+            // Readiness went to a start of the app's own daemon instead.
+        }
 
-        XCTAssertTrue(health.ok)
         let storedHealth = await backend.health
-        let currentFanMode = await backend.currentFanMode
-        let pendingModelDownload = await backend.pendingModelDownload
-        XCTAssertEqual(storedHealth?.model, "mtplx-test-model")
-        XCTAssertEqual(currentFanMode, "max")
-        XCTAssertNil(pendingModelDownload)
+        XCTAssertNil(storedHealth, "the other server's /health never becomes the app's")
     }
 
     func testStopDaemonRestoresFansWhenFanModeCacheIsStale() async throws {

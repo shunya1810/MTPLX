@@ -37,14 +37,26 @@ from typing import Any
 
 GIB = 1024**3
 
-# Mirrors the server's Metal memory-limit default (_configure_metal_memory_caps):
-# min(ram, max(8 GiB, 75% of ram), 192 GiB). Everything the engine allocates
+# The server's Metal memory-limit default (_apply_metal_memory_caps reads
+# usable_engine_bytes): min(ram, max(8 GiB, 75% of ram), 192 GiB), and from
+# 128 GB up at most ram - 38 GiB. Everything the engine allocates
 # through MLX (weights, KV, bank snapshots, transients) lives under that
 # allocator bound, so it is the honest "usable" envelope; macOS, other apps,
 # and the Python side of the process live in the remaining 25%.
 ENGINE_RAM_FRACTION = 0.75
 ENGINE_RAM_FLOOR_BYTES = 8 * GIB
 ENGINE_RAM_CAP_BYTES = 192 * GIB
+# A desktop keeps other apps open beside the engine. On a 128 GB Mac with
+# 16 GB of other apps, the 75% rule (a 96 GiB limit) left too little outside
+# the engine for a compaction-size prefill: the guard kept the Mac alive by
+# refusing it with a 507, while at 90 GiB the same request was served with the
+# Mac safe (09-27 final-guard receipts, founder decision G5 on 09-29). From
+# 128 GB up the default therefore leaves at least this much outside the
+# allocator; at 192 GB and up the 75% rule already leaves more, and Macs under
+# 128 GB keep the 75% rule until a desktop receipt says otherwise. A headless
+# server chooses ``--memory-limit max`` instead (issue #548).
+DESKTOP_HEADROOM_BYTES = 38 * GIB
+DESKTOP_HEADROOM_MIN_RAM_BYTES = 128 * GIB
 
 # Decode/prefill working memory that is neither weights, KV, nor bank:
 # graphbank compiled buffers, logits_keep tail, draft-head activations,
@@ -204,6 +216,29 @@ def qsa_aux_bytes_per_token_from_config(config: dict | None) -> int:
     return (n_qsa + 1) * per_layer + mtp_head_kv
 
 
+def mtp_history_bytes_per_token_from_config(config: dict | None) -> int:
+    """KV the MTP head keeps per committed token under the ``committed``
+    MTP-history policy, for families whose aux term does not already count
+    it: the Qwen 3.5/3.6/3.8 hybrids' MTP layers are full attention with the
+    trunk's KV heads and head size, bf16. 4,096 B a token on the 27B and the
+    4B (one layer, 4 KV heads x 256). Zero for QSA hybrids (their aux term
+    counts the MTP head) and for configs that do not declare
+    ``mtp_num_hidden_layers``."""
+
+    if not isinstance(config, dict) or _qsa_geometry(config) is not None:
+        return 0
+    text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
+    try:
+        layers = int(text.get("mtp_num_hidden_layers") or config.get("mtp_num_hidden_layers") or 0)
+        kv_heads = int(text.get("num_key_value_heads") or 0)
+        head_dim = int(text.get("head_dim") or 0)
+    except (TypeError, ValueError):
+        return 0
+    if layers <= 0 or kv_heads <= 0 or head_dim <= 0:
+        return 0
+    return layers * 2 * kv_heads * head_dim * 2
+
+
 def qsa_prefill_transient_bytes_per_token_from_config(
     config: dict | None, *, chunk_size: int = 2048
 ) -> int:
@@ -255,14 +290,38 @@ def detect_total_ram_bytes() -> int | None:
     return None
 
 
-def usable_engine_bytes(total_ram_bytes: int) -> int:
-    """The engine's allocator envelope for a machine of this size."""
+def _ram_share_bytes(total_ram_bytes: int) -> int:
+    """The 75% rule: min(ram, max(8 GiB, 75% of ram), 192 GiB)."""
     total = int(total_ram_bytes)
     return min(
         total,
         max(ENGINE_RAM_FLOOR_BYTES, int(total * ENGINE_RAM_FRACTION)),
         ENGINE_RAM_CAP_BYTES,
     )
+
+
+def usable_engine_bytes(total_ram_bytes: int) -> int:
+    """The engine's default allocator envelope for a machine of this size."""
+    total = int(total_ram_bytes)
+    usable = _ram_share_bytes(total)
+    if total >= DESKTOP_HEADROOM_MIN_RAM_BYTES:
+        usable = min(usable, total - DESKTOP_HEADROOM_BYTES)
+    return usable
+
+
+def max_engine_bytes(total_ram_bytes: int) -> int:
+    """``--memory-limit max``: everything outside macOS's own reserve, and
+    never less than the default.
+
+    For a headless server with no desktop to leave room for (issue #548):
+    112 GiB on a 128 GB Mac, 56 GiB on 64 GB. On Macs of 32 GB and under the
+    default (75% of RAM, at least 8 GiB) already reaches past the reserve
+    (8 GiB there), so ``max`` is the default: 8, 12, 18 and 24 GiB on 8, 16,
+    24 and 32 GB. The guard's whole-Mac floors still apply; only the
+    engine's own budget grows.
+    """
+    total = int(total_ram_bytes)
+    return max(usable_engine_bytes(total), total - system_reserve_bytes(total))
 
 
 def system_reserve_bytes(total_ram_bytes: int) -> int:
@@ -298,12 +357,22 @@ def engine_envelope_bytes(
 
     Never below the floor; seats whose 75% envelope already covers the
     floor (128 GB and up for Flash-Next) are unchanged.
+
+    The desktop headroom (``usable_engine_bytes`` from 128 GB up) gives way
+    to a model whose floor is above it only as far as the 75% rule, the
+    default before that headroom: a 128 GB Mac and a 92 GiB floor get
+    96 GiB, as they did, not the whole envelope outside the system reserve
+    (112 GiB; the review of 4c9da1ba found the lower default turning that
+    floor into 112 GiB).
     """
     total = int(total_ram_bytes)
     base = usable_engine_bytes(total)
     floor = max(0, int(resident_floor_bytes or 0))
     if floor <= base:
         return base
+    share = _ram_share_bytes(total)
+    if floor <= share:
+        return share
     return min(total, max(floor, total - system_reserve_bytes(total)))
 
 
@@ -364,6 +433,10 @@ class MemoryPlan:
     # Zero for families without them — the fit then matches the legacy solve.
     aux_bytes_per_token: int = 0
     prefill_transient_bytes_per_token: int = 0
+    # The committed MTP-history cache per token of a non-QSA MTP family
+    # (mtp_history_bytes_per_token_from_config). The request admission
+    # prices it; the fit and the bank budgets do not count it yet.
+    mtp_history_bytes_per_token: int = 0
 
     model_fits: bool = True
     # Largest window the machine can commit to (weights + full-window KV +
@@ -429,6 +502,7 @@ class MemoryPlan:
             "prefill_transient_bytes_per_token": int(
                 self.prefill_transient_bytes_per_token
             ),
+            "mtp_history_bytes_per_token": int(self.mtp_history_bytes_per_token),
             "model_fits": self.model_fits,
             "context_window_fit": int(self.context_window_fit),
             "context_window_resolved": int(self.context_window_resolved),
@@ -467,6 +541,7 @@ def plan_memory(
     usable_bytes_explicit: bool = False,
     resident_floor_bytes: int | None = None,
     tight_machine_measured: bool = False,
+    mtp_history_bytes_per_token: int = 0,
 ) -> MemoryPlan:
     """Solve the machine's memory geometry.
 
@@ -654,14 +729,17 @@ def plan_memory(
         )
 
     # --- bank budgets -------------------------------------------------------
-    # Steady-state KV projection: sessions decode dense up to the dense
-    # ceiling; that much KV WILL routinely be resident, so the bank's
-    # advertised under-load budget subtracts it. Past the ceiling (paged
-    # lane) the dynamic ceiling yields further at runtime.
-    reserve_tokens = min(
-        resolved, int(dense_decode_ceiling) if dense_decode_ceiling else resolved
-    )
-    kv_reserve = reserve_tokens * kv_effective
+    # Steady-state KV projection: a session may hold the whole committed
+    # window, so the bank's advertised under-load budget subtracts the KV
+    # and the family's per-token working set (QSA streams, the MTP head's KV)
+    # of the resolved window. It used to stop at the dense-decode ceiling
+    # and count KV alone (#525: a 262K window on 64 GB reserved 157K tokens,
+    # and the committed rest rode the paged lane unpriced).
+    # ``dense_decode_ceiling`` no longer narrows it: the paged lane past the
+    # ceiling holds the same tokens. The runtime ceiling
+    # (bank_dynamic_ceiling) still reads the live working set.
+    reserve_tokens = int(resolved)
+    kv_reserve = reserve_tokens * (kv_effective + aux_pt)
     bank_idle = usable - weights - transients
     bank_idle = max(bank_floor, min(BANK_CAP_BYTES, bank_idle))
     bank_steady = usable - weights - transients - kv_reserve
@@ -680,6 +758,7 @@ def plan_memory(
         kv_bytes_per_token_effective=kv_effective,
         aux_bytes_per_token=aux_pt,
         prefill_transient_bytes_per_token=transient_pt,
+        mtp_history_bytes_per_token=max(0, int(mtp_history_bytes_per_token)),
         model_fits=model_fits,
         context_window_fit=context_fit,
         context_window_resolved=resolved,

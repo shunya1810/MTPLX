@@ -17,6 +17,8 @@ from __future__ import annotations
 import time
 from threading import Event
 
+import pytest
+
 from mtplx.model_scheduler import ModelWorkScheduler
 
 
@@ -478,6 +480,12 @@ def test_bank_cold_jobs_carry_session_coalesce_key():
     )
     assert len(dispatched) == 1
     assert getattr(dispatched[0], "coalesce_key", None) == "ssd_cold:session-42"
+    # While the bank holds the entry the job pins nothing extra; once the
+    # bank lets the entry go, the queued job is what keeps its bytes.
+    pinned = dispatched[0].pinned_bytes
+    assert pinned() == 0
+    bank.clear(session_id="session-42")
+    assert pinned() == 64
 
 
 def test_capability_marker_and_legacy_fallback_shape():
@@ -580,3 +588,322 @@ def test_cancelled_persistence_closure_released_while_worker_parks_idle():
     finally:
         release.set()
         scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def _hold_owner(scheduler: ModelWorkScheduler):
+    started = Event()
+    release = Event()
+
+    def blocker() -> None:
+        started.set()
+        assert release.wait(timeout=2)
+
+    future = scheduler.submit_foreground(blocker)
+    assert started.wait(timeout=2)
+    return future, release
+
+
+def test_persistence_budget_drops_oldest_pinned_and_keeps_newest():
+    scheduler = _scheduler(persistence_max_pending_bytes=100)
+    ran: list[str] = []
+    held, release = _hold_owner(scheduler)
+    try:
+        futures = [
+            scheduler.submit_idle_persistence(
+                lambda name=name: ran.append(name),
+                coalesce_key=f"ssd_cold:{name}",
+                pinned_bytes=40,
+            )
+            for name in ("a", "b", "c")
+        ]
+        stats = scheduler.stats()
+        assert futures[0].cancelled()
+        assert stats["persistence_pending"] == 2
+        assert stats["persistence_pending_bytes"] == 80
+        assert stats["persistence_budget_dropped"] == 1
+        release.set()
+        held.result(timeout=2)
+        futures[1].result(timeout=2)
+        futures[2].result(timeout=2)
+        assert ran == ["b", "c"]
+        assert scheduler.stats()["persistence_pending_bytes"] == 0
+    finally:
+        release.set()
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_persistence_budget_never_drops_newest_or_unpinned_items():
+    scheduler = _scheduler(persistence_max_pending_bytes=10)
+    _held, release = _hold_owner(scheduler)
+    try:
+        unpinned = scheduler.submit_idle_persistence(lambda: None)
+        pinned = scheduler.submit_idle_persistence(lambda: None, pinned_bytes=50)
+        stats = scheduler.stats()
+        assert not unpinned.cancelled()
+        assert not pinned.cancelled()
+        assert stats["persistence_pending_bytes"] == 50
+        assert stats["persistence_budget_dropped"] == 0
+    finally:
+        release.set()
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_zero_persistence_budget_disables_the_cap():
+    scheduler = _scheduler(persistence_max_pending_bytes=0)
+    _held, release = _hold_owner(scheduler)
+    try:
+        futures = [
+            scheduler.submit_idle_persistence(lambda: None, pinned_bytes=10**12)
+            for _ in range(3)
+        ]
+        assert not any(future.cancelled() for future in futures)
+        assert scheduler.stats()["persistence_budget_dropped"] == 0
+    finally:
+        release.set()
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_coalescing_releases_pinned_bytes():
+    scheduler = _scheduler(persistence_max_pending_bytes=100)
+    _held, release = _hold_owner(scheduler)
+    try:
+        scheduler.submit_idle_persistence(
+            lambda: None, coalesce_key="ssd_cold:s", pinned_bytes=60
+        )
+        scheduler.submit_idle_persistence(
+            lambda: None, coalesce_key="ssd_cold:s", pinned_bytes=70
+        )
+        stats = scheduler.stats()
+        assert stats["persistence_pending_bytes"] == 70
+        assert stats["persistence_budget_dropped"] == 0
+    finally:
+        release.set()
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_persistence_budget_reads_env(monkeypatch):
+    import mtplx.memory_plan as memory_plan
+
+    def budget() -> int:
+        scheduler = _scheduler()
+        try:
+            return scheduler.persistence_max_pending_bytes
+        finally:
+            scheduler.shutdown(wait=True)
+
+    monkeypatch.setenv("MTPLX_PERSISTENCE_MAX_PENDING_BYTES", "2G")
+    assert budget() == 2 * 1024**3
+    monkeypatch.setenv("MTPLX_PERSISTENCE_MAX_PENDING_BYTES", "off")
+    assert budget() == 0
+    monkeypatch.delenv("MTPLX_PERSISTENCE_MAX_PENDING_BYTES")
+    monkeypatch.setattr(memory_plan, "detect_total_ram_bytes", lambda: 128 * 1024**3)
+    assert budget() == 4 * 1024**3
+
+
+@pytest.mark.parametrize(
+    "ram_gib, budget_gib",
+    [(8, 0.5), (16, 0.5), (36, 1.125), (64, 2), (128, 4), (512, 16)],
+)
+def test_default_budget_follows_the_machine(ram_gib, budget_gib):
+    from mtplx.model_scheduler import _default_persistence_max_pending_bytes
+
+    assert _default_persistence_max_pending_bytes(ram_gib * 1024**3) == int(
+        budget_gib * 1024**3
+    )
+
+
+def test_live_pinned_bytes_are_read_at_the_check():
+    """A job's bytes count from the moment the bank lets its entry go."""
+    scheduler = _scheduler(persistence_max_pending_bytes=100)
+    _held, release = _hold_owner(scheduler)
+    held_by_bank = {"a": True}
+    try:
+        old = scheduler.submit_idle_persistence(
+            lambda: None,
+            coalesce_key="ssd_cold:a",
+            pinned_bytes=lambda: 0 if held_by_bank["a"] else 80,
+        )
+        scheduler.submit_idle_persistence(
+            lambda: None, coalesce_key="ssd_cold:b", pinned_bytes=40
+        )
+        assert not old.cancelled()
+        assert scheduler.stats()["persistence_pending_bytes"] == 40
+        held_by_bank["a"] = False
+        assert scheduler.stats()["persistence_pending_bytes"] == 120
+        scheduler.submit_idle_persistence(
+            lambda: None, coalesce_key="ssd_cold:c", pinned_bytes=10
+        )
+        assert old.cancelled()
+        assert scheduler.stats()["persistence_pending_bytes"] == 50
+    finally:
+        release.set()
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_resident_session_persist_survives_another_sessions_commit():
+    """The 09-27 probe, now a test: a large main session the RAM bank still
+    holds, then a small second session commits while the owner is busy. The
+    main session's SSD encode must stay queued (cancelling it frees nothing
+    and only loses the disk copy); both reach the SSD tier once idle."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from mtplx.cache_state import CacheSnapshot
+    from mtplx.session_bank import SessionBank
+
+    persisted: list[str] = []
+    scheduler = _scheduler(persistence_max_pending_bytes=64 * 1024**2)
+    bank = SessionBank(
+        max_entries=8,
+        max_bytes=8 * 1024**3,
+        per_session_max_bytes=8 * 1024**3,
+        cold_tier=SimpleNamespace(
+            put_entry=lambda entry, capabilities=None: persisted.append(
+                entry.session_id
+            )
+            or True
+        ),
+    )
+    bank.cold_enqueue_dispatch = lambda job: scheduler.submit_idle_persistence(
+        job,
+        coalesce_key=getattr(job, "coalesce_key", None),
+        pinned_bytes=getattr(job, "pinned_bytes", 0) or 0,
+    )
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    held, release = _hold_owner(scheduler)
+    try:
+        for session_id, tokens, nbytes in (
+            ("main", list(range(1, 400)), 5 * 1024**3),
+            ("subagent", [7, 8, 9], 16 * 1024**2),
+        ):
+            bank.put_snapshot(
+                runtime=runtime,
+                token_ids=tokens,
+                cache_snapshot=CacheSnapshot(states=(), meta_states=()),
+                logits=None,
+                hidden=None,
+                session_id=session_id,
+                snapshot_epoch=len(tokens),
+                nbytes_override=nbytes,
+            )
+        stats = scheduler.stats()
+        assert stats["persistence_budget_dropped"] == 0
+        assert stats["persistence_pending_bytes"] == 0
+        release.set()
+        held.result(timeout=2)
+        deadline = time.monotonic() + 5.0
+        while len(persisted) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert sorted(persisted) == ["main", "subagent"]
+    finally:
+        release.set()
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_jobs_the_budget_drops_leave_no_pending_rows_in_the_bank():
+    """The review of 4c9da1ba: the budget cancelled queued SSD encodes, but
+    the bank's pending map is cleared only by a job that runs, so 100
+    sessions through the budget left 99 rows behind (the parent left none).
+    A dropped job's cancelled future now retires its row, and only while the
+    row still names that job's entry."""
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from mtplx.cache_state import CacheSnapshot
+    from mtplx.session_bank import SessionBank
+
+    persisted: list[str] = []
+    scheduler = _scheduler(persistence_max_pending_bytes=64 * 1024**2)
+    bank = SessionBank(
+        max_entries=1,
+        max_bytes=8 * 1024**3,
+        per_session_max_bytes=8 * 1024**3,
+        cold_tier=SimpleNamespace(
+            put_entry=lambda entry, capabilities=None: persisted.append(
+                entry.session_id
+            )
+            or True
+        ),
+    )
+    bank.cold_enqueue_dispatch = lambda job: scheduler.submit_idle_persistence(
+        job,
+        coalesce_key=getattr(job, "coalesce_key", None),
+        pinned_bytes=getattr(job, "pinned_bytes", 0) or 0,
+    )
+    runtime = SimpleNamespace(model_path=Path("models/example"), mtp_enabled=True)
+    held, release = _hold_owner(scheduler)
+    try:
+        for n in range(100):
+            tokens = [1000 * (n + 1) + i for i in range(8)]
+            bank.put_snapshot(
+                runtime=runtime,
+                token_ids=tokens,
+                cache_snapshot=CacheSnapshot(states=(), meta_states=()),
+                logits=None,
+                hidden=None,
+                session_id=f"session-{n}",
+                snapshot_epoch=len(tokens),
+                nbytes_override=16 * 1024**2,
+            )
+        stats = scheduler.stats()
+        assert stats["persistence_budget_dropped"] > 0
+        release.set()
+        held.result(timeout=2)
+        deadline = time.monotonic() + 5.0
+        while scheduler.stats()["persistence_pending"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert scheduler.stats()["persistence_pending"] == 0
+        time.sleep(0.05)
+        assert persisted, "the kept jobs ran"
+        assert len(bank._persistence_pending) == 0
+        assert bank.queued_persistence() == []
+    finally:
+        release.set()
+        scheduler.shutdown(wait=True, cancel_futures=True)
+
+
+def test_a_dropped_job_never_retires_a_newer_row_for_its_key():
+    import weakref
+
+    from mtplx.session_bank import SessionBank
+
+    bank = SessionBank(max_entries=4, max_bytes=1024**3, per_session_max_bytes=1024**3)
+    futures = []
+
+    class _Future:
+        def __init__(self):
+            self.callbacks = []
+            self._cancelled = False
+
+        def add_done_callback(self, fn):
+            self.callbacks.append(fn)
+
+        def cancelled(self):
+            return self._cancelled
+
+        def cancel(self):
+            self._cancelled = True
+            for fn in self.callbacks:
+                fn(self)
+
+    def dispatch(job):
+        future = _Future()
+        futures.append(future)
+        return future
+
+    class _Entry:
+        def __init__(self, token_ids):
+            self.token_ids = token_ids
+            self.nbytes = 10
+            self.session_id = "s"
+
+    bank.cold_enqueue_dispatch = dispatch
+    old = _Entry((1, 2))
+    new = _Entry((1, 2, 3))
+    bank._dispatch_persistence(old, lambda: None, key="k")
+    bank._dispatch_persistence(new, lambda: None, key="k")
+    # The older job is dropped after the newer one filed under the key.
+    futures[0].cancel()
+    assert bank._persistence_pending["k"] is weakref.ref(new)
+    futures[1].cancel()
+    assert "k" not in bank._persistence_pending

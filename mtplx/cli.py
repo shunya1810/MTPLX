@@ -820,8 +820,9 @@ def _add_ssd_session_cache_args(parser: argparse.ArgumentParser) -> None:
         default="on",
         help=(
             "Persistent SessionBank SSD cold tier (default on; kvcache-v2). "
-            "Budgeted by min(configured cap, free_disk/4), disabled below "
-            "10 GiB free."
+            "Budgeted by the configured cap and free disk: normally a quarter of "
+            "the space it can use, raised to hold two copies of the largest "
+            "conversation, never taking free disk below 10 GiB."
         ),
     )
     parser.add_argument(
@@ -862,13 +863,14 @@ def _add_paged_kv_quant_args(parser: argparse.ArgumentParser) -> None:
             "supports it. Contract: decode-memory feature routed once per "
             "request from its starting offset. q8 at/past the two-pass "
             "threshold (default 1024 tokens) decodes through the inline-"
-            "dequant kernel with no bf16 working copy; below it q8 keeps a "
-            "context-sized bf16 working mirror, so its memory win starts at "
+            "dequant kernel with no unquantized working copy; below it q8 keeps "
+            "a context-sized unquantized working mirror, so its memory win starts at "
             "the threshold. q4 keeps no mirror and, at/past the same threshold, "
             "decodes through the packed-quant kernel; unsupported shapes use "
             "bounded chunked dequantization. Prefill runs unquantized (peak prefill "
-            "memory unchanged) and compiled-verify/dense-two-pass fast paths "
-            "detach while active."
+            "memory unchanged). The compiled verify step keeps running on the "
+            "quantized pages and dequantizes them in its attention; the dense "
+            "two-pass and dense-decode layouts are not used while active."
         ),
     )
 
@@ -3751,6 +3753,19 @@ def build_parser() -> argparse.ArgumentParser:
             "model's own maximum and prompts past the fit are admitted instead "
             "of refused with 507. Expect swap and slow decode there. "
             "MTPLX_ALLOW_SWAP=1 does the same for launchers without flags."
+        ),
+    )
+    serve_p.add_argument(
+        "--memory-limit",
+        default=None,
+        metavar="SIZE|max",
+        help=(
+            "The engine's memory limit, e.g. 90G. Default: 75%% of RAM, and "
+            "on 128 GB Macs and up at most RAM minus 38 GiB so a desktop's "
+            "other apps keep room (90 GiB on a 128 GB Mac). 'max' uses "
+            "everything outside macOS's own reserve, for a headless server "
+            "with no desktop (issue #548). The memory guard's safety floors "
+            "apply either way."
         ),
     )
     serve_p.add_argument(

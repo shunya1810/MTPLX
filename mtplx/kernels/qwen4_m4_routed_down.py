@@ -17,6 +17,7 @@ OUTPUTS_PER_THREADGROUP = 8
 _ROUTED_KERNEL: Any | None = None
 _TAIL_KERNEL: Any | None = None
 _RESIDUAL_TAIL_KERNEL: Any | None = None
+_PARALLEL_RESIDUAL_KERNEL: Any | None = None
 
 
 _HEADER = f"""
@@ -259,6 +260,138 @@ _RESIDUAL_TAIL_SOURCE = f"""
 """
 
 
+#: The routed reduction and the residual tail in one dispatch, with the ten
+#: slots' dot products in parallel simdgroups: each (slot, output) dot is
+#: _ROUTED_SOURCE's code, lane for lane, so it keeps its bits; the combine
+#: then runs in SLOT_ORDER with the same bfloat16 boundaries, and the tail is
+#: _RESIDUAL_TAIL_SOURCE's arithmetic. Five simdgroups own two slots each.
+PARALLEL_SIMDGROUPS = 5
+PARALLEL_THREADS = 32 * PARALLEL_SIMDGROUPS
+
+_PARALLEL_RESIDUAL_SOURCE = """
+    const uint output_tile = threadgroup_position_in_grid.x;
+    const uint row = threadgroup_position_in_grid.y;
+    const uint simd_group = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint output_base = output_tile * OUTPUTS_PER_SIMD;
+    threadgroup float dots[TOP_K][OUTPUTS_PER_SIMD];
+
+    for (uint pass = 0; pass < TOP_K / 5; ++pass) {
+        const uint slot = simd_group + pass * 5;
+        const uint expert = expert_ids[row * TOP_K + slot];
+        const device bfloat* x =
+            routed_h + (row * TOP_K + slot) * K + lane * VALUES_PER_THREAD;
+        const device uchar* w = (const device uchar*)weights
+            + ((size_t)expert * HIDDEN + output_base) * WEIGHT_BYTES_PER_ROW
+            + lane * sizeof(uint);
+        const device bfloat* scale = scales
+            + ((size_t)expert * HIDDEN + output_base) * GROUPS_PER_ROW
+            + lane / (GROUP_SIZE / VALUES_PER_THREAD);
+        const device bfloat* bias = biases
+            + ((size_t)expert * HIDDEN + output_base) * GROUPS_PER_ROW
+            + lane / (GROUP_SIZE / VALUES_PER_THREAD);
+
+        float result[OUTPUTS_PER_SIMD] = {0.0f};
+        int k = 0;
+        for (; k < int(K - BLOCK_SIZE); k += BLOCK_SIZE) {
+            float x_thread[VALUES_PER_THREAD];
+            float sum = load_q4_vector(x, x_thread);
+            for (uint out = 0; out < OUTPUTS_PER_SIMD; ++out) {
+                result[out] += qdot_q4(
+                    w + out * WEIGHT_BYTES_PER_ROW,
+                    x_thread,
+                    float(scale[out * GROUPS_PER_ROW]),
+                    float(bias[out * GROUPS_PER_ROW]),
+                    sum);
+            }
+            w += BLOCK_SIZE / 2;
+            scale += BLOCK_SIZE / GROUP_SIZE;
+            bias += BLOCK_SIZE / GROUP_SIZE;
+            x += BLOCK_SIZE;
+        }
+        const int remaining = clamp(
+            int(K) - k - int(lane * VALUES_PER_THREAD),
+            0,
+            int(VALUES_PER_THREAD));
+        if (remaining > 0) {
+            float x_thread[VALUES_PER_THREAD];
+            float sum = load_q4_vector_safe(x, x_thread, remaining);
+            for (uint out = 0; out < OUTPUTS_PER_SIMD; ++out) {
+                result[out] += qdot_q4_safe(
+                    w + out * WEIGHT_BYTES_PER_ROW,
+                    x_thread,
+                    float(scale[out * GROUPS_PER_ROW]),
+                    float(bias[out * GROUPS_PER_ROW]),
+                    sum,
+                    remaining);
+            }
+        }
+        for (uint out = 0; out < OUTPUTS_PER_SIMD; ++out) {
+            result[out] = simd_sum(result[out]);
+        }
+        if (lane == 0) {
+            for (uint out = 0; out < OUTPUTS_PER_SIMD; ++out) {
+                dots[slot][out] = result[out];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint out = simd_group * 32 + lane;
+    if (out >= OUTPUTS_PER_SIMD) {
+        return;
+    }
+    bfloat pending = bfloat(0.0f);
+    bfloat routed_value = bfloat(0.0f);
+    for (uint order_index = 0; order_index < TOP_K; ++order_index) {
+        const uint slot = SLOT_ORDER[order_index];
+        bfloat down_value = bfloat(dots[slot][out]);
+        bfloat product = bfloat(
+            float(down_value) * float(route_scores[row * TOP_K + slot]));
+        if (order_index == 0 || order_index == 2) {
+            pending = product;
+        } else if (order_index == 1) {
+            routed_value = bfloat(float(pending) + float(product));
+        } else if (order_index == 3) {
+            bfloat second = bfloat(float(pending) + float(product));
+            routed_value = bfloat(float(second) + float(routed_value));
+        } else {
+            routed_value = bfloat(float(product) + float(routed_value));
+        }
+    }
+
+    const uint column = output_base + out;
+    const uint index = row * HIDDEN + column;
+    bfloat gated_shared = bfloat(
+        float(shared_factor[row]) * float(shared_down[index]));
+    bfloat block_out = bfloat(
+        float(routed_value) + float(gated_shared));
+    for (uint stream = 0; stream < 4; ++stream) {
+        uint hidden_index = row * 4 * HIDDEN + stream * HIDDEN + column;
+        bfloat inject_value = inject[row * 4 + stream];
+        bfloat product = bfloat(
+            float(block_out) * float(inject_value));
+        output[hidden_index] = bfloat(
+            float(hyper[hidden_index]) + float(product));
+    }
+"""
+
+
+def parallel_residual_source() -> str:
+    """The one-dispatch routed reduction plus residual tail."""
+
+    return _HEADER + _PARALLEL_RESIDUAL_SOURCE
+
+
+def parallel_launch_geometry() -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """640 threadgroups of four outputs per row, five simdgroups each."""
+
+    return (
+        (HIDDEN // 4 * PARALLEL_THREADS, ROWS, 1),
+        (PARALLEL_THREADS, 1, 1),
+    )
+
+
 def source() -> str:
     """Return the exact fixed-shape q4 QMV plus routed-reduction source."""
 
@@ -357,7 +490,74 @@ def bind() -> Callable[..., mx.array]:
 
 
 def bind_residual_tail() -> Callable[..., mx.array]:
-    """Bind routed reduction plus the combined shared and residual tail."""
+    """Bind the routed reduction and the combined shared and residual tail.
+
+    One dispatch (_PARALLEL_RESIDUAL_SOURCE): the two-kernel spelling below it
+    in the file computes the same bits with a second launch and ten serial
+    slot passes per simdgroup.
+    """
+
+    global _PARALLEL_RESIDUAL_KERNEL
+    if _PARALLEL_RESIDUAL_KERNEL is None:
+        _PARALLEL_RESIDUAL_KERNEL = mx.fast.metal_kernel(
+            name="mtplx_qwen4_m4_routed_down_parallel_residual_tail",
+            input_names=[
+                "routed_h",
+                "weights",
+                "scales",
+                "biases",
+                "expert_ids",
+                "route_scores",
+                "shared_down",
+                "shared_factor",
+                "hyper",
+                "inject",
+            ],
+            output_names=["output"],
+            header=_HEADER,
+            source=_PARALLEL_RESIDUAL_SOURCE,
+            ensure_row_contiguous=True,
+        )
+    kernel = _PARALLEL_RESIDUAL_KERNEL
+    grid, threadgroup = parallel_launch_geometry()
+
+    def routed_down_residual_tail(
+        routed_h,
+        weights,
+        scales,
+        biases,
+        expert_ids,
+        route_scores,
+        shared_down,
+        shared_factor,
+        hyper,
+        inject,
+    ):
+        (output,) = kernel(
+            inputs=[
+                routed_h,
+                weights,
+                scales,
+                biases,
+                expert_ids,
+                route_scores,
+                shared_down,
+                shared_factor,
+                hyper,
+                inject,
+            ],
+            grid=grid,
+            threadgroup=threadgroup,
+            output_shapes=[(ROWS, 4 * HIDDEN)],
+            output_dtypes=[mx.bfloat16],
+        )
+        return output.reshape(*hyper.shape)
+
+    return routed_down_residual_tail
+
+
+def bind_residual_tail_two_dispatch() -> Callable[..., mx.array]:
+    """The two-dispatch spelling of ``bind_residual_tail`` (its parent)."""
 
     global _ROUTED_KERNEL, _RESIDUAL_TAIL_KERNEL
     if _ROUTED_KERNEL is None:
@@ -435,7 +635,10 @@ def bind_residual_tail() -> Callable[..., mx.array]:
 __all__ = [
     "bind",
     "bind_residual_tail",
+    "bind_residual_tail_two_dispatch",
     "launch_geometry",
+    "parallel_launch_geometry",
+    "parallel_residual_source",
     "residual_tail_source",
     "source",
     "tail_source",

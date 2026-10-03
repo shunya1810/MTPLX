@@ -318,6 +318,21 @@ def block_for_ext(ext: int, k_cap: int) -> int:
     return min(_BLOCK_LADDER[idx], max(4, k_cap))
 
 
+def ladder_widths(k_caps) -> frozenset[int]:
+    """Verify widths (primary plus block) of every full-length block these caps allow.
+
+    The widths a copy round forwards unless its block was cut short (by the
+    request's token budget, the end of the prompt, or a grammar): with the
+    default caps (24, and 8 in probation) they are 9, 13, 17 and 25.
+    """
+
+    return frozenset(
+        1 + block_for_ext(ext, cap)
+        for cap in k_caps
+        for ext in range(len(_BLOCK_LADDER))
+    )
+
+
 class NgramIndex:
     """ng_min-gram index, built once over the prompt at setup: gram -> continuation
     positions. find() is O(candidates) instead of an O(L) backward scan, which

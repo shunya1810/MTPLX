@@ -177,6 +177,65 @@ def test_paged_kv_quant_readers_agree(
         assert layout == "contiguous_then_repage"
 
 
+@pytest.mark.parametrize(
+    ("mode", "switches", "kernel", "bank_kept"),
+    [
+        ("q8", {}, "sdpa_2pass_paged_q8", True),
+        ("q4", {}, "sdpa_gqa_packed_quant", True),
+        ("q4", {"MTPLX_KV_QUANT_Q4_KERNEL": "0"}, None, True),
+        ("q8", {"MTPLX_KV_QUANT_2PASS_KERNEL": "0"}, None, True),
+        # A spelling the runtime reads as off must read as off here too.
+        ("q8", {"MTPLX_KV_QUANT_2PASS_KERNEL": "enabled"}, None, True),
+        ("q8", {"MTPLX_GRAPHBANK_QUANTIZED_PAGED": "0"}, "sdpa_2pass_paged_q8", False),
+    ],
+)
+def test_kv_quant_health_detail_describes_the_routes_that_run(
+    monkeypatch, mode: str, switches: dict, kernel: str | None, bank_kept: bool
+) -> None:
+    """The /health detail used to say KV quant detaches the compiled verify
+    bank (the quantized adapter has kept it since 2.10) and named the q8
+    memoized dequant for q4, which runs its own bank kernel."""
+
+    from mtplx.cache_state import VllmMetalPagedKVCache
+    from mtplx.graphbank import quantized_paged_bank_enabled
+    from mtplx.server.openai import _paged_kv_quantization_detail
+
+    for name in (
+        "MTPLX_KV_QUANT_2PASS_KERNEL",
+        "MTPLX_KV_QUANT_Q4_KERNEL",
+        "MTPLX_GRAPHBANK_QUANTIZED_PAGED",
+        "MTPLX_VLLM_METAL_PAGED_ATTN_2PASS_THRESHOLD",
+        "MTPLX_VLLM_METAL_PAGED_KV_QUANT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("MTPLX_PAGED_KV_QUANT", mode)
+    for name, value in switches.items():
+        monkeypatch.setenv(name, value)
+
+    detail = _paged_kv_quantization_detail()
+
+    assert detail["mode"] == mode
+    assert detail["decode_kernel"] == (kernel or "none")
+    if kernel is not None:
+        assert detail["decode"].startswith(
+            f"requests that start at or past 1024 tokens read the quantized pages with {kernel}"
+        )
+    # The runtime's own readers decide, so the payload cannot drift from them.
+    runtime_kernel = VllmMetalPagedKVCache._kv_quant_kernel_enabled() and (
+        mode == "q8" or VllmMetalPagedKVCache._kv_quant_q4_kernel_enabled()
+    )
+    assert (kernel is not None) == runtime_kernel
+    assert quantized_paged_bank_enabled() is bank_kept
+    assert detail["compiled_verify"].startswith("kept" if bank_kept else "off")
+    assert ("compiled_verify_graphbank" in detail["detached_fast_paths"]) is not bank_kept
+    assert "dense_two_pass_paged" in detail["detached_fast_paths"]
+    # The q8 mirror holds the cache's source dtypes (fp16 for an FP16 pack),
+    # so the payload must not call it a bf16 mirror.
+    assert "bf16" not in detail["decode"]
+    if mode == "q8":
+        assert "an unquantized working mirror of the pages" in detail["decode"]
+
+
 def test_paged_kv_quant_rejects_an_unknown_mode(monkeypatch) -> None:
     from mtplx.kv_quant import config_from_env
 

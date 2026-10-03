@@ -70,12 +70,27 @@ NATIVE = SamplerConfig(temperature=0.6, top_p=0.95, top_k=20)
 NATIVE_DRAFT = SamplerConfig(temperature=1.0, top_p=0.95, top_k=20)
 
 
-@pytest.fixture(autouse=True)
-def _clean(monkeypatch):
+@pytest.fixture(autouse=True, params=["route-off", "turbo-route"])
+def _clean(request, monkeypatch):
     # Tests of the compiled route explicitly opt in; the default has its
     # own product-level test below.
     monkeypatch.setenv("MTPLX_DENSE_VISION_COMPILED_VERIFY", "1")
+    # Both attention configurations. "turbo-route" is the turbo profile's
+    # (the profile that turns the compiled verifier on): every full-attention
+    # forward takes MTPLX's route. With the route off, an image request's
+    # compiled leg (containers that own a rotary origin) takes MTPLX's route
+    # while its parity reference (containers without one) is mlx-lm's stock
+    # forward outside verify; on verify both go through attention_gate, else
+    # the two lowerings of the gate's sigmoid differ in float32 (hidden on an
+    # M5 by the TF32 o_proj GEMM, not on the M1 to M4 kernels).
+    if request.param == "turbo-route":
+        monkeypatch.setenv("MTPLX_GQA_PACKED_SDPA", "1")
     for name in (
+        *(() if request.param == "turbo-route" else ("MTPLX_GQA_PACKED_SDPA",)),
+        "MTPLX_SPLIT_FULL_ATTN",
+        "MTPLX_SDPA_2PASS",
+        "MTPLX_VLLM_METAL_PAGED_ATTN",
+        "MTPLX_BLOCKWISE_ATTN",
         "MTPLX_DENSE_MROPE",
         "MTPLX_DENSE_MROPE_STRICT",
         "MTPLX_COMPILED_VERIFY",

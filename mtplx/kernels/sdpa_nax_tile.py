@@ -30,6 +30,7 @@ from functools import lru_cache
 import mlx.core as mx
 
 from ..nax_verify import nax_available
+from .sdpa_2pass import unnormalized_partials_dtype
 from .sdpa_gqa_packed import _blocks_for_capacity, _paged_reduce_kernel
 
 nax_tile_bail_counts: dict[str, int] = {}
@@ -51,9 +52,10 @@ inline short2 nax_get_coord(ushort lid) {
 }
 """
 
-# Template params injected by mx.fast.metal_kernel: InT, D, QL, GQA_F.
+# Template params injected by mx.fast.metal_kernel: InT, PartT, D, QL, GQA_F.
 # Inputs: queries, keys, values, offset(i32[1]), kcap(int), scale(f32), blocks(int)
-# Outputs: partials [1, HQ, QL, blocks, D] InT, sums/maxs [1, HQ, QL, blocks] f32
+# Outputs: partials [1, HQ, QL, blocks, D] PartT (f32 for fp16 queries, else InT),
+# sums/maxs [1, HQ, QL, blocks] f32
 _SOURCE = r"""
     constexpr int TK = 32;               // keys per tile
     constexpr int MROWS = 16;            // M rows per simdgroup
@@ -277,12 +279,12 @@ _SOURCE = r"""
       const int m_local = m_base + sc.y + i * kElemRowsJump;
       if (m_local >= LIVE) continue;
       const int hq_row = kv_head * LIVE + m_local;     // == h*QL + j global
-      device InT* prow = partials
+      device PartT* prow = partials
           + ((size_t)hq_row * n_blocks + block_idx) * D;
       for (int g = 0; g < NGROUPS; g++)
         for (short hh = 0; hh < 2; hh++)
           for (short j = 0; j < kElemCols; j++)
-            prow[g * 32 + hh * 16 + sc.x + j] = InT(o_frag[g][hh][i * kElemCols + j]);
+            prow[g * 32 + hh * 16 + sc.x + j] = PartT(o_frag[g][hh][i * kElemCols + j]);
     }
     // Stats: one designated lane per row (lane bits 0 and 3 clear) writes.
     if ((lane & 0x9) == 0) {
@@ -392,6 +394,7 @@ def sdpa_nax_tile(
                     float(scale), blocks_arr],
             template=[
                 ("InT", queries.dtype),
+                ("PartT", unnormalized_partials_dtype(queries.dtype)),
                 ("D", d),
                 ("QL", q_len),
                 ("GQA_F", gqa_factor),
@@ -400,7 +403,7 @@ def sdpa_nax_tile(
             grid=(hk * 32 * ((gqa_factor * q_len + 15) // 16), 1, blocks),
             threadgroup=(32 * ((gqa_factor * q_len + 15) // 16), 1, 1),
             output_shapes=[partial_shape, stats_shape, stats_shape],
-            output_dtypes=[queries.dtype, mx.float32, mx.float32],
+            output_dtypes=[unnormalized_partials_dtype(queries.dtype), mx.float32, mx.float32],
         )
     except Exception:  # noqa: BLE001 — dispatch/compile failure => stock fallback
         return _bail("dispatch_failed")

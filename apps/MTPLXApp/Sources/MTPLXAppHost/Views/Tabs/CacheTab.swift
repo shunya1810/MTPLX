@@ -77,7 +77,7 @@ struct CacheTab: View {
                 Divider().frame(height: 36)
                 StatTile(
                     label: tr("Last miss"),
-                    value: sessionBank?.lastMissReason ?? "—",
+                    value: CacheExplanation.missReason(sessionBank?.lastMissReason) ?? "—",
                     systemImage: "questionmark.circle",
                     tint: (sessionBank?.lastMissReason).flatMap { $0.isEmpty ? nil : $0 } == nil
                         ? .secondary : .mtplxWarning

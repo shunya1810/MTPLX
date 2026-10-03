@@ -19,6 +19,55 @@ from threading import Condition, Event, Thread, get_ident
 import time
 from typing import Any, Callable
 
+
+_PERSISTENCE_PENDING_MIN_BYTES = 512 * 1024**2
+
+
+def _default_persistence_max_pending_bytes(total_ram_bytes: int | None = None) -> int:
+    """1/32 of physical memory (4 GiB on a 128 GB Mac), at least 512 MiB.
+
+    The budget counts only memory the session bank has already let go of
+    and a queued job still holds, so it is sized like the memory guard's
+    floors (2.5% of RAM to abort, 5% to shed): a backlog alone stays below
+    the shed band on every Mac. The author's 4 GiB on 128 GB is the same
+    value there, measured flat under his 4-client load.
+    """
+    if total_ram_bytes is None:
+        from .memory_plan import detect_total_ram_bytes
+
+        total_ram_bytes = detect_total_ram_bytes()
+    if not total_ram_bytes or int(total_ram_bytes) <= 0:
+        return 4 * 1024**3
+    return max(_PERSISTENCE_PENDING_MIN_BYTES, int(total_ram_bytes) // 32)
+
+
+def _persistence_max_pending_bytes_from_env() -> int:
+    raw = os.environ.get("MTPLX_PERSISTENCE_MAX_PENDING_BYTES", "").strip()
+    if raw.lower() in ("0", "off", "false", "no"):
+        return 0
+    if not raw:
+        return _default_persistence_max_pending_bytes()
+    from .cache_bank.cold_tier import parse_size_bytes
+
+    return parse_size_bytes(raw, _default_persistence_max_pending_bytes())
+
+
+def _pinned_bytes(item: "_WorkItem") -> int:
+    """What a queued persistence job holds that nothing else does.
+
+    ``pinned_bytes`` is a byte count, or a callable the session bank gives
+    its jobs: the entry's size once the bank no longer holds the entry, 0
+    while it does (cancelling that job would free nothing and only lose the
+    SSD copy). Read at the moment of the check, never cached.
+    """
+    value = item.pinned_bytes
+    try:
+        raw = value() if callable(value) else value
+        return max(0, int(raw or 0))
+    except Exception:
+        return 0
+
+
 _QOS_CLASSES = {
     "user_interactive": 0x21,
     "user_initiated": 0x19,
@@ -92,6 +141,13 @@ class _WorkItem:
     queued_at_s: float = field(default_factory=time.monotonic)
     earliest_start_s: float = field(default_factory=time.monotonic)
     coalesce_key: str | None = None
+    # What stood in front of this item when it was submitted: the running
+    # item (kind, batch key, how long it had been running) and the queue
+    # depths. The owner thread publishes it with the queue wait when the
+    # item starts (``active_item_receipt``), so a request can say which
+    # work its time-to-first-token waited behind.
+    submitted_behind: dict[str, Any] | None = None
+    pinned_bytes: int | Callable[[], int] = 0
 
 
 class _KeepaliveTurn:
@@ -99,6 +155,15 @@ class _KeepaliveTurn:
 
 
 _KEEPALIVE = _KeepaliveTurn()
+
+
+class _OwnerIdleTurn:
+    """Sentinel `_take_next` returns once the owner thread has had no work
+    for ``owner_idle_grace_s`` after running some: the moment the server
+    hands the MLX buffer pool back to macOS (``on_owner_idle``)."""
+
+
+_OWNER_IDLE = _OwnerIdleTurn()
 
 
 def _batch_key_class(batch_key: str) -> str:
@@ -141,8 +206,17 @@ class ModelWorkScheduler:
         name: str = "mtplx-model",
         idle_grace_s: float | None = None,
         persistence_quiet_grace_s: float = 0.25,
+        persistence_max_pending_bytes: int | None = None,
     ) -> None:
         self.name = str(name)
+        self.persistence_max_pending_bytes = max(
+            0,
+            int(
+                _persistence_max_pending_bytes_from_env()
+                if persistence_max_pending_bytes is None
+                else persistence_max_pending_bytes
+            ),
+        )
         if idle_grace_s is None:
             # A serve request is not one scheduler item: restore and
             # prefill/generate arrive as separate foreground submissions
@@ -168,6 +242,8 @@ class ModelWorkScheduler:
         self._idle: deque[_WorkItem] = deque()
         self._persistence: deque[_WorkItem] = deque()
         self._persistence_coalesced = 0
+        self._persistence_cancelled = 0
+        self._persistence_budget_dropped = 0
         # Idle-pump budget (issue #290): the persistence band is normally
         # reachable only while the idle deque is COMPLETELY empty, so any
         # self-chaining idle_postcommit occupant (each completion enqueues
@@ -186,6 +262,21 @@ class ModelWorkScheduler:
         self._persistence_pump_budget = 0
         self._persistence_pumped = 0
         self._last_quiet_anchor_s = time.monotonic()
+        # Owner idle hook: called on the owner thread, outside the lock,
+        # once the owner has had no work for owner_idle_grace_s after
+        # running some (a request, a postcommit, an SSD encode). The server
+        # returns the MLX buffer pool to macOS there, so the pool the work
+        # needed at full size (prefill reuses it within each chunk) is not
+        # held while nothing runs. The grace outlasts the 100-200 ms of
+        # handler Python between one request's restore and its generation,
+        # which arrive as separate items. Keepalive beats are not work.
+        self.on_owner_idle: Callable[[], Any] | None = None
+        self.owner_idle_grace_s = 1.0
+        self._owner_worked = False
+        self._owner_last_done_s = 0.0
+        self._owner_idle_turns = 0
+        self._owner_idle_errors = 0
+        self._owner_idle_last: dict[str, Any] | None = None
         # Idle keepalive (GPU residency): see arm_idle_keepalive.
         self._keepalive_fn: Callable[[], Any] | None = None
         self._keepalive_interval_s = 0.0
@@ -220,6 +311,7 @@ class ModelWorkScheduler:
         self._active_batch_key: str | None = None
         self._active_started_at_s: float | None = None
         self._active_queue_wait_s: float | None = None
+        self._active_receipt: dict[str, Any] | None = None
         self.owner_qos: str | None = None
         self._thread = Thread(
             target=self._run,
@@ -238,6 +330,40 @@ class ModelWorkScheduler:
     def foreground_pending(self) -> int:
         with self._condition:
             return len(self._foreground)
+
+    def active_item_receipt(self) -> dict[str, Any] | None:
+        """The running item's queue wait and what it was submitted behind.
+
+        Only meaningful on the owner thread (the item asking is the one
+        running); any other thread gets None.
+        """
+
+        if not self.is_owner_thread():
+            return None
+        with self._condition:
+            return dict(self._active_receipt) if self._active_receipt else None
+
+    def _submitted_behind_locked(self) -> dict[str, Any] | None:
+        if self._active_kind is None and not (
+            self._foreground or self._idle or self._persistence
+        ):
+            return None
+        behind: dict[str, Any] = {
+            "ahead_foreground": len(self._foreground),
+            "ahead_idle": len(self._idle),
+        }
+        if self._active_kind is not None:
+            behind["running_kind"] = self._active_kind
+            behind["running_batch_key"] = (
+                _batch_key_class(self._active_batch_key)
+                if self._active_batch_key
+                else None
+            )
+            if self._active_started_at_s is not None:
+                behind["running_for_s"] = max(
+                    0.0, time.monotonic() - self._active_started_at_s
+                )
+        return behind
 
     def persistence_pending(self) -> int:
         """Queued (not running) durability items. Cheap: for the server's
@@ -378,6 +504,30 @@ class ModelWorkScheduler:
             return None
         return self._last_owner_activity_s + self._keepalive_interval_s
 
+    def _run_owner_idle(self) -> None:
+        """Call ``on_owner_idle`` on the owner thread; a hook that raises is
+        counted and reported in ``stats()``, never raised into the loop."""
+
+        hook = self.on_owner_idle
+        if hook is None:
+            return
+        started = time.monotonic()
+        error: str | None = None
+        result: Any = None
+        try:
+            result = hook()
+        except Exception as exc:  # noqa: BLE001 - reported below
+            error = f"{type(exc).__name__}: {exc}"
+        with self._condition:
+            self._owner_idle_turns += 1
+            if error is not None:
+                self._owner_idle_errors += 1
+            self._owner_idle_last = {
+                "elapsed_s": round(time.monotonic() - started, 6),
+                "error": error,
+                "result": dict(result) if isinstance(result, dict) else None,
+            }
+
     def _run_keepalive(self) -> None:
         fn = self._keepalive_fn
         if fn is None:
@@ -413,11 +563,23 @@ class ModelWorkScheduler:
                 else None
             )
             return {
+                "owner_idle": {
+                    "turns": self._owner_idle_turns,
+                    "errors": self._owner_idle_errors,
+                    "grace_s": self.owner_idle_grace_s,
+                    "last": dict(self._owner_idle_last)
+                    if self._owner_idle_last is not None
+                    else None,
+                },
                 "idle_keepalive": self._keepalive_state_locked(time.monotonic()),
                 "foreground_pending": len(self._foreground),
                 "idle_pending": len(self._idle),
                 "persistence_pending": len(self._persistence),
                 "persistence_coalesced": self._persistence_coalesced,
+                "persistence_cancelled": self._persistence_cancelled,
+                "persistence_pending_bytes": self._persistence_pinned_bytes_locked(),
+                "persistence_max_pending_bytes": self.persistence_max_pending_bytes,
+                "persistence_budget_dropped": self._persistence_budget_dropped,
                 "persistence_pump_budget": self._persistence_pump_budget,
                 "persistence_pumped": self._persistence_pumped,
                 "active_kind": self._active_kind,
@@ -527,6 +689,7 @@ class ModelWorkScheduler:
         *args: Any,
         batch_key: str | None = None,
         coalesce_key: str | None = None,
+        pinned_bytes: int | Callable[[], int] = 0,
         **kwargs: Any,
     ) -> Future:
         """Durability work: strictly below idle_postcommit, quiet-grace
@@ -551,7 +714,37 @@ class ModelWorkScheduler:
             batch_key=batch_key,
             earliest_start_s=time.monotonic() + self.idle_grace_s,
             coalesce_key=coalesce_key,
+            pinned_bytes=pinned_bytes,
         )
+
+    def cancel_idle_persistence(self, coalesce_key: str) -> int:
+        """Drop PENDING persistence work filed under ``coalesce_key``.
+
+        The memory guard releases an idle session's bank entries when a
+        request cannot otherwise fit. A queued SSD encode for that session
+        holds its entry's snapshot arrays until it runs, so the release
+        frees nothing while the closure sits here. Same reach as the
+        newest-wins coalescing in ``_submit``: only queued items (a running
+        item was popped from the deque and is never cancelled), and removing
+        one only means that entry is not written. Entries already on disk are
+        untouched: the cold tier writes an entry under a temporary name and
+        renames it into place before its manifest row lands, so a cancelled
+        job never leaves a partial entry behind.
+        """
+
+        if not coalesce_key:
+            return 0
+        cancelled = 0
+        with self._condition:
+            for stale in list(self._persistence):
+                if stale.coalesce_key == coalesce_key:
+                    self._persistence.remove(stale)
+                    stale.future.cancel()
+                    cancelled += 1
+            self._persistence_cancelled += cancelled
+            if cancelled:
+                self._condition.notify_all()
+        return cancelled
 
     def shutdown(
         self,
@@ -575,6 +768,29 @@ class ModelWorkScheduler:
         if wait and not park and self._thread.is_alive():
             self._thread.join()
 
+    def _persistence_pinned_bytes_locked(self) -> int:
+        return sum(_pinned_bytes(item) for item in self._persistence)
+
+    def _enforce_persistence_budget_locked(self, *, keep: _WorkItem) -> None:
+        """Cancel the oldest queued jobs that hold memory nothing else holds
+        until the rest fit the budget. The newest job and jobs that pin
+        nothing (their entry is still in the bank) are never dropped."""
+
+        budget = self.persistence_max_pending_bytes
+        if budget <= 0:
+            return
+        pinned = [(item, _pinned_bytes(item)) for item in self._persistence]
+        total = sum(nbytes for _item, nbytes in pinned)
+        for item, nbytes in pinned:
+            if total <= budget:
+                return
+            if item is keep or nbytes <= 0:
+                continue
+            self._persistence.remove(item)
+            total -= nbytes
+            item.future.cancel()
+            self._persistence_budget_dropped += 1
+
     def _submit(
         self,
         kind: str,
@@ -585,6 +801,7 @@ class ModelWorkScheduler:
         batch_key: str | None,
         earliest_start_s: float,
         coalesce_key: str | None = None,
+        pinned_bytes: int = 0,
     ) -> Future:
         future: Future = Future()
         with self._condition:
@@ -614,6 +831,12 @@ class ModelWorkScheduler:
                 batch_key=batch_key,
                 earliest_start_s=earliest_start_s,
                 coalesce_key=coalesce_key,
+                submitted_behind=self._submitted_behind_locked(),
+                pinned_bytes=(
+                    pinned_bytes
+                    if callable(pinned_bytes)
+                    else max(0, int(pinned_bytes or 0))
+                ),
             )
             if kind == "foreground":
                 # A request is arriving: its tail postcommit is imminent.
@@ -623,6 +846,7 @@ class ModelWorkScheduler:
                 self._foreground.append(item)
             elif kind == "idle_persistence":
                 self._persistence.append(item)
+                self._enforce_persistence_budget_locked(keep=item)
             else:
                 self._idle.append(item)
             self._condition.notify_all()
@@ -650,6 +874,9 @@ class ModelWorkScheduler:
             if item is _KEEPALIVE:
                 self._run_keepalive()
                 continue
+            if item is _OWNER_IDLE:
+                self._run_owner_idle()
+                continue
             if not item.future.set_running_or_notify_cancel():
                 with self._condition:
                     self._cancelled_before_start += 1
@@ -660,12 +887,16 @@ class ModelWorkScheduler:
                 continue
             now = time.monotonic()
             queue_wait_s = max(0.0, now - item.queued_at_s)
+            receipt = {"queue_wait_s": queue_wait_s, **(item.submitted_behind or {})}
+            # Readable by whoever holds the future once the item finished.
+            item.future.queue_receipt = receipt
             with self._condition:
                 self._active_kind = item.kind
                 self._active_sequence = item.sequence
                 self._active_batch_key = item.batch_key
                 self._active_started_at_s = now
                 self._active_queue_wait_s = queue_wait_s
+                self._active_receipt = receipt
                 self._active_self_reported = False
                 self._queue_wait_samples_s.append(queue_wait_s)
                 self._started += 1
@@ -697,6 +928,8 @@ class ModelWorkScheduler:
                     # rung or a postcommit snapshot is not a user talking
                     # to the model.
                     self._last_owner_activity_s = time.monotonic()
+                    self._owner_worked = True
+                    self._owner_last_done_s = self._last_owner_activity_s
                     if item.kind == "foreground":
                         self._keepalive_attentive_anchor_s = self._last_owner_activity_s
                     if item.kind != "idle_persistence":
@@ -713,6 +946,7 @@ class ModelWorkScheduler:
                     self._active_batch_key = None
                     self._active_started_at_s = None
                     self._active_queue_wait_s = None
+                    self._active_receipt = None
                     self._condition.notify_all()
                 # Release the finished item before looping: _take_next can
                 # park this frame indefinitely, and a bound local would pin
@@ -781,6 +1015,12 @@ class ModelWorkScheduler:
                     wait_until = (
                         keepalive_at if wait_until is None else min(wait_until, keepalive_at)
                     )
+                if self._owner_worked and self.on_owner_idle is not None:
+                    idle_at = self._owner_last_done_s + self.owner_idle_grace_s
+                    if now >= idle_at:
+                        self._owner_worked = False
+                        return _OWNER_IDLE
+                    wait_until = idle_at if wait_until is None else min(wait_until, idle_at)
                 if wait_until is not None:
                     self._condition.wait(timeout=max(0.0, wait_until - now))
                     continue

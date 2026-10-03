@@ -134,9 +134,17 @@ class TestPressureAbortArming:
 class TestPrefillAbortWiring:
     def test_request_lanes_and_postcommit_consult_pressure(self):
         src = inspect.getsource(srv)
-        # Two request-lane abort_check lambdas (AR + MTP) plus the
-        # postcommit abort predicate.
-        assert src.count("or _pressure_abort_requested(state)") >= 3
+        # The postcommit abort predicate.
+        assert "or _pressure_abort_requested(state)" in src
+        # The two request lanes (AR + MTP) share one prefill abort check. It
+        # used to be two lambdas, each "... or _pressure_abort_requested
+        # (state)"; since the per-chunk supply check joined them it is one
+        # function that consults the pressure abort and that check.
+        assert src.count("abort_check=_prefill_abort_check") >= 2
+        start = src.index("def _prefill_abort_check() -> bool:")
+        body = src[start : start + 400]
+        assert "_pressure_abort_requested(state)" in body
+        assert "prefill_system_guard()" in body
 
     def test_pressure_abort_maps_to_507_not_stream_cancel(self):
         src = inspect.getsource(srv)

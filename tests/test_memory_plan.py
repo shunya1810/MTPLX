@@ -62,7 +62,8 @@ def _plan(ram_gib: int, weights: int = SPEED_WEIGHTS, **kwargs):
 
 
 def test_usable_envelope_matches_metal_cap_default() -> None:
-    assert usable_engine_bytes(RAM[128]) == 96 * GIB
+    # G5 (09-29): from 128 GB up the default leaves a desktop 38 GiB.
+    assert usable_engine_bytes(RAM[128]) == 90 * GIB
     assert usable_engine_bytes(RAM[48]) == 36 * GIB
     # 512 GiB boxes hit the 192 GiB allocator cap, not the 75% rule.
     assert usable_engine_bytes(RAM[512]) == 192 * GIB
@@ -85,11 +86,16 @@ def test_128g_speed_resolves_exactly_todays_geometry() -> None:
     assert plan.bank_steady_bytes == BANK_CAP_BYTES
 
 
-def test_128g_quality_keeps_the_full_cap_too() -> None:
+def test_128g_quality_keeps_the_full_window_and_the_idle_cap() -> None:
     plan = _plan(128, weights=QUALITY_WEIGHTS)
     assert plan.context_window_resolved == 262_144
     assert plan.bank_idle_max_bytes == BANK_CAP_BYTES
-    assert plan.bank_steady_bytes == BANK_CAP_BYTES
+    # Under full-window load the 90 GiB desktop limit (G5) leaves the bank
+    # 90 GiB - 30.6 GB weights - 3 GiB transients - 16 GiB of KV for the
+    # 262,144-token window = 42.5 GiB, under the 48 GiB cap (96 GiB reached it).
+    assert plan.bank_steady_bytes == (
+        90 * GIB - QUALITY_WEIGHTS - 3 * GIB - 262_144 * 64 * 1024
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -106,10 +112,13 @@ def test_48g_speed_fit() -> None:
     # Idle bank stays aggressive (~13.1G, same class as the shipped
     # half-surplus 14.05G) ...
     assert plan.bank_idle_max_bytes == 14_119_530_400
-    # ... and the advertised under-load budget subtracts KV at the dense
-    # ceiling (131,072 x 64 KiB = 8 GiB) so the machine can never be
-    # walked into swap by its own warm cache.
-    assert plan.bank_steady_bytes == 5_529_595_808
+    # ... and the advertised under-load budget subtracts the KV of the whole
+    # committed window (196,608 x 64 KiB = 12 GiB) so the machine can never
+    # be walked into swap by its own warm cache. It subtracted only the
+    # dense ceiling's 131,072 tokens (8 GiB) and advertised 5.15 GiB before
+    # #525: the committed rest rides the paged lane and is just as resident.
+    assert plan.kv_reserve_tokens == 196_608
+    assert plan.bank_steady_bytes == 1_234_628_512
     total = (
         plan.model_weights_bytes
         + plan.kv_reserve_bytes

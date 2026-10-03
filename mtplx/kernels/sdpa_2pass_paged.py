@@ -12,7 +12,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from .sdpa_2pass import _compute_blocks
+from .sdpa_2pass import _compute_blocks, unnormalized_partials_dtype
 
 
 @lru_cache(maxsize=2)
@@ -101,7 +101,7 @@ def _paged_partials_kernel(*, has_window: bool = False):
             maxs[0] = max_score;
         }
         for (int i = 0; i < v_per_thread; ++i) {
-            partials[i] = static_cast<InT>(o[i]);
+            partials[i] = static_cast<PartT>(o[i]);
         }
     """
     source = source.replace("__LOOP_HEADER__", loop_header).replace(
@@ -279,7 +279,7 @@ def _paged_partials_dynamic_offset_kernel():
             maxs[0] = max_score;
         }
         for (int i = 0; i < v_per_thread; ++i) {
-            partials[i] = static_cast<InT>(o[i]);
+            partials[i] = static_cast<PartT>(o[i]);
         }
     """
     return mx.fast.metal_kernel(
@@ -358,6 +358,7 @@ def sdpa_2pass_paged_tail(
 
     partial_shape = (int(bsz), int(hq), int(q_len), int(blocks), int(vdim))
     stats_shape = (int(bsz), int(hq), int(q_len), int(blocks))
+    partial_dtype = unnormalized_partials_dtype(queries.dtype)
     partial_inputs = [
         queries,
         key_cache,
@@ -371,6 +372,7 @@ def sdpa_2pass_paged_tail(
         inputs=partial_inputs,
         template=[
             ("InT", queries.dtype),
+            ("PartT", partial_dtype),
             ("D", int(d)),
             ("V", int(vdim)),
             ("Hk", int(hk)),
@@ -379,7 +381,7 @@ def sdpa_2pass_paged_tail(
         grid=(hk * 32, int(bsz) * gqa_factor, int(blocks) * int(q_len)),
         threadgroup=(32, gqa_factor, int(q_len)),
         output_shapes=[partial_shape, stats_shape, stats_shape],
-        output_dtypes=[queries.dtype, mx.float32, mx.float32],
+        output_dtypes=[partial_dtype, mx.float32, mx.float32],
     )
 
     (out,) = reduce_kernel(
@@ -473,6 +475,7 @@ def sdpa_2pass_paged_tail_dynamic_offset(
 
     partial_shape = (int(bsz), int(hq), int(q_len), int(blocks), int(vdim))
     stats_shape = (int(bsz), int(hq), int(q_len), int(blocks))
+    partial_dtype = unnormalized_partials_dtype(queries.dtype)
     partials, sums, maxs = partials_kernel(
         inputs=[
             queries,
@@ -484,6 +487,7 @@ def sdpa_2pass_paged_tail_dynamic_offset(
         ],
         template=[
             ("InT", queries.dtype),
+            ("PartT", partial_dtype),
             ("D", int(d)),
             ("V", int(vdim)),
             ("Hk", int(hk)),
@@ -492,7 +496,7 @@ def sdpa_2pass_paged_tail_dynamic_offset(
         grid=(hk * 32, int(bsz) * gqa_factor, int(blocks) * int(q_len)),
         threadgroup=(32, gqa_factor, int(q_len)),
         output_shapes=[partial_shape, stats_shape, stats_shape],
-        output_dtypes=[queries.dtype, mx.float32, mx.float32],
+        output_dtypes=[partial_dtype, mx.float32, mx.float32],
     )
 
     (out,) = reduce_kernel(

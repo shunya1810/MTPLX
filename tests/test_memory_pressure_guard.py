@@ -20,7 +20,10 @@ class FakeBank:
         self.calls = []
         self.protect_active_calls = []
 
-    def shrink_to_bytes(self, target, *, reason, protect_active=False):
+    def shrink_to_bytes(
+        self, target, *, reason, protect_active=False, protect_session_ids=None
+    ):
+        # The real bank's keywords: the trim names the sessions generating.
         self.calls.append((target, reason))
         self.protect_active_calls.append(protect_active)
         evicted = 1 if self.total_nbytes > target else 0

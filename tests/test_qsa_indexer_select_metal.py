@@ -57,6 +57,10 @@ def test_nax_availability_parser(
 
 
 def test_nax_detection_reads_platform_and_device_info(monkeypatch):
+    # Hardware detection only. The rehearsal switch closes this route gate on
+    # every Mac by design (tests/test_nax_detect.py covers it), so a suite run
+    # with MTPLX_FORCE_GPU_FAMILY_FALLBACK=1 must not reach this check.
+    monkeypatch.delenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", raising=False)
     requested_devices = []
     monkeypatch.setattr(
         selector_module.platform,

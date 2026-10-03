@@ -127,7 +127,13 @@ separate, existing knob: `--mlx-cache-limit` (env `MTPLX_MLX_CACHE_LIMIT`,
 otherwise to a RAM tier - 8 GiB at 100 GB and above. `/health` reports it as
 `mlx_cache_limit` with the applied `limit_bytes`. That pool is reclaimable, so
 it is not lost memory, but it is 8 GiB the page cache does not get; lowering it
-is the first lever if `auto` keeps sizing the budget too small.
+is the first lever if `auto` keeps sizing the budget too small. The engine
+returns the pool to macOS after every completed request and about a second
+after its model thread goes idle, so between requests it holds nothing
+(`MTPLX_CLEAR_CACHE_AFTER_REQUEST=off` keeps it; the scheduler stats count the
+idle returns under `owner_idle`). While work runs the pool keeps its
+full limit: a prefill reuses its buffers inside every chunk, and a 2 GiB limit
+cost 6 to 10% of the 16K and 64K prefill rate on a 128 GB Mac.
 
 ### What `/health` reports
 
@@ -197,7 +203,8 @@ both under `mem`: `phys_footprint_bytes` and `host_overhang_bytes`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MTPLX_HOST_MEMORY_ALLOWANCE_BYTES` | `auto` | Process memory outside MLX's account that the guards treat as normal. `auto` is the larger of 8 GiB and what the machine leaves after the system reserve and the Metal limit (16 GiB on a 128 GB Mac with default limits). `0` makes every byte above MLX's account count, which is stricter than the memory plan and reads a full session on a 48 GB Mac as critical. Sizes such as `12G` are accepted. |
+| `--memory-limit SIZE\|max` (`MTPLX_MEMORY_LIMIT_BYTES`) | 75% of RAM; from 128 GB up at most RAM minus 38 GiB (90 GiB on a 128 GB Mac); 192 GiB at most | The engine's Metal memory limit: weights, KV, the session cache and transients are planned inside it. The 128 GB default leaves a desktop's other apps room: with 16 GB of other apps open, a 96 GiB limit made the guard refuse a compaction-size prompt to keep the Mac alive, where 90 GiB served it. A model whose resident floor is above that keeps the 75% rule (96 GiB on 128 GB), and one above the 75% rule gets everything outside macOS's reserve. `max` uses everything outside macOS's own reserve (112 GiB on a 128 GB Mac), for a headless server with nothing else running (issue #548); it is never under the default, so on Macs of 32 GB and under it is the default. The guard's whole-Mac checks (free pages, compressor growth) apply at every limit. Sizes such as `96G` are accepted; the app's Memory setting writes the same variable. |
+| `MTPLX_HOST_MEMORY_ALLOWANCE_BYTES` | `auto` | Process memory outside MLX's account that the guards treat as normal. `auto` is RAM/16, at most 8 GiB, and at most a twelfth of an explicit memory limit. `0` makes every byte above MLX's account count, which is stricter than the memory plan and reads a full session on a 48 GB Mac as critical. Sizes such as `12G` are accepted. |
 
 ## SSD session cache (cold tier) limits
 

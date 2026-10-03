@@ -238,6 +238,13 @@ struct ActivityTab: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
+            if let prefill = request.prefillState, prefill.isActive,
+               let reread = prefill.reread, reread.explainsAReread {
+                RereadExplanationText(
+                    reread: reread,
+                    ssd: SSDLowDiskNotice.from(backend.health?.ssdSessionCache)
+                )
+            }
             HStack(spacing: 14) {
                 Label(tr("%@ prompt tok", Format.integer(request.promptTokens)),
                       systemImage: "text.alignleft")
@@ -634,7 +641,7 @@ struct ActivityTab: View {
                 Divider().frame(height: 36)
                 StatTile(
                     label: tr("Last miss"),
-                    value: sessionBank?.lastMissReason ?? "—",
+                    value: CacheExplanation.missReason(sessionBank?.lastMissReason) ?? "—",
                     systemImage: "questionmark.circle",
                     tint: (sessionBank?.lastMissReason).flatMap { $0.isEmpty ? nil : $0 } == nil
                         ? .secondary : .mtplxWarning
@@ -866,9 +873,9 @@ struct ActivityTab: View {
             }
             return parts.joined(separator: " · ")
         case .miss:
-            return tr("miss · %@", latest.cacheMissReason ?? tr("new or uncached request"))
+            return tr("miss · %@", CacheExplanation.missReason(latest.cacheMissReason) ?? tr("new or uncached request"))
         case .unknown:
-            if let reason = latest.cacheMissReason, !reason.isEmpty {
+            if let reason = CacheExplanation.missReason(latest.cacheMissReason) {
                 return tr("unknown · %@", reason)
             }
             return tr("unknown · no cache verdict from the model")
@@ -916,7 +923,10 @@ struct ActivityTab: View {
                 }
                 return tr("hit · %@", mode)
             }
-            return tr("miss · %@", latest.liveFrontierMissReason ?? latest.cacheMissReason ?? policy)
+            return tr(
+                "miss · %@",
+                CacheExplanation.missReason(latest.liveFrontierMissReason ?? latest.cacheMissReason) ?? policy
+            )
         }
         if latest.requestSessionKeepLiveRef == true {
             if latest.opencodeToolHistoryLiveFrontierRestore == true || policy.contains("live_reference") {
@@ -1085,8 +1095,7 @@ struct ActivityTab: View {
     }
 
     private func prefixDiagnosticText(_ diagnostic: DynamicObject) -> String {
-        let reason = diagnostic.string("miss_reason")
-            ?? diagnostic.string("reason")
+        let reason = CacheExplanation.missReason(diagnostic.string("miss_reason"))
             ?? tr("no miss")
         var parts = [reason]
         if let matched = diagnostic.int("common_prefix_tokens")

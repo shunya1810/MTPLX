@@ -20,6 +20,7 @@ def _bank(runtime, marker):
     bank._prepare_compiled_aux = None
     bank._spec = []
     bank._shadow = []
+    bank._program_hosts = {}
     bank.stats = {"traces": 0}
     bank._runtime_forward = lambda *args, **kwargs: (marker, "hidden", {})
     return bank

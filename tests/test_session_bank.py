@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+from mtplx.cache_state import CacheSnapshot
 from mtplx.session_bank import SessionBank
 
 
@@ -123,7 +124,11 @@ def test_session_bank_oversized_prompt_prefix_can_use_live_reference_lease():
     assert restored.restore_mode == "reference_lease"
     assert restored.cache is cache
     assert restored.mtp_history_cache is mtp_cache
-    assert cache[0].offset == 9
+    # The trunk lands at the entry's end, where a clone lands: an identical
+    # prompt decodes from the stored logits, so a cache one slot short
+    # wrote its first answer token over its last prompt token. The draft
+    # history keeps its own convention, one row behind the prefix.
+    assert cache[0].offset == 10
     assert mtp_cache[0].offset == 9
     assert entry.cache_ref is None
     assert entry.mtp_history_cache_ref is None
@@ -583,6 +588,77 @@ def test_per_session_entry_retention_bounds_divergent_siblings(monkeypatch):
     )
     assert sum(1 for e in bank._entries.values() if e.session_id == "other") == 1
     assert sum(1 for e in bank._entries.values() if e.session_id == "agent") == 3
+
+
+class _RecurrentLayer:
+    """Untrimmable GDN-style layer: marks the entry as hybrid/recurrent."""
+
+    state = ()
+
+    def is_trimmable(self) -> bool:
+        return False
+
+
+def _hybrid_runtime():
+    return SimpleNamespace(
+        model_path=Path("models/example"), mtp_enabled=True,
+        make_cache=list, make_mtp_cache=list,
+    )
+
+
+def _put_recurrent(bank, runtime, tokens):
+    return bank.put(
+        runtime=runtime, token_ids=tokens, cache=[_RecurrentLayer()], logits=None,
+        hidden=None, session_id="agent", nbytes_override=10,
+        gdn_boundaries=[(48, CacheSnapshot((), ()))],
+    )
+
+
+def _agent_turn_with_retry_lineage(bank, runtime, *, postcommit_lands):
+    """Each agent turn is a first pass (lineage A)
+    plus a tool-fed retry (lineage B, diverging early). The async postcommit
+    restores A's prompt prefix and banks the re-rendered history; the next
+    turn's first pass then extends that history."""
+    history = list(range(100))
+    retry_prev = history[:50] + [900] * 10
+    first_pass = history[:80]
+    retry = history[:50] + [901] * 12
+    for tokens in (retry_prev, first_pass, retry):
+        _put_recurrent(bank, runtime, tokens)
+    next_first_pass_source = first_pass
+    if postcommit_lands:
+        with bank.maintenance_reads():
+            assert bank.restore(runtime, history[:90], session_id="agent") is not None
+        _put_recurrent(bank, runtime, history[:90])
+        next_first_pass_source = history[:90]
+    restored = bank.restore(runtime, history[:95], session_id="agent")
+    assert restored.entry.prefix_len == len(next_first_pass_source)
+    _put_recurrent(bank, runtime, history[:95])
+    return tuple(retry)
+
+
+def test_postcommit_restore_keeps_the_retry_lineage_under_retention():
+    runtime = _hybrid_runtime()
+    for postcommit_lands in (False, True):
+        bank = SessionBank(max_entries=16, max_bytes=10_000, per_session_max_bytes=10_000)
+        retry = _agent_turn_with_retry_lineage(
+            bank, runtime, postcommit_lands=postcommit_lands
+        )
+        assert bank.per_session_max_entries == 3
+        assert retry in bank._entries, f"postcommit_lands={postcommit_lands}"
+
+
+def test_maintenance_reads_do_not_refresh_recency_but_client_reads_do():
+    runtime = _hybrid_runtime()
+    bank = SessionBank(max_entries=4, max_bytes=10_000, per_session_max_bytes=10_000)
+    entry = _put_recurrent(bank, runtime, list(range(80)))
+    stamped = entry.last_access_s
+    with bank.maintenance_reads():
+        assert bank.restore(runtime, list(range(90)), session_id="agent") is not None
+    assert entry.last_access_s == stamped
+    assert entry.hits == 1
+    assert bank.restore(runtime, list(range(90)), session_id="agent") is not None
+    assert entry.last_access_s > stamped
 
 
 def test_longest_shared_prefix_tokens_sees_entries_that_are_not_exact_prefixes():

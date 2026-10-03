@@ -4,6 +4,7 @@ import "uplot/dist/uPlot.min.css";
 import { Card } from "./Card";
 import { useDashboardStore, useFilteredHistory } from "../state/store";
 import { fmtTokS } from "../lib/utils";
+import { autoAxisSize } from "../lib/uplotAxis";
 
 export function TPSTimeSeries() {
   const history = useFilteredHistory();
@@ -56,6 +57,7 @@ export function TPSTimeSeries() {
           stroke: "rgba(200,210,220,0.55)",
           grid: { show: true, stroke: "rgba(255,255,255,0.04)", width: 1 },
           values: (_self, ticks) => ticks.map((t) => `${t.toFixed(0)} tok/s`),
+          size: autoAxisSize,
         },
       ],
       legend: { show: false },

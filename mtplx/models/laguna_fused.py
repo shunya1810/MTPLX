@@ -46,6 +46,7 @@ import mlx.nn as nn
 # and a function-local import would spend a meaningful slice of what it saves on
 # `sys.modules` lookups.  `mtplx.kernels` imports nothing from `mtplx.models`,
 # so there is no cycle to avoid.
+from .. import moe_sorted_gather
 from ..kernels.laguna_decode import fused_glu
 
 ENV_FUSED_GATE_UP = "MTPLX_LAGUNA_FUSED_GATE_UP"
@@ -129,7 +130,7 @@ class FusedGateUpSwitchGLU(nn.Module):
             else None
         )
         if self.quantized:
-            return mx.gather_qmm(
+            return moe_sorted_gather.gather_qmm(
                 x,
                 self["gate_up_weight"],
                 self["gate_up_scales"],
@@ -199,7 +200,7 @@ def cached_lhs_indices(leading_shape: tuple[int, ...]) -> mx.array:
 
 
 def _patched_quantized_switch_call(self, x, indices, sorted_indices=False):
-    x = mx.gather_qmm(
+    x = moe_sorted_gather.gather_qmm(
         x,
         self["weight"],
         self["scales"],

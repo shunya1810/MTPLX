@@ -38,6 +38,15 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
         "MTPLX_APP_SETTINGS_PATH", str(isolated / "app-settings.json")
     )
     monkeypatch.setenv("MTPLX_MODEL_DIR", str(isolated / "models"))
+    # `mtplx start` saves its setup to ~/.mtplx/quickstart.json and offers it
+    # again on the next start; a test that reaches save_state without its own
+    # path must not rewrite the developer's.
+    monkeypatch.setenv("MTPLX_QUICKSTART_STATE", str(isolated / "quickstart.json"))
+    # A real ~/.mtplx/config.toml outranks MTPLX_MODEL_DIR: its `model` changed
+    # the default-model and bench dry runs, and its `model_dir` sent forge
+    # builds into the user's real model cache. Tests that exercise the config
+    # set their own MTPLX_CONFIG.
+    monkeypatch.setenv("MTPLX_CONFIG", str(isolated / "config.toml"))
     # Synthetic server requests must not enter a live user's trace history.
     monkeypatch.setenv("MTPLX_REQUEST_LOG_JSONL", str(isolated / "requests.jsonl"))
     monkeypatch.setenv("MTPLX_FLIGHT_RECORDER", str(isolated / "flight.jsonl"))
@@ -50,6 +59,16 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
     # Tests that exercise the config writer set their own path; everyone
     # else writes into this scratch file.
     monkeypatch.setenv("MTPLX_OPENCODE_CONFIG", str(isolated / "opencode.json"))
+    # Pi's models.json and the extensions MTPLX installs beside it get the
+    # same treatment: ~/.pi/agent is never written by the suite. So do the
+    # OpenCode Desktop stores the OpenCode writer and launcher edit on macOS.
+    monkeypatch.setenv("MTPLX_PI_MODELS_JSON", str(isolated / "pi" / "models.json"))
+    monkeypatch.setenv(
+        "MTPLX_OPENCODE_DESKTOP_SETTINGS_STORE", str(isolated / "opencode-desktop.dat")
+    )
+    monkeypatch.setenv(
+        "MTPLX_OPENCODE_DESKTOP_APP_SUPPORT", str(isolated / "opencode-desktop")
+    )
     # The system memory guard reads how much memory the kernel can still hand
     # out. On a developer machine that figure depends on what else is open,
     # so the suite sees "unknown" (the guard takes no action) unless a test
@@ -66,6 +85,9 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
         # that boots it with --memory-budget would size every later test's
         # session bank against that budget instead of the machine's RAM.
         "MTPLX_MEMORY_BUDGET",
+        # Same for --allow-swap: a leaked value would switch it on for every
+        # later server the suite boots.
+        "MTPLX_ALLOW_SWAP",
     ):
         monkeypatch.delenv(name, raising=False)
     # `mtplx doctor` reads the app's failed-start report (#504). A developer

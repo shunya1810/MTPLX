@@ -34,6 +34,10 @@ struct LiveTab: View {
                         plan: backend.memoryPlan
                     )
 
+                    if let notice = SSDLowDiskNotice.from(backend.health?.ssdSessionCache) {
+                        SSDLowDiskBanner(notice: notice)
+                    }
+
                     heroSection(availableWidth: contentWidth)
                     TileRow(availableWidth: contentWidth)
                     AcceptanceSection()
@@ -100,16 +104,26 @@ struct LiveTab: View {
     @ViewBuilder
     private func heroCaption(mode: GaugeMode) -> some View {
         if case .prefill = mode, let prefill = currentPrefill() {
-            HStack(spacing: 6) {
-                Image(systemName: cacheSymbol(for: prefill))
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(Brand.warning)
-                Text(prefillTokenCaption(prefill))
-                    .font(.system(size: 11, weight: .heavy, design: .monospaced))
-                    .tracking(1)
-                    .foregroundStyle(Brand.textHighlight.opacity(0.75))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.75)
+            VStack(spacing: 4) {
+                HStack(spacing: 6) {
+                    Image(systemName: cacheSymbol(for: prefill))
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(Brand.warning)
+                    Text(prefillTokenCaption(prefill))
+                        .font(.system(size: 11, weight: .heavy, design: .monospaced))
+                        .tracking(1)
+                        .foregroundStyle(Brand.textHighlight.opacity(0.75))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                }
+                // Why this prompt is read again, said while the wait happens.
+                if let reread = prefill.reread, reread.explainsAReread {
+                    RereadExplanationText(
+                        reread: reread,
+                        ssd: SSDLowDiskNotice.from(backend.health?.ssdSessionCache)
+                    )
+                    .multilineTextAlignment(.center)
+                }
             }
         } else {
             // Same warm-up gate as `currentMode()` — don't show the
@@ -311,7 +325,8 @@ struct LiveTab: View {
             ssdCachedTokens: (values["ssd_cached_tokens"]?.doubleValue).map(Int.init),
             ssdRestoreS: values["ssd_restore_s"]?.doubleValue,
             ssdSuffixTokens: (values["ssd_suffix_tokens"]?.doubleValue).map(Int.init),
-            startedS: values["started_s"]?.doubleValue
+            startedS: values["started_s"]?.doubleValue,
+            reread: values["reread"]?.objectValue.map(PrefillReread.init(values:))
         )
     }
 

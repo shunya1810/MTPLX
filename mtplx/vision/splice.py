@@ -11,7 +11,7 @@ injection when enabled.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 import mlx.core as mx
 
@@ -238,6 +238,91 @@ def clamp_matched_outside_image_spans(
     for start, end in spans:
         if start < m < end:
             return int(start)
+    return m
+
+
+# -- reading a keyed sequence -------------------------------------------------
+#
+# The session bank, the session's committed stream and the admission all hold
+# an image conversation in the view vision_bank_key_ids builds. These read that
+# view back, so the key format stays known to this module alone.
+
+
+def is_image_key(token: int) -> bool:
+    """Whether ``token`` stands for an image row in a keyed sequence.
+
+    Every image row of a keyed sequence carries the flag bit; no model id does.
+    """
+
+    return bool(int(token) & _BANK_KEY_FLAG)
+
+
+def image_key_runs(keyed_ids: Sequence[int]) -> list[tuple[int, int]]:
+    """[start, end) of each run of consecutive image rows, in order.
+
+    Each image expands to one contiguous run of rows, and the chat templates
+    put markup between images, so a run is one image. Two images that touch
+    read as one run, which only makes every rule built on runs stricter.
+    """
+
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for position, token in enumerate(keyed_ids):
+        if is_image_key(token):
+            if start is None:
+                start = position
+        elif start is not None:
+            runs.append((start, position))
+            start = None
+    if start is not None:
+        runs.append((start, len(keyed_ids)))
+    return runs
+
+
+def unkeyed_ids(keyed_ids: Sequence[int], image_pad_token_id: int) -> list[int]:
+    """The model ids behind a keyed sequence: every image row back to the pad.
+
+    What the model is served (the rows themselves ride the splice) and what a
+    tokenizer can decode.
+    """
+
+    pad = int(image_pad_token_id)
+    return [pad if is_image_key(token) else int(token) for token in keyed_ids]
+
+
+def inside_image(keyed_ids: Sequence[int], position: int) -> bool:
+    """Whether a cut at ``position`` would split an image: image rows on both sides."""
+
+    p = int(position)
+    return (
+        0 < p < len(keyed_ids)
+        and is_image_key(keyed_ids[p - 1])
+        and is_image_key(keyed_ids[p])
+    )
+
+
+def image_safe_restore_len(
+    keyed_ids: Sequence[int], matched: int, *, reforwards_last_token: bool
+) -> int:
+    """The longest restore within ``matched`` tokens that keeps every image whole.
+
+    A matched keyed prefix is content-true: the same text and, row for row,
+    the same pixels at the same positions. A restore point inside an image is
+    still refused: no restore has ever started there (they stopped before the
+    first image or at an entry's end), so that case is unproven. A restore
+    that re-forwards its last token (an entry without recurrent state) must
+    not end on an image row either, since that forward embeds the pad id
+    instead of the image row. Such a restore steps back to the first row of
+    the image, where the prefix is text. Text sequences carry no image rows
+    and come back unchanged.
+    """
+
+    m = max(0, min(int(matched), len(keyed_ids)))
+    if inside_image(keyed_ids, m) or (
+        reforwards_last_token and m > 0 and is_image_key(keyed_ids[m - 1])
+    ):
+        while m > 0 and is_image_key(keyed_ids[m - 1]):
+            m -= 1
     return m
 
 

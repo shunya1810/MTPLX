@@ -84,9 +84,10 @@ struct DaemonStatePill: View {
 //
 // Single combined daemon + stream pulse that replaces the old "RUNNING"
 // text pill plus the separate "live" dot. Goes green and pulses only
-// when the daemon is fully running AND the SSE metrics stream is open;
-// otherwise it shows the most informative intermediate state (starting,
-// reconnecting, offline) without splitting attention across two widgets.
+// when the daemon is fully running AND the SSE metrics stream is open.
+// The words come from `DaemonStatusBadge` (issue #528): a running engine
+// whose live stats dropped reads "Running · reconnecting live stats",
+// never "Offline" or "Degraded".
 struct ConnectionDot: View {
     let daemonState: DaemonState
     let connectionState: MetricsConnectionState
@@ -94,13 +95,18 @@ struct ConnectionDot: View {
     @State private var pulseKey: Int = 0
 
     var body: some View {
+        let badge = DaemonStatusBadge(
+            daemonState: daemonState,
+            connectionState: connectionState
+        )
+        let tint = tint(badge.tone)
         HStack(spacing: 6) {
             ZStack {
                 Circle()
                     .fill(tint)
                     .frame(width: 8, height: 8)
                     .shadow(color: tint.opacity(0.5), radius: 3)
-                if isHealthy {
+                if badge.tone == .healthy {
                     Circle()
                         .stroke(tint.opacity(0.45), lineWidth: 1.5)
                         .frame(width: 14, height: 14)
@@ -115,21 +121,13 @@ struct ConnectionDot: View {
                 }
             }
             .frame(width: 14, height: 14)
-            Text(label)
+            Text(badge.label)
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .tracking(0.5)
                 .foregroundStyle(tint.opacity(0.95))
         }
         .onChange(of: stateKey) { _, _ in pulseKey &+= 1 }
-        .help(helpText)
-    }
-
-    /// True only when both the daemon is `.running` and the SSE stream
-    /// is `.open`. Used to gate the pulse so the indicator never lies
-    /// about health.
-    private var isHealthy: Bool {
-        if case .running = daemonState, case .open = connectionState { return true }
-        return false
+        .help(badge.help)
     }
 
     /// Equatable proxy so `.onChange` fires only on a meaningful state
@@ -148,76 +146,12 @@ struct ConnectionDot: View {
         }
     }
 
-    private var tint: Color {
-        if isHealthy { return .mtplxSuccess }
-        switch daemonState.kind {
-        case .running:
-            // Daemon up but stream not open yet.
-            switch connectionState {
-            case .failed: return .mtplxDanger
-            case .reconnecting, .connecting: return .mtplxWarning
-            default: return .mtplxWarning
-            }
-        case .starting, .warming:
-            return .mtplxWarning
-        case .stopping:
-            return .mtplxWarning
-        case .degraded, .crashed:
-            return .mtplxDanger
-        case .stopped:
-            return Brand.textHighlight.opacity(0.55)
-        }
-    }
-
-    private var label: String {
-        if isHealthy { return tr("Running") }
-        // The degraded reason was invisible outside a hover tooltip; users
-        // (and their screenshots) only ever saw the bare word "Degraded".
-        // Surface a capped reason inline; the full text stays in helpText.
-        if case .degraded(let reason) = daemonState {
-            let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty { return tr("Degraded") }
-            let capped = trimmed.count > 44
-                ? String(trimmed.prefix(44)).trimmingCharacters(in: .whitespaces) + "…"
-                : trimmed
-            return tr("Degraded — %@", capped)
-        }
-        switch daemonState.kind {
-        case .running:
-            switch connectionState {
-            case .open: return tr("Running")
-            case .connecting: return tr("Connecting…")
-            case .reconnecting(let n): return tr("Reconnect #%lld", n)
-            case .failed: return tr("Offline")
-            case .idle: return tr("Idle")
-            }
-        case .starting: return tr("Starting")
-        case .warming: return tr("Warming")
-        case .stopping: return tr("Stopping")
-        case .degraded: return tr("Degraded")
-        case .crashed: return tr("Crashed")
-        case .stopped: return tr("Stopped")
-        }
-    }
-
-    private var helpText: String {
-        if isHealthy { return tr("Running and ready.") }
-        switch daemonState {
-        case .running:
-            switch connectionState {
-            case .open: return tr("Running.")
-            case .connecting: return tr("Connecting to live stats…")
-            case .reconnecting(let n): return tr("Reconnecting (attempt %lld).", n)
-            case .failed(let msg): return tr("Live stats offline: %@", msg)
-            case .idle: return tr("Running. Waiting for stats.")
-            }
-        case .starting: return tr("Starting up…")
-        case .warming: return tr("Loading the model…")
-        case .degraded(let msg): return tr("Degraded: %@", msg)
-        case .stopping: return tr("Stopping…")
-        case .crashed(let status?): return tr("Crashed (exit code %@).", String(status))
-        case .crashed: return tr("Crashed.")
-        case .stopped: return tr("Not running.")
+    private func tint(_ tone: DaemonStatusBadge.Tone) -> Color {
+        switch tone {
+        case .healthy: return .mtplxSuccess
+        case .pending: return .mtplxWarning
+        case .failed: return .mtplxDanger
+        case .idle: return Brand.textHighlight.opacity(0.55)
         }
     }
 }
@@ -549,6 +483,60 @@ struct MemoryGuardBanner: View {
             text += tr(" Context window %@ exceeds this Mac's fit of %@ tokens. Lower it to stop this recurring.", resolved.formatted(), fit.formatted())
         }
         return text
+    }
+}
+
+// MARK: - SSDLowDiskBanner
+
+/// The SSD cache is short of disk: it may skip saves (low) or has stopped
+/// saving (full). Driven by the SSD tier's `/health` stats; saved copies
+/// stay, so a warm restore still works, but new progress may be read again.
+struct SSDLowDiskBanner: View {
+    let notice: SSDLowDiskNotice
+
+    var body: some View {
+        let tint = notice.severity == .full ? Brand.danger : Brand.warning
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "externaldrive.badge.exclamationmark")
+                .font(.title3)
+                .foregroundStyle(tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(notice.title)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(tint)
+                Text(notice.message)
+                    .font(.caption)
+                    .foregroundStyle(Brand.textHighlight.opacity(0.75))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+        }
+        .padding(12)
+        .background {
+            RoundedRectangle(cornerRadius: Brand.Radii.m, style: .continuous)
+                .fill(tint.opacity(0.12))
+                .overlay {
+                    RoundedRectangle(cornerRadius: Brand.Radii.m, style: .continuous)
+                        .strokeBorder(tint.opacity(0.45), lineWidth: Brand.hairlineStrong)
+                }
+        }
+    }
+}
+
+// MARK: - RereadExplanationText
+
+/// Why a prompt is read again, in plain sentences, while the prefill runs
+/// (the server's `reread`; `CacheExplanation.rereadSentences`).
+struct RereadExplanationText: View {
+    let reread: PrefillReread
+    let ssd: SSDLowDiskNotice?
+
+    var body: some View {
+        Text(CacheExplanation.rereadLine(reread, ssd: ssd))
+            .font(.caption)
+            .foregroundStyle(Brand.warning)
+            .fixedSize(horizontal: false, vertical: true)
+            .lineLimit(3)
     }
 }
 

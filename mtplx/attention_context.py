@@ -5,7 +5,10 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Iterator
+from dataclasses import dataclass, field
+from typing import Any, Hashable, Iterator
+
+from .compile_state import compiled_dispatch_scope, current_dispatch_identity
 
 VALID_ATTENTION_PHASES = {
     "prefill",
@@ -137,3 +140,123 @@ def model_forward_kind(kind: str | None) -> Iterator[None]:
         yield
     finally:
         _MODEL_FORWARD_KIND.reset(token)
+
+
+# KV attention record (issue #526): host facts about each full-attention
+# layer's latest call, written by the split-attention hook and read when the
+# request fails with non-finite logits. It belongs to one request, not to the
+# process: the server gives every model-work item its own record
+# (kv_attention_request_scope) and NonFiniteLogitsError captures the failure
+# line where it is raised, on the model thread, before any other request can
+# run attention. A thread with no scope keeps one record for itself.
+#
+# The Python forward runs for eager calls and for the TRACE of a compiled
+# step, never for its replays. Trace-time records are therefore kept apart,
+# filed under the specialization being traced (the compiled callable and the
+# input shapes that select its graph), and every compiled dispatch names its
+# specialization (compiled_dispatch). A failure after a replay reads
+# "compiled replay of" the trace of that same graph when this request traced
+# it, and says the metadata is unavailable otherwise: never another width's
+# trace, never a stale eager record claiming to be the failing dispatch.
+
+
+@dataclass
+class KvAttentionRecords:
+    eager: dict[int, tuple[Any, ...]] = field(default_factory=dict)
+    traced: dict[Hashable, dict[int, tuple[Any, ...]]] = field(default_factory=dict)
+    last_dispatch: str = "eager"
+    last_identity: Hashable | None = None
+
+
+_KV_ATTENTION_RECORDS: ContextVar[KvAttentionRecords | None] = ContextVar(
+    "mtplx_kv_attention_records", default=None
+)
+
+
+def _kv_attention_records() -> KvAttentionRecords:
+    records = _KV_ATTENTION_RECORDS.get()
+    if records is None:
+        records = KvAttentionRecords()
+        _KV_ATTENTION_RECORDS.set(records)
+    return records
+
+
+@contextmanager
+def kv_attention_request_scope() -> Iterator[None]:
+    """Give one request (one model-work item) its own KV attention record."""
+    token = _KV_ATTENTION_RECORDS.set(KvAttentionRecords())
+    try:
+        yield
+    finally:
+        _KV_ATTENTION_RECORDS.reset(token)
+
+
+def note_kv_attention_record(layer: int, record: tuple[Any, ...], *, traced: bool) -> None:
+    records = _kv_attention_records()
+    if traced:
+        identity = current_dispatch_identity()
+        records.traced.setdefault(identity, {})[int(layer)] = record
+    else:
+        records.eager[int(layer)] = record
+        records.last_dispatch = "eager"
+
+
+@contextmanager
+def compiled_dispatch(identity: Hashable) -> Iterator[None]:
+    """Wrap a call into a compiled step whose graph ``identity`` names.
+
+    Marks the dispatch (no Python runs for a replay) and files any trace the
+    call makes under ``identity``, so a failure can be matched to the trace of
+    the graph that ran. Pass the compiled callable's id and the shapes of the
+    inputs that select its specialization.
+    """
+
+    records = _kv_attention_records()
+    records.last_dispatch = "compiled_replay"
+    records.last_identity = identity
+    with compiled_dispatch_scope(identity):
+        yield
+
+
+def format_kv_attention_record(
+    record: tuple[Any, ...], *, dispatch: str | None = None
+) -> str:
+    (layer, phase, cache_name, bits, route, q_dtype, offset, capacity, q_len,
+     mask_kind, fallback, finite) = record
+    head = "mtplx_kv_attention " + (f"dispatch={dispatch} " if dispatch else "")
+    return head + (
+        f"layer={layer} phase={phase} cache={cache_name} bits={bits} route={route} "
+        f"q_dtype={str(q_dtype).removeprefix('mlx.core.')} offset={offset} "
+        f"capacity={'-' if capacity is None else capacity} q_len={q_len} "
+        f"mask={mask_kind} fallback={fallback or '-'} finite={finite}"
+    )
+
+
+def kv_attention_failure_line() -> str | None:
+    """The current request's first full-attention layer, for a failure report.
+
+    Host data only (safe after the failing generation unwound). Offsets held
+    in an array print as ``array``; rerun with MTPLX_KV_ATTENTION_TRACE=nonfinite
+    for per-layer values and verdicts.
+    """
+
+    records = _KV_ATTENTION_RECORDS.get()
+    if records is None:
+        return None
+    if records.last_dispatch == "compiled_replay":
+        traced = (
+            records.traced.get(records.last_identity)
+            if records.last_identity is not None
+            else None
+        )
+        if traced:
+            record = traced[min(traced)]
+            return format_kv_attention_record(record, dispatch="compiled_replay_of_trace")
+        return (
+            "mtplx_kv_attention dispatch=compiled_replay (this request did not "
+            "trace the graph that ran, so its call metadata is unavailable; "
+            "MTPLX_KV_ATTENTION_TRACE=1 prints every trace)"
+        )
+    if records.eager:
+        return format_kv_attention_record(records.eager[min(records.eager)], dispatch="eager")
+    return None

@@ -245,7 +245,7 @@ def inject_qwen3_5_mtp_support(
     from mlx_lm.models.cache import KVCache
     from mlx_lm.models.qwen3_5 import TextModelArgs
 
-    from .mtp_patch import _text_model
+    from .mtp_patch import _stack_mtp_moe_experts, _text_model
 
     if not is_qwen3_5_mtp_config(config):
         return False
@@ -258,6 +258,10 @@ def inject_qwen3_5_mtp_support(
     if not weights:
         logger.warning("[Qwen3.5 MTP inject] no mtp.* weights found in %s", model_path)
         return False
+    # Fused or numbered routed experts take the switch_mlp layout the module
+    # loads, through the same mapping as every other MTP loader; the strict
+    # coverage check below still refuses anything else.
+    weights = _stack_mtp_moe_experts(weights, config)
 
     # Operate at the qwen3_5 *TextModel* level (``.model`` inner trunk +
     # ``.lm_head``), which is what ``_text_model`` returns and what

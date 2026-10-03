@@ -29,6 +29,7 @@ from .session_bank import (
     DEFAULT_MAX_BYTES,
     DEFAULT_PER_SESSION_MAX_BYTES,
     DEFAULT_PREFIX_BLOCK_SIZE,
+    QueuedPersistenceCancelError,
     SessionBank,
     block_aligned_prefix_len,
 )
@@ -678,6 +679,11 @@ def _marathon_postcommit_wait_s() -> float:
 
 _DEFAULT_CANCELLED_HOLDER_HANDOFF_WAIT_S = 30.0
 _CANCELLED_HOLDER_HANDOFF_POLL_S = 0.02
+# Longest a request waits for a memory release that holds its session's
+# slot. The release evicts that one session's RAM entries (dictionary work
+# and dropped references, milliseconds) and lets go; the bound only stops a
+# request from waiting forever on a release that never returns.
+_RELEASE_HOLD_WAIT_S = 5.0
 
 
 def _cancelled_holder_handoff_wait_s() -> float:
@@ -973,6 +979,16 @@ class EngineSession:
         self.bytes_estimate = 0
         self.revision = 0
         self._lock = Lock()
+        # Odd while a memory release holds ``_lock`` (begin_release_hold):
+        # a request that finds the slot taken by a release waits for it
+        # instead of reporting the session busy. ``_release_guard`` makes
+        # taking or giving back the slot and publishing the sequence one
+        # step: a request that tried the slot in between read an even
+        # sequence with the slot taken and reported busy (the review of
+        # 9c96dd9c).
+        self._release_seq = 0
+        self._release_guard = Lock()
+        self.release_held = False
         # The cancel signal of the generation that holds ``_lock`` (or held
         # it last). Written only by the thread that has just taken the lock
         # and never cleared on release, so a waiter that failed to take the
@@ -1006,6 +1022,14 @@ class EngineSession:
         # one bounded grace instead of one per record. See
         # `cross_session_postcommit_protection`.
         self._cross_session_protect_deadline_s: float | None = None
+        # The previous streamed turn's tail: its terminal frame went out at
+        # the last token and its generation-final commit (then the prompt
+        # prefix and the idle postcommit's scheduling) is still running on
+        # the stream worker, which holds this session's generation slot
+        # until it is done. The next request of this session waits for it
+        # before it reads the session (begin/end/wait_for_response_tail).
+        self._response_tail: Event | None = None
+        self.last_response_tail: dict[str, Any] | None = None
 
     @property
     def pending_postcommit(self) -> Any:
@@ -1328,6 +1352,40 @@ class EngineSession:
         record.mark_finished(outcome)
         return outcome
 
+    def begin_response_tail(self) -> Event:
+        """Mark a streamed turn whose commit runs after its terminal frame."""
+
+        tail = Event()
+        with self._postcommit_lock:
+            self._response_tail = tail
+        return tail
+
+    def end_response_tail(self, tail: Event, outcome: dict[str, Any] | None) -> None:
+        """The tail is done (commit landed, slot released): wake the waiter."""
+
+        with self._postcommit_lock:
+            if self._response_tail is tail:
+                self._response_tail = None
+            self.last_response_tail = dict(outcome or {})
+        tail.set()
+
+    def wait_for_response_tail(self, timeout_s: float) -> dict[str, Any] | None:
+        """Wait (bounded) for the previous turn's tail before this request
+        reads the session: the same state it read when the terminal frame
+        waited for the commit. None when no tail was running."""
+
+        with self._postcommit_lock:
+            tail = self._response_tail
+        if tail is None:
+            return None
+        started = time.monotonic()
+        finished = tail.wait(max(0.0, float(timeout_s)))
+        return {
+            "waited_s": round(time.monotonic() - started, 6),
+            "finished": bool(finished),
+            "tail": dict(self.last_response_tail or {}) if finished else None,
+        }
+
     def resolve_pending_postcommit_for_request(self) -> dict[str, Any]:
         """Foreground-request policy for a prior turn's pending postcommit.
 
@@ -1461,14 +1519,43 @@ class EngineSession:
         if timeout_s > 0.0:
             acquired = self._lock.acquire(timeout=float(timeout_s))
         else:
-            acquired = self._lock.acquire(blocking=False)
+            with self._release_guard:
+                acquired = self._lock.acquire(blocking=False)
+                releasing = not acquired and self._release_seq % 2 == 1
+                if acquired:
+                    # The slot and its flag in one step: stale eviction and
+                    # the in-flight readers take this guard too.
+                    self._hold_for_generation(cancel_event)
+            if acquired:
+                self.touch()
+                return True
+            if releasing:
+                # A memory release holds the slot for the milliseconds it
+                # takes to evict this session's RAM entries. Wait for it:
+                # reporting the session busy would refuse a named session
+                # (409) or fork an implicit one because of the release.
+                acquired = self._lock.acquire(timeout=_RELEASE_HOLD_WAIT_S)
         if not acquired:
             return False
+        # A waiting acquire cannot hold the guard while it blocks; the flag
+        # follows under it, and until then the held slot itself (``locked``)
+        # is what stale eviction and the in-flight readers see.
+        with self._release_guard:
+            self._hold_for_generation(cancel_event)
+        self.touch()
+        return True
+
+    def _hold_for_generation(self, cancel_event: Any | None) -> None:
         self._holder_cancel_event = cancel_event
         self.in_flight = True
         self.in_flight_started_s = time.time()
-        self.touch()
-        return True
+
+    def slot_in_use(self) -> bool:
+        """Whether a request or a memory release owns this session now: its
+        flag, or its slot taken by an acquire whose flag has not landed yet.
+        Callers that act on the answer hold ``_release_guard``."""
+
+        return bool(self.in_flight or self.release_held or self._lock.locked())
 
     def holder_cancel_requested(self) -> bool:
         """True when the generation holding the slot has been cancelled."""
@@ -1527,6 +1614,38 @@ class EngineSession:
         if receipt["outcome"] != "holder_not_cancelled":
             self.last_cancel_handoff = dict(receipt)
         return receipt
+
+    def begin_release_hold(self) -> bool:
+        """Take this session's slot for a memory release, without waiting.
+
+        False when a generation holds it: the session is busy and the
+        release skips it. Held, no request can restore from the session's
+        entries while they are evicted; a request that arrives meanwhile
+        waits in ``try_begin_generation`` and then finds the entries gone
+        (an SSD restore or a prefill), never a busy refusal.
+        """
+
+        with self._release_guard:
+            if not self._lock.acquire(blocking=False):
+                return False
+            self._release_seq += 1
+            # In flight for the hold's duration: stale eviction keeps the
+            # record (it dropped a held session's record, and a request
+            # then created and took a second one under the same id while
+            # the release still evicted the first's entries), and every
+            # other reclamation step spares it.
+            self.release_held = True
+            self.in_flight = True
+            self.in_flight_started_s = time.time()
+        return True
+
+    def end_release_hold(self) -> None:
+        with self._release_guard:
+            self.release_held = False
+            self.in_flight = False
+            self.in_flight_started_s = None
+            self._release_seq += 1
+            self._lock.release()
 
     def end_generation(self) -> None:
         self.in_flight = False
@@ -2320,16 +2439,120 @@ class EngineSessionManager:
             "reason": "exact_prefix_match" if exact else "prefix_divergence_at_token",
         }
 
+    def in_flight_session_ids(self) -> set[str]:
+        """Sessions whose generation slot is held right now.
+
+        Read without taking any slot: taking one here would turn a request
+        that arrives during a release into a 409 (named session) or a forked
+        session (implicit one). The slot's own flag and lock are the truth.
+        """
+
+        return {
+            session.session_id
+            for session in self._sessions_snapshot()
+            if session.in_flight or session._lock.locked()
+        }
+
+    def release_idle_sessions(
+        self,
+        target_bytes: int | None,
+        *,
+        keep_session_ids: Any = (),
+        protect_tokens: list[int] | tuple[int, ...] | None = None,
+        restore_identity: dict[str, Any] | None = None,
+        reason: str = "idle_session_release",
+    ) -> dict[str, Any]:
+        """Give back the memory of conversations that are not generating.
+
+        The bank holds the arrays (snapshots, live caches, leases); this
+        manager knows which sessions are generating. A coding agent's
+        compaction arrives as a new session while the conversation it
+        summarizes waits for the answer: that conversation is idle, and its
+        state is exactly the memory the compaction needs (the 2026-09-26
+        field report: 13 refusals in a row until a restart).
+        ``keep_session_ids`` adds the caller's incoming and in-flight
+        sessions to the ones generating now; the prompt's own restore
+        sources are kept by the bank (``SessionBank.restore_plan``).
+
+        Ownership: each session is evicted while this release holds its
+        generation slot (``EngineSession.begin_release_hold``), taken without
+        waiting; a session whose slot a request holds is skipped, whenever
+        that request arrived. A session with no record is evicted with the
+        registry locked, so a request creating its record waits until the
+        eviction is done. A released session's pending postcommit is
+        aborted (it would rebuild what was just freed). Its record stays:
+        the committed tokens serve canonicalization, token-splice recovery
+        and turn boundaries when the conversation comes back, and the
+        admission estimate reads the bank's coverage, not the record.
+        """
+
+        kept = {str(session_id) for session_id in (keep_session_ids or ()) if session_id}
+        kept |= self.in_flight_session_ids()
+        postcommits_aborted: list[str] = []
+
+        def hold(session_id: str):
+            self._lock.acquire()
+            session = self._sessions.get(session_id)
+            if session is None:
+                return self._lock.release
+            self._lock.release()
+            if not session.begin_release_hold():
+                return None
+            try:
+                if session.has_pending_postcommit():
+                    outcome = session.abort_pending_postcommit(reason)
+                    if outcome.get("aborted"):
+                        postcommits_aborted.append(session_id)
+            except BaseException:
+                session.end_release_hold()
+                raise
+            return session.end_release_hold
+
+        try:
+            receipt = self.bank.release_sessions(
+                target_bytes,
+                keep_session_ids=kept,
+                protect_tokens=protect_tokens,
+                restore_identity=restore_identity,
+                hold_session=hold,
+                reason=reason,
+            )
+        except QueuedPersistenceCancelError as exc:
+            # The release happened; a queued job it could not cancel still
+            # holds its entry. The caller gets the receipt and the failure.
+            if isinstance(exc.receipt, dict):
+                exc.receipt["postcommits_aborted"] = len(postcommits_aborted)
+                exc.receipt["kept_sessions"] = sorted(kept)
+            raise
+        receipt["postcommits_aborted"] = len(postcommits_aborted)
+        receipt["kept_sessions"] = sorted(kept)
+        return receipt
+
     def evict_stale(self) -> int:
+        """Drop the records (and bank entries) of sessions idle past their TTL.
+
+        Never a session whose slot is owned: each record is checked and
+        dropped under its own ``_release_guard``, the guard a request's
+        non-blocking acquire and a release hold take the slot and set the
+        flag under, and a slot taken by a waiting acquire whose flag has not
+        landed yet counts as owned (the review of 23a94abf: paused between
+        taking the slot and setting ``in_flight``, the record was dropped,
+        and the next request created and took a second one under the same
+        id: two held slots for one session).
+        """
+
         now = time.time()
+        stale_ids: list[str] = []
         with self._lock:
-            stale_ids = [
-                session_id
-                for session_id, session in self._sessions.items()
-                if session.is_stale(now_s=now) and not session.in_flight
-            ]
+            for session_id, session in list(self._sessions.items()):
+                if not session.is_stale(now_s=now):
+                    continue
+                with session._release_guard:
+                    if session.slot_in_use():
+                        continue
+                    self._sessions.pop(session_id, None)
+                stale_ids.append(session_id)
             for session_id in stale_ids:
-                self._sessions.pop(session_id, None)
                 self.bank.clear(session_id=session_id)
         return len(stale_ids)
 

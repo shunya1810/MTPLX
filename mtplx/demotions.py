@@ -55,7 +55,12 @@ KINDS: dict[str, str] = {
     ),
     "copy_round_eager": (
         "A copy-block round ran on the eager forward (the Flash-Next batched "
-        "lane has no compiled route for copy blocks)."
+        "lane compiles copy blocks only with MTPLX_FIXED_M4_COPY_WINDOWS=1, "
+        "and then only full-length blocks on a bucketed rows-gather bank)."
+    ),
+    "fixed_m4_copy_windows_retired": (
+        "Flash-Next compiled copy windows failed to dispatch on this GPU and "
+        "were retired to the eager forward for the life of the process."
     ),
     "compiled_verify_growth_demotion": (
         "A 27B verify round ran eager because the request outgrew the compiled "

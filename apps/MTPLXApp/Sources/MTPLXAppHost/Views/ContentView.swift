@@ -30,6 +30,7 @@ private struct ContentViewBackendSnapshot: Equatable {
     let modelPackUpdateStatus: String?
     let modelPackUpdateNeedsRestart: ModelUpdateInfo?
     let settingsRecoveryNotice: SettingsRecoveryNotice?
+    let configurationChangeFailure: String?
 
     @MainActor
     init(backend: MTPLXBackendStore, configuredModelFamily: String) {
@@ -53,6 +54,7 @@ private struct ContentViewBackendSnapshot: Equatable {
         modelPackUpdateStatus = backend.modelPackUpdateStatus
         modelPackUpdateNeedsRestart = backend.modelPackUpdateNeedsRestart
         settingsRecoveryNotice = backend.settingsRecoveryNotice
+        configurationChangeFailure = backend.configurationChangeFailure
     }
 }
 
@@ -236,6 +238,12 @@ struct ContentView: View {
                     if let notice = snapshot.settingsRecoveryNotice {
                         SettingsRecoveryBanner(notice: notice) {
                             backend.dismissSettingsRecoveryNotice()
+                        }
+                        .layoutPriority(2)
+                    }
+                    if let failure = snapshot.configurationChangeFailure {
+                        ConfigurationChangeFailureBanner(reason: failure) {
+                            backend.dismissConfigurationChangeFailure()
                         }
                         .layoutPriority(2)
                     }
@@ -490,6 +498,46 @@ private struct SettingsRecoveryBanner: View {
                 url.lastPathComponent
             )
         }
+    }
+}
+
+/// One-line, dismissable notice: a configuration change failed before its
+/// restart reached the running daemon, which keeps serving the previous
+/// configuration (#528). The engine badge stays about the engine; this
+/// says what happened to the change.
+private struct ConfigurationChangeFailureBanner: View {
+    let reason: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.callout)
+                .foregroundStyle(Brand.warning)
+            Text(message)
+                .font(.system(.callout, design: .monospaced))
+                .foregroundStyle(Brand.textHighlight)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .help(message)
+            Spacer(minLength: 8)
+            Button(tr("Dismiss"), action: onDismiss)
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Brand.warning.opacity(0.14))
+        .overlay(
+            Rectangle()
+                .fill(Brand.warning.opacity(0.35))
+                .frame(height: 0.5),
+            alignment: .bottom
+        )
+    }
+
+    private var message: String {
+        tr("The change could not be applied, so MTPLX is still running the previous settings: %@", reason)
     }
 }
 

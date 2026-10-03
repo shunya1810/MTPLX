@@ -742,22 +742,34 @@ def test_extend_pooled_fixed_uses_the_rowsel_form_when_armed(monkeypatch):
 
 
 def test_every_residual_write_site_goes_through_the_shared_helper():
-    """No copy of the two-kernel spelling may survive outside the helper."""
+    """No copy of the two-kernel spelling may survive outside the helper.
+
+    The attention-side write is handed to the MLP read (``pending``), which
+    folds it into the verify-width read's norm kernel or writes it through the
+    helper before reading; the MLP-side write stays in the layer (the stage-3
+    forwards write it in their combine tail kernel).
+    """
 
     import inspect
 
     from mtplx import qwen4_m4_stage3
 
     layer_source = inspect.getsource(qwen4_exp.DecoderLayer.__call__)
-    assert layer_source.count("_hyper_residual_write(hyper, block_out, inject)") == 2
+    assert layer_source.count("_hyper_residual_write(hyper, block_out, inject)") == 1
+    assert "pending=(block_out, inject)" in layer_source
     assert "inject[..., :, None]" not in layer_source
+
+    read_source = inspect.getsource(qwen4_exp.GatedResidual.__call__)
+    assert "_hyper_residual_write(hyper_input, *pending)" in read_source
+    assert "inject[..., :, None]" not in read_source
 
     for forward in (
         qwen4_m4_stage3._m4_routed_down_residual_tail_layer_forward,
         qwen4_m4_stage3._m4_paired_routed_glu_residual_tail_layer_forward,
     ):
         source = inspect.getsource(forward)
-        assert "_hyper_residual_write(hyper, block_out, inject)" in source
+        assert "pending=(block_out, inject)" in source
+        assert "_hyper_residual_write" not in source
         assert "inject[..., :, None]" not in source
 
 

@@ -161,12 +161,28 @@ def test_apply_user_config_preserves_explicit_forge_model_root(tmp_path):
     assert args.model_root == "/models/operation"
 
 
-def test_apply_user_config_ignores_legacy_optimized_speed_default(tmp_path):
+@pytest.mark.parametrize(
+    "configured,ignored",
+    [
+        # The default ids early `mtplx init` builds wrote: the old default,
+        # not a choice, so the command's own default applies.
+        ("mtplx/Qwen3.6-27B-MTPLX-GDN8-Speed4-CyanKiwiMTP", True),
+        ("Youssofal/Qwen3.6-27B-MTPLX-Optimized", True),
+        # MTPLX never wrote a path into config.toml, so a folder there is the
+        # user's whatever its name: the CLI's old built-in default folders,
+        # and a <publisher>/<repo> copy named after a retired id (#573).
+        ("models/Qwen3.6-27B-MTPLX-Optimized-Speed", False),
+        ("models/Qwen3.6-27B-MTPLX-GDN8-Speed4", False),
+        ("/Users/example/models/Qwen3.6-27B-MTPLX-Optimized-Speed", False),
+        ("~/models/Qwen3.6-27B-MTPLX-GDN8-Speed4", False),
+        ("/Users/example/AI/models/Youssofal/Qwen3.6-27B-MTPLX-Optimized", False),
+    ],
+)
+def test_apply_user_config_ignores_only_the_default_ids_old_init_builds_wrote(
+    tmp_path, configured, ignored
+):
     config = tmp_path / "config.toml"
-    config.write_text(
-        'model = "models/Qwen3.6-27B-MTPLX-Optimized-Speed"\n',
-        encoding="utf-8",
-    )
+    config.write_text(f'model = "{configured}"\n', encoding="utf-8")
     args = argparse.Namespace(
         command="quickstart",
         model=DEFAULT_HF_MODEL_ID,
@@ -177,7 +193,7 @@ def test_apply_user_config_ignores_legacy_optimized_speed_default(tmp_path):
 
     apply_user_config(args, config_path=config)
 
-    assert args.model == DEFAULT_HF_MODEL_ID
+    assert args.model == (DEFAULT_HF_MODEL_ID if ignored else configured)
 
 
 def test_apply_user_config_preserves_explicit_runtime_values(tmp_path):

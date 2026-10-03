@@ -387,9 +387,29 @@ def _fill_missing_deep(existing: dict[str, Any], defaults: dict[str, Any]) -> di
     return merged
 
 
+def _window_fields_written_by_mtplx(entry: dict[str, Any]) -> bool:
+    """Whether a model entry's ``contextWindow``/``maxTokens`` pair is MTPLX's.
+
+    MTPLX writes ``maxTokens`` equal to the window. Any other pair is a user
+    edit and survives every sync (#282). SYNC PAIR:
+    ``PiIntegration.windowFieldsWereWrittenByMTPLX``.
+    """
+
+    window = entry.get("contextWindow")
+    max_tokens = entry.get("maxTokens")
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in (window, max_tokens)
+    ):
+        return False
+    return window > 0 and max_tokens == window
+
+
 def merge_pi_provider_config(
     existing_provider: Any,
     fresh: dict[str, Any],
+    *,
+    refresh_window: bool = True,
 ) -> dict[str, Any]:
     """User-preserving merge of the MTPLX provider block (#282 clobber fix).
 
@@ -407,6 +427,9 @@ def merge_pi_provider_config(
     resolve the model dir"), a user-taught ``input`` survives like any other
     edit (#282): the user may proxy to a capable endpoint, and an engine
     "unknown" must never delete what a human wrote.
+
+    A ``contextWindow``/``maxTokens`` pair MTPLX wrote takes the fresh
+    window with ``refresh_window``; a pair the user edited stays theirs.
     """
 
     if not isinstance(existing_provider, dict):
@@ -475,6 +498,9 @@ def merge_pi_provider_config(
                 fresh_input = fresh_model.get("input")
                 if isinstance(fresh_input, list) and "image" in fresh_input:
                     merged_model["input"] = fresh_input
+                if refresh_window and _window_fields_written_by_mtplx(entry):
+                    merged_model["contextWindow"] = fresh_model.get("contextWindow")
+                    merged_model["maxTokens"] = fresh_model.get("maxTokens")
                 result_models[index] = merged_model
                 break
         else:
@@ -488,6 +514,7 @@ def merge_pi_models_config(
     *,
     provider_config: dict[str, Any],
     provider_id: str = PI_PROVIDER_ID,
+    refresh_window: bool = True,
 ) -> dict[str, Any]:
     """Merge or create a Pi ``models.json`` payload.
 
@@ -505,9 +532,105 @@ def merge_pi_models_config(
     providers[str(provider_id)] = merge_pi_provider_config(
         providers.get(str(provider_id)),
         provider_config,
+        refresh_window=refresh_window,
     )
     payload["providers"] = providers
     return payload
+
+
+def _write_models_json(
+    config_path: Path, existing: dict[str, Any] | None, merged: dict[str, Any]
+) -> tuple[bool, Path | None]:
+    """Write ``merged`` unless it equals ``existing``; return (written, backup).
+
+    Unchanged content leaves the file exactly as the user wrote it. A
+    rewrite keeps the previous file next to it.
+    """
+
+    written = existing is None or merged != existing
+    backup_path: Path | None = None
+    if written:
+        if existing is not None:
+            backup_path = _unique_backup(config_path, "before-mtplx")
+            shutil.copy2(config_path, backup_path)
+        config_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+    try:
+        config_path.chmod(0o600)
+    except OSError:
+        pass
+    return written, backup_path
+
+
+def pi_lists_model(
+    model_id: str,
+    *,
+    path: str | Path | None = None,
+    provider_id: str = PI_PROVIDER_ID,
+) -> bool:
+    """Whether Pi's config lists ``model_id`` under MTPLX's provider.
+
+    Raises ``InvalidConfigFile`` for a file Pi could not read either.
+    """
+
+    config_path = pi_models_json_path(path)
+    if not config_path.exists():
+        return False
+    existing, _existing_text = load_config_file(config_path)
+    providers = existing.get("providers")
+    provider = providers.get(provider_id) if isinstance(providers, dict) else None
+    models = provider.get("models") if isinstance(provider, dict) else None
+    return isinstance(models, list) and any(
+        isinstance(entry, dict) and str(entry.get("id")) == str(model_id)
+        for entry in models
+    )
+
+
+def refresh_pi_models_window(
+    model_id: str,
+    window: int,
+    *,
+    path: str | Path | None = None,
+    provider_id: str = PI_PROVIDER_ID,
+) -> dict[str, Any]:
+    """Give MTPLX's own Pi entry for ``model_id`` the window the server serves.
+
+    That window (``served_execution_window``) exists only once the model is
+    loaded, so the CLI's Pi handoff calls this after startup, as the app
+    re-syncs Pi once its daemon answers. Only a pair MTPLX wrote changes;
+    the entry's other fields, other models and a pair the user edited stay.
+    """
+
+    config_path = pi_models_json_path(path)
+    result: dict[str, Any] = {
+        "config_path": str(config_path),
+        "context_window": int(window),
+        "written": False,
+        "backup_path": None,
+    }
+    if int(window) <= 0 or not config_path.exists():
+        return result
+    existing, _existing_text = load_config_file(config_path)
+    providers = existing.get("providers")
+    provider = providers.get(provider_id) if isinstance(providers, dict) else None
+    models = provider.get("models") if isinstance(provider, dict) else None
+    if not isinstance(models, list):
+        return result
+    refreshed = [
+        {**entry, "contextWindow": int(window), "maxTokens": int(window)}
+        if isinstance(entry, dict)
+        and str(entry.get("id")) == str(model_id)
+        and _window_fields_written_by_mtplx(entry)
+        else entry
+        for entry in models
+    ]
+    merged = {
+        **existing,
+        "providers": {**providers, provider_id: {**provider, "models": refreshed}},
+    }
+    written, backup_path = _write_models_json(config_path, existing, merged)
+    result["written"] = written
+    result["backup_path"] = str(backup_path) if backup_path is not None else None
+    return result
 
 
 def write_pi_models_config(
@@ -521,11 +644,17 @@ def write_pi_models_config(
     context_window: int = PI_DEFAULT_CONTEXT_WINDOW,
     max_tokens: int | None = PI_DEFAULT_MAX_TOKENS,
     vision: bool = False,
+    keep_window: bool = False,
 ) -> dict[str, Any]:
-    """Write the MTPLX provider into Pi's config and return a handoff payload."""
+    """Write the MTPLX provider into Pi's config and return a handoff payload.
+
+    ``keep_window`` leaves the window of an existing MTPLX entry alone: the
+    write before the server starts has only a guess at the window, and the
+    handoff then brings it to the served one (``refresh_pi_models_window``),
+    so a launch never rewrites it twice.
+    """
 
     config_path = pi_models_json_path(path)
-    backup_path: Path | None = None
     existing: dict[str, Any] | None = None
     if config_path.exists():
         # Pi strips // comments and trailing commas from models.json, so MTPLX
@@ -547,20 +676,19 @@ def write_pi_models_config(
         existing,
         provider_config=provider_config,
         provider_id=provider_id,
+        refresh_window=not keep_window,
     )
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    # Unchanged content leaves the file exactly as the user wrote it. A
-    # rewrite keeps the previous file next to it and reports the copy's path.
-    written = existing is None or merged != existing
-    if written:
-        if existing is not None:
-            backup_path = _unique_backup(config_path, "before-mtplx")
-            shutil.copy2(config_path, backup_path)
-        config_path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
-    try:
-        config_path.chmod(0o600)
-    except OSError:
-        pass
+    written, backup_path = _write_models_json(config_path, existing, merged)
+    # With keep_window the file may keep another window than the one passed.
+    written_window = next(
+        (
+            entry.get("contextWindow")
+            for entry in merged["providers"][str(provider_id)].get("models") or []
+            if isinstance(entry, dict) and str(entry.get("id")) == str(model_id)
+        ),
+        None,
+    )
     request_policy_extension_path = write_pi_request_policy_extension(
         model_id=model_id,
         uncapped=max_tokens is None,
@@ -577,7 +705,9 @@ def write_pi_models_config(
         "model_ref": pi_model_ref(model_id, provider_id=provider_id),
         "launch_command": pi_launch_command(model_id, provider_id=provider_id),
         "api_key": api_key,
-        "context_window": int(context_window),
+        "context_window": (
+            written_window if isinstance(written_window, int) else int(context_window)
+        ),
         "max_tokens": None if max_tokens is None else int(max_tokens),
         "no_hidden_max_tokens": max_tokens is None,
         "request_policy_extension_path": str(request_policy_extension_path),

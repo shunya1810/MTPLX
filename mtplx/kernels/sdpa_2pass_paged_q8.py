@@ -1,7 +1,11 @@
 """Two-pass paged SDPA reading q8-quantized KV pages directly.
 
+Wired as the q8 kv_quant decode route (cache_state
+VllmMetalPagedKVCache._kv_quant_2pass_attention), where the alternative is the
+dequant fallback rather than the dense kernel the verdict below measured.
+
 CLOSED LANE (2026-06-12, [CONFIDENT DOES NOT WORK as a kernel-variant
-family]): kept as evidence, NOT wired into any dispatch. Three numerically
+family]) as a replacement for the dense kernel. Three numerically
 verified variants (per-token scales, char4-vectorized loads, per-page
 scales) all measured ~0.8x vs the dense two-pass kernel at the target
 8k-32k contexts on M5 (short-context 1k reached 1.72x with vectorization,
@@ -27,6 +31,7 @@ from .sdpa_2pass_paged import (  # reuse the proven pieces
     _compute_blocks,
     _paged_reduce_kernel,
     sdpa_2pass_paged_tail,
+    unnormalized_partials_dtype,
 )
 
 
@@ -125,8 +130,10 @@ def _paged_partials_kernel_q8():
             sums[0] = sum_exp_score;
             maxs[0] = max_score;
         }
+        // PartT, not InT: o[] is not yet divided by sum_exp_score
+        // (see sdpa_2pass.unnormalized_partials_dtype).
         for (int i = 0; i < v_per_thread; ++i) {
-            partials[i] = static_cast<InT>(o[i]);
+            partials[i] = static_cast<PartT>(o[i]);
         }
     """
     return mx.fast.metal_kernel(
@@ -203,6 +210,7 @@ def sdpa_2pass_paged_q8_tail(
 
     partial_shape = (int(bsz), int(hq), int(q_len), int(blocks), int(vdim))
     stats_shape = (int(bsz), int(hq), int(q_len), int(blocks))
+    partial_dtype = unnormalized_partials_dtype(queries.dtype)
     partials, sums, maxs = kernel(
         inputs=[
             queries,
@@ -216,6 +224,7 @@ def sdpa_2pass_paged_q8_tail(
         ],
         template=[
             ("InT", queries.dtype),
+            ("PartT", partial_dtype),
             ("D", int(d)),
             ("V", int(vdim)),
             ("Hk", int(hk)),
@@ -224,7 +233,7 @@ def sdpa_2pass_paged_q8_tail(
         grid=(hk * 32, int(bsz) * gqa_factor, int(blocks) * int(q_len)),
         threadgroup=(32, gqa_factor, int(q_len)),
         output_shapes=[partial_shape, stats_shape, stats_shape],
-        output_dtypes=[queries.dtype, mx.float32, mx.float32],
+        output_dtypes=[partial_dtype, mx.float32, mx.float32],
     )
     (out,) = reduce_kernel(
         inputs=[partials, sums, maxs, int(blocks)],

@@ -2,9 +2,10 @@
 
 The server reserves at most 16,384 new tokens of pages up front; a thinking-on
 decode past that wrote beyond the adapter's fixed capacity and produced
-non-finite logits (2026-10-01). ``grow_to`` extends every layout zero-filled
-and block-aligned, and writes after the growth must land exactly where a cache
-that had the room from the start puts them.
+non-finite logits (2026-10-01). Upstream 2.12.1 (#526) grows promoted adapters
+through ``ensure_capacity``; these cases keep the M1 token-major quantized
+``pages`` layout covered: writes after the growth must land exactly where a
+cache that had the room from the start puts them.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ def _adapter(paged: VllmMetalPagedKVCache, bits: int | None):
 def test_grow_then_write_matches_a_cache_that_had_the_room(bits, pages, monkeypatch):
     monkeypatch.setenv("MTPLX_KV_QUANT_PAGES_ADAPTER", pages)
     monkeypatch.setenv("MTPLX_GQA_MMA", "1")
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
     first_k, first_v = _kv(100, 1)
     more_k, more_v = _kv(60, 3)
 
@@ -52,7 +54,7 @@ def test_grow_then_write_matches_a_cache_that_had_the_room(bits, pages, monkeypa
     adapter = _adapter(small, bits)
     assert adapter.capacity == 128
 
-    assert adapter.grow_to(160 + 512)
+    assert adapter.ensure_capacity(160 + 512)
     assert adapter.capacity >= 672 and adapter.capacity % 16 == 0
     adapter.update_without_fetch(more_k, more_v)
     mx.eval(adapter.cache)
@@ -69,11 +71,12 @@ def test_grow_then_write_matches_a_cache_that_had_the_room(bits, pages, monkeypa
     assert mx.array_equal(got_v, want_v).item()
 
 
-def test_grow_to_is_a_no_op_within_capacity():
+def test_ensure_capacity_is_a_no_op_within_capacity(monkeypatch):
+    monkeypatch.setenv("MTPLX_DYNAMIC_PAGED_KV", "1")
     paged = _paged(8, None)
     paged.update_and_fetch(*_kv(10, 5))
     adapter = _adapter(paged, None)
     before = [leaf for leaf in adapter.cache[:2]]
-    assert adapter.grow_to(64)
+    assert adapter.ensure_capacity(64)
     assert adapter.capacity == 128
     assert all(a is b for a, b in zip(before, adapter.cache[:2]))

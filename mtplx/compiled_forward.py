@@ -31,7 +31,8 @@ from typing import Any, Callable
 
 import mlx.core as mx
 
-from mtplx.compile_state import compile_trace
+from mtplx.attention_context import compiled_dispatch
+from mtplx.compile_state import compile_trace, compiled_step_body
 from mtplx.graphbank import TensorOffsetKVCache
 
 # Engagement proof: incremented every time the compiled forward actually runs, so
@@ -110,7 +111,8 @@ class CompiledARForward:
                 caches[i].cache[0] = state[3 * i]
                 caches[i].cache[1] = state[3 * i + 1]
                 caches[i].cache[2] = state[3 * i + 2]
-            logits = model(input_ids, cache=caches)
+            with compiled_step_body():
+                logits = model(input_ids, cache=caches)
             out: list[mx.array] = []
             for i in range(n):
                 out.append(caches[i].cache[0])
@@ -127,7 +129,9 @@ class CompiledARForward:
             # Mark the trace so the model forward suppresses its per-layer
             # async_eval submit cadence (illegal inside a graph transformation,
             # and obsolete once the whole forward is one traced submission).
-            with compile_trace():
+            with compile_trace(), compiled_dispatch(
+                (id(self._compiled), tuple(getattr(input_ids, "shape", ())))
+            ):
                 result = self._compiled(input_ids, *self._state)  # type: ignore[misc]
         except Exception:
             # The trace fires on the first call; a host-sync buried in the model

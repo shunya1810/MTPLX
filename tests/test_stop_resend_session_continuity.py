@@ -285,6 +285,10 @@ def _three_turns(monkeypatch, *, resend_session: str, release_before_resend: boo
     _install(monkeypatch, engine)
     with TestClient(create_app(state)) as client:
         _chat(client, CONVERSATION, _messages(U1))
+        # A named session's stream ends at its last token and commits after
+        # it (aed64295): read the session once that commit landed, as the
+        # next request of the session does.
+        state.sessions.peek(CONVERSATION).wait_for_response_tail(10.0)
         committed = tuple(state.sessions.peek(CONVERSATION).committed_token_ids)
         _stop_mid_stream(monkeypatch, client, engine)
         if release_before_resend:

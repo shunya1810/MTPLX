@@ -44,6 +44,12 @@ def test_loads_reports_errors_at_positions_in_the_original_text():
     assert excinfo.value.lineno == 5
 
 
+def test_loads_accepts_a_byte_order_mark_as_pi_does():
+    # Pi 0.85.1 strips a BOM from models.json before parsing it.
+    assert jsonc.loads("\ufeff" + '{"providers": {}, // note\n}') == {"providers": {}}
+    assert jsonc.loads("\ufeff{}") == {}
+
+
 def test_loads_rejects_what_no_lenient_reader_accepts():
     for text in ("{bad json", "{'single': 'quotes'}", '{"a": 1 "b": 2}', ""):
         with pytest.raises(json.JSONDecodeError):

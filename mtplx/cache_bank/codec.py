@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -49,6 +49,13 @@ class EncodedPayload:
     spec: dict[str, Any]
     tensors: dict[str, bytes]
     nbytes: int
+    # Incremental encode (MTPLX_SSD_INCREMENTAL_ENCODE): tensor names whose
+    # bytes were not captured because the tier already holds an identical
+    # blob ({"sha256", "nbytes"}), and the content key of every
+    # fingerprinted name, for the tier's per-session block memo.
+    reused: dict[str, dict[str, Any]] = field(default_factory=dict)
+    reused_nbytes: int = 0
+    fingerprints: dict[str, tuple] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -88,6 +95,60 @@ class ColdEncodeInterrupted(RuntimeError):
 # milliseconds of copy on any Apple Silicon Mac.
 DEFAULT_ENCODE_UNIT_BYTES = 32 * 1024 * 1024
 
+# Incremental encode: tensors below this size are always captured whole (a
+# fingerprint pass costs about as much as their copy). KV blocks are keyed
+# per 256-token block regardless of size.
+INCREMENTAL_WHOLE_TENSOR_MIN_BYTES = 1024 * 1024
+
+_UINT_VIEW_BY_ITEMSIZE: dict[int, Any] = {1: mx.uint8, 2: mx.uint16, 4: mx.uint32}
+
+
+def content_fingerprints(value: Any, *, rows: int | None = None) -> list[int] | None:
+    """64-bit content fingerprints of a tensor, computed on the GPU.
+
+    With ``rows`` set, one fingerprint per consecutive ``rows``-slice along
+    axis 2 (only full slices; the caller passes the full-block prefix);
+    without it, one fingerprint for the whole tensor. The fingerprint reads
+    the raw bits (an unsigned view, so -0.0/+0.0 and NaN payloads differ)
+    and folds them into two position-weighted sums modulo 2**32: one linear,
+    one over the squared bits. Integer arithmetic makes it exact and
+    order-independent; a single changed element always changes the linear
+    sum (odd weights). Returns None for dtypes without a same-size unsigned
+    view (e.g. 8-byte types), which then take the normal copy path.
+    """
+    view_dtype = _UINT_VIEW_BY_ITEMSIZE.get(int(value.dtype.size))
+    if view_dtype is None:
+        return None
+    shape = [int(dim) for dim in value.shape]
+    if rows is None:
+        blocks = 1
+        flat = value.reshape(1, -1)
+    else:
+        if len(shape) < 3 or rows <= 0 or shape[2] % rows:
+            return None
+        blocks = shape[2] // rows
+        if blocks == 0:
+            return []
+        inner = rows
+        for dim in shape[3:]:
+            inner *= dim
+        flat = value.reshape(shape[0], shape[1], blocks, inner)
+        flat = flat.transpose(2, 0, 1, 3).reshape(blocks, -1)
+    bits = flat.view(view_dtype).astype(mx.uint32)
+    width = int(bits.shape[1])
+    index = mx.arange(width, dtype=mx.uint32)
+    weight_a = (index * mx.array(0x9E3779B1, dtype=mx.uint32)
+                + mx.array(0x7F4A7C15, dtype=mx.uint32)) | mx.array(1, dtype=mx.uint32)
+    weight_b = (index * mx.array(0x85EBCA6B, dtype=mx.uint32)
+                + mx.array(0xC2B2AE35, dtype=mx.uint32)) | mx.array(1, dtype=mx.uint32)
+    sum_a = mx.sum(bits * weight_a, axis=1)
+    sum_b = mx.sum((bits * bits) * weight_b, axis=1)
+    mx.eval(sum_a, sum_b)
+    return [
+        ((int(a) & 0xFFFFFFFF) << 32) | (int(b) & 0xFFFFFFFF)
+        for a, b in zip(sum_a.tolist(), sum_b.tolist())
+    ]
+
 
 class TreeCodec:
     """Flatten JSON-safe trees plus MLX arrays into raw tensor blobs."""
@@ -99,8 +160,17 @@ class TreeCodec:
         should_abort: Callable[[], bool] | None = None,
         unit_bytes: int | None = None,
         on_unit: Callable[[str, float, int], None] | None = None,
+        reuse: dict[tuple, dict[str, Any]] | None = None,
     ) -> None:
         self._next_tensor_id = 0
+        # Incremental encode (opt-in): None keeps the legacy full capture.
+        # A dict (possibly empty) maps a content key (dtype, shape, block
+        # start, fingerprint) to a blob the tier already holds; matching
+        # blocks are referenced instead of evaluated, copied and hashed,
+        # and every fingerprinted name is recorded for the next memo.
+        self.reuse = reuse
+        self.reused: dict[str, dict[str, Any]] = {}
+        self.fingerprints: dict[str, tuple] = {}
         self.tensors: dict[str, bytes] = {}
         self.block_size = max(1, int(block_size))
         self.should_abort = should_abort
@@ -132,6 +202,24 @@ class TreeCodec:
                 pass
         self._check_abort()
         return raw
+
+    def _fingerprints(self, value: Any, *, rows: int | None) -> list[int] | None:
+        """One bounded unit like _materialize: a single GPU reduction over
+        ``value``, reported to on_unit, followed by the abort check."""
+        started = time.perf_counter()
+        fps = content_fingerprints(value, rows=rows)
+        observer = self.on_unit
+        if observer is not None:
+            try:
+                observer(
+                    "fingerprint",
+                    time.perf_counter() - started,
+                    int(getattr(value, "nbytes", 0) or 0),
+                )
+            except Exception:
+                pass
+        self._check_abort()
+        return fps
 
     def _check_abort(self) -> None:
         check = self.should_abort
@@ -186,6 +274,25 @@ class TreeCodec:
             return self._encode_tensor_blocks(value, dtype=dtype, shape=shape)
         name = f"tensor_{self._next_tensor_id:08d}"
         self._next_tensor_id += 1
+        if (
+            self.reuse is not None
+            and int(getattr(value, "nbytes", 0) or 0)
+            >= INCREMENTAL_WHOLE_TENSOR_MIN_BYTES
+        ):
+            fps = self._fingerprints(value, rows=None)
+            if fps:
+                key = (dtype, tuple(shape), -1, fps[0])
+                self.fingerprints[name] = key
+                hit = self.reuse.get(key)
+                if hit is not None:
+                    self.reused[name] = dict(hit)
+                    return {
+                        "kind": "tensor",
+                        "name": name,
+                        "dtype": dtype,
+                        "shape": list(shape),
+                        "nbytes": int(hit["nbytes"]),
+                    }
         raw = self._tensor_bytes(value, shape)
         self.tensors[name] = raw
         return {
@@ -229,6 +336,15 @@ class TreeCodec:
         axis = 2
         blocks: list[dict[str, Any]] = []
         total = 0
+        block_fps: list[int] | None = None
+        if self.reuse is not None:
+            full = (shape[axis] // self.block_size) * self.block_size
+            if full:
+                slices = [slice(None)] * len(shape)
+                slices[axis] = slice(0, full)
+                block_fps = self._fingerprints(
+                    value[tuple(slices)], rows=self.block_size
+                )
         for start in range(0, shape[axis], self.block_size):
             # No check here: _encode_tensor checked before the first block and
             # _materialize checks after every block.
@@ -236,9 +352,29 @@ class TreeCodec:
             slices = [slice(None)] * len(shape)
             slices[axis] = slice(start, end)
             chunk = value[tuple(slices)]
-            raw = self._materialize("block", chunk)
             name = f"tensor_{self._next_tensor_id:08d}"
             self._next_tensor_id += 1
+            block_index = start // self.block_size
+            if block_fps is not None and block_index < len(block_fps):
+                chunk_shape = [int(dim) for dim in chunk.shape]
+                key = (dtype, tuple(chunk_shape), int(start), block_fps[block_index])
+                self.fingerprints[name] = key
+                hit = self.reuse.get(key) if self.reuse is not None else None
+                if hit is not None:
+                    nbytes = int(hit["nbytes"])
+                    self.reused[name] = dict(hit)
+                    total += nbytes
+                    blocks.append(
+                        {
+                            "name": name,
+                            "start": int(start),
+                            "end": int(end),
+                            "shape": chunk_shape,
+                            "nbytes": nbytes,
+                        }
+                    )
+                    continue
+            raw = self._materialize("block", chunk)
             self.tensors[name] = raw
             total += len(raw)
             blocks.append(
@@ -350,12 +486,14 @@ def encode_payload(
     should_abort: Callable[[], bool] | None = None,
     unit_bytes: int | None = None,
     on_unit: Callable[[str, float, int], None] | None = None,
+    reuse: dict[tuple, dict[str, Any]] | None = None,
 ) -> EncodedPayload:
     codec = TreeCodec(
         block_size=block_size,
         should_abort=should_abort,
         unit_bytes=unit_bytes,
         on_unit=on_unit,
+        reuse=reuse,
     )
     spec = build_payload_spec(
         codec,
@@ -370,6 +508,9 @@ def encode_payload(
         spec=spec,
         tensors=dict(codec.tensors),
         nbytes=sum(len(raw) for raw in codec.tensors.values()),
+        reused=dict(codec.reused),
+        reused_nbytes=sum(int(blob["nbytes"]) for blob in codec.reused.values()),
+        fingerprints=dict(codec.fingerprints),
     )
 
 
@@ -510,28 +651,38 @@ def decode_payload_prefix(
     return decoded
 
 
+def _collect_arrays(value: Any, arrays: list[Any]) -> None:
+    if isinstance(value, mx.array):
+        arrays.append(value)
+    elif isinstance(value, CacheSnapshot):
+        _collect_arrays(value.states, arrays)
+        _collect_arrays(value.meta_states, arrays)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _collect_arrays(item, arrays)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _collect_arrays(item, arrays)
+
+
 def _eval_decoded_arrays(decoded: DecodedPayload) -> None:
-    """Single batched evaluation of every decoded array (vs per-tensor eval)."""
+    """Single batched evaluation of every decoded array (vs per-tensor eval).
+
+    The walker is a module function, never a closure that calls itself: such
+    a closure is a reference cycle, and its list held every decoded tensor
+    until the cyclic collector next ran. A candidate the caller rejected
+    stayed resident through the cold prefill that followed (2026-10-01: a
+    4.17 GB decode still active a second after its last reference went).
+    """
     arrays: list[Any] = []
-
-    def collect(value: Any) -> None:
-        if isinstance(value, mx.array):
-            arrays.append(value)
-        elif isinstance(value, CacheSnapshot):
-            collect(value.states)
-            collect(value.meta_states)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                collect(item)
-        elif isinstance(value, dict):
-            for item in value.values():
-                collect(item)
-
-    collect(decoded.cache_snapshot)
-    collect(decoded.logits)
-    collect(decoded.hidden)
-    collect(decoded.mtp_history_snapshot)
-    collect(decoded.gdn_boundaries)
+    for part in (
+        decoded.cache_snapshot,
+        decoded.logits,
+        decoded.hidden,
+        decoded.mtp_history_snapshot,
+        decoded.gdn_boundaries,
+    ):
+        _collect_arrays(part, arrays)
     if arrays:
         mx.eval(*arrays)
 
@@ -557,16 +708,6 @@ def decode_gdn_boundaries(
     interrupted.
     """
 
-    def collect(value: Any, arrays: list[Any]) -> None:
-        if isinstance(value, mx.array):
-            arrays.append(value)
-        elif isinstance(value, CacheSnapshot):
-            collect(value.states, arrays)
-            collect(value.meta_states, arrays)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                collect(item, arrays)
-
     def interrupted() -> bool:
         if should_abort is None:
             return False
@@ -588,7 +729,7 @@ def decode_gdn_boundaries(
             decode_tree(record.get("hidden_last") or {"kind": "none"}, read_tensor),
         )
         arrays: list[Any] = []
-        collect(decoded, arrays)
+        _collect_arrays(decoded, arrays)
         if arrays:
             mx.eval(*arrays)
         boundaries.append(decoded)

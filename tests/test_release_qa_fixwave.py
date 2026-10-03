@@ -124,7 +124,10 @@ def test_opencode_override_ignores_env_only_hint():
 
 
 def test_auto_clear_client_ignores_env_label(monkeypatch):
-    monkeypatch.setenv("MTPLX_CLEAR_CACHE_AFTER_REQUEST", "auto")
+    # The client-restricted mode must not trust a label: "auto" now clears
+    # after every request (tests/test_working_set.py), so the label check
+    # lives on the "aime" mode.
+    monkeypatch.setenv("MTPLX_CLEAR_CACHE_AFTER_REQUEST", "aime")
     result = srv._auto_clear_mlx_cache_after_completed_request(
         SimpleNamespace(),
         session_id=None,

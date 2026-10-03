@@ -3,6 +3,7 @@ import uPlot from "uplot";
 import { Card } from "./Card";
 import { usePrefillHistory } from "../hooks/usePolling";
 import { fmtTokS } from "../lib/utils";
+import { autoAxisSize } from "../lib/uplotAxis";
 
 export function PrefillTPSSparkline() {
   const { data } = usePrefillHistory();
@@ -45,6 +46,7 @@ export function PrefillTPSSparkline() {
         {
           stroke: "rgba(200,210,220,0.4)",
           values: (_self, ticks) => ticks.map((t) => `${t.toFixed(0)}`),
+          size: autoAxisSize,
         },
       ],
       legend: { show: false },

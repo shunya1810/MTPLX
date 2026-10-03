@@ -157,12 +157,12 @@ def test_download_disk_rule_is_the_mtplx_pull_rule_in_python_and_swift(monkeypat
     monkeypatch.setattr(hf_loader.shutil, "disk_usage", lambda _root: SimpleNamespace(free=required))
     hf_loader._require_download_disk_headroom(tmp_path, total_bytes=quality.size_bytes, started_size_bytes=0)
 
-@pytest.mark.parametrize("name,ram,catalog_id,follows_default", [
-    ("Bonsai-3.8-27B-MTPLX-Optimized-Speed", 16, "bonsai-2-27b-optimized-speed", True),
+@pytest.mark.parametrize("name,ram,catalog_id", [
+    ("Bonsai-3.8-27B-MTPLX-Optimized-Speed", 16, "bonsai-2-27b-optimized-speed"),
     # 128 GiB Macs run this pack by choice; it must not be swapped for the 27B.
-    ("Qwen3.8-Flash-Next-MTPLX-Optimized-Speed", 256, "flash-next-optimized-speed", False),
+    ("Qwen3.8-Flash-Next-MTPLX-Optimized-Speed", 256, "flash-next-optimized-speed"),
 ])
-def test_default_reuses_complete_library_pack(name, ram, catalog_id, follows_default, monkeypatch, tmp_path):
+def test_default_reuses_complete_library_pack(name, ram, catalog_id, monkeypatch, tmp_path):
     from mtplx.default_models import is_verified_default_model_ref, select_default_model
     root = tmp_path / "library"
     pack = root / name
@@ -174,7 +174,9 @@ def test_default_reuses_complete_library_pack(name, ram, catalog_id, follows_def
     selection = select_default_model(hardware={"apple_silicon_generation": "m5", "memory_gib": ram})
     assert selection.model == str(pack)
     assert catalog_model_matching(selection.hf_model).id == catalog_id
-    assert is_verified_default_model_ref(pack) is follows_default
+    # Even the default's own copy is not "the default" by its folder alone:
+    # start setup records a default pick, so a folder never gets swapped (#573).
+    assert not is_verified_default_model_ref(pack)
     assert not is_verified_default_model_ref(catalog_model_with_id("flash-next-optimized-quality").hf_model_id)
 
 @pytest.mark.parametrize("catalog_id,family", NEW_MODELS)

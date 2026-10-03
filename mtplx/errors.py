@@ -84,3 +84,36 @@ class IntegrationError(MTPLXError):
             command=command,
         )
 
+
+
+# Allocation failures the daemon must survive as per-request errors. MLX's
+# Metal allocator raises plain RuntimeErrors ("[metal::malloc] ... maximum
+# allowed buffer size", "Insufficient Memory",
+# kIOGPUCommandBufferCallbackErrorOutOfMemory); before 2.9.4 these reached
+# clients as anonymous internal_error 500s with no cache shed, so the very
+# next request hit the same wall (#348).
+_ALLOCATION_FAILURE_MARKERS = (
+    "insufficient memory",
+    "out of memory",
+    "failed to allocate",
+    "kiogpucommandbuffercallbackerroroutofmemory",
+    "metal::malloc",
+    "maximum allowed buffer size",
+)
+
+
+def is_allocation_failure(exc: BaseException) -> bool:
+    """Whether ``exc`` is the memory refusing an allocation.
+
+    The server answers such a request with a memory error instead of an
+    internal one, and an optional allocation (a faster route's buffers) falls
+    back to the path that needs none. Anything else, a cancellation or a
+    programming error, is not one.
+    """
+
+    if isinstance(exc, MemoryError):
+        return True
+    if not isinstance(exc, (RuntimeError, OSError)):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _ALLOCATION_FAILURE_MARKERS)

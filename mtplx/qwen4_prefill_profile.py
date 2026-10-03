@@ -207,7 +207,18 @@ def install() -> bool:
             _INSTALLED = True
             return True
 
-    family.GatedResidual.__call__ = _timed("hc_read", family.GatedResidual.__call__, 1)
+    timed_read = _timed("hc_read", family.GatedResidual.__call__, 1)
+
+    def read_after_write(self, hyper_input, pending=None):
+        # At profiled widths a residual write handed to the read is timed as
+        # the write it is, so hc_read and hc_write keep their meaning; below
+        # the row gate it rides into the read untouched.
+        if pending is not None and _rows_of(hyper_input) >= _min_rows():
+            hyper_input = family._hyper_residual_write(hyper_input, *pending)
+            pending = None
+        return timed_read(self, hyper_input, pending=pending)
+
+    family.GatedResidual.__call__ = read_after_write
     family._hyper_residual_write = _timed("hc_write", family._hyper_residual_write, 0)
     family.GatedDeltaNet.__call__ = _timed("gdn", family.GatedDeltaNet.__call__, 1)
     family.Attention.__call__ = _timed("qsa_attention", family.Attention.__call__, 1)

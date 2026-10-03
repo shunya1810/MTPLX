@@ -2043,6 +2043,38 @@ def _fake_streaming_session_state():
     return state
 
 
+@pytest.fixture(params=["before_commit", "after_commit"])
+def terminal_frame(request, monkeypatch):
+    """Both orders of a named session's streamed turn: the terminal frame at
+    the last token with the commit after it (the default), and the frame
+    after the commit (MTPLX_STREAM_TERMINAL_FRAME_BEFORE_COMMIT=0)."""
+    monkeypatch.setenv(
+        "MTPLX_STREAM_TERMINAL_FRAME_BEFORE_COMMIT",
+        "1" if request.param == "before_commit" else "0",
+    )
+    return request.param
+
+
+def _stream_commit_outcome(state, session_id, response_text, terminal_frame):
+    """A finished streamed turn's session-commit outcome, read where it lands:
+    the terminal frame's stats when the frame waited for the commit, else the
+    session's response tail once the commit that ran after the frame landed
+    (the frame then says ``after_response``)."""
+    if terminal_frame == "after_commit":
+        final = [
+            payload
+            for payload in _stream_payloads(response_text)
+            if payload.get("choices") and payload["choices"][0].get("finish_reason")
+        ]
+        return final[-1]["mtplx_stats"]
+    assert '"mode": "after_response"' in response_text
+    session = state.sessions.peek(session_id)
+    assert session is not None
+    session.wait_for_response_tail(5.0)
+    assert session.last_response_tail is not None
+    return session.last_response_tail
+
+
 def _fake_final_state(tokens):
     return SimpleNamespace(
         final_trunk_cache=["cache"],
@@ -3010,7 +3042,7 @@ def test_completions_prompt_scoring_contract(monkeypatch):
     state = _prompt_scoring_state()
     prompt = "abcd"  # CaptureTokenizer: 1 char = 1 token (ords)
 
-    def fake_score(runtime, prompt_ids, *, top_k):
+    def fake_score(runtime, prompt_ids, *, top_k, abort_check=None, prefill_callback=None):
         n = len(prompt_ids)
         positions = [
             [(prompt_ids[i + 1], -0.1), (prompt_ids[0], -2.0)]
@@ -3117,8 +3149,8 @@ def test_completions_prompt_scoring_top_k_capped(monkeypatch):
 )
 def test_chat_completions_rejects_logprobs_with_clear_400(body_extra):
     """logprobs used to be swallowed by extra="allow" and silently ignored;
-    clients read the missing data as model behavior. Interim contract: a
-    clean 400 until logprob support ships."""
+    clients read the missing data as model behavior. Logprobs are served for
+    max_tokens=1 only, so these shapes stay a clean 400."""
 
     client = TestClient(create_app(_fake_state()))
 
@@ -3691,7 +3723,7 @@ def test_opencode_short_context_depth_policy_reports_decision():
 
 
 def test_streaming_session_uses_generation_final_postcommit_without_retokenized_tail(
-    monkeypatch,
+    monkeypatch, terminal_frame
 ):
     state = _fake_streaming_session_state()
     captured: dict[str, object] = {"batch_keys": []}
@@ -3808,8 +3840,13 @@ def test_streaming_session_uses_generation_final_postcommit_without_retokenized_
     assert '"content": "OK"' in response_text or (
         '"content": "O"' in response_text and '"content": "K"' in response_text
     )
-    assert '"mode": "generation_final_exact"' in response_text
+    outcome = _stream_commit_outcome(
+        state, "stream-session", response_text, terminal_frame
+    )
+    assert outcome["session_postcommit_snapshot"]["mode"] == "generation_final_exact"
     assert captured["commit_final_state_to_bank"] is False
+    # With the frame first, the second turn still reads the session only
+    # after this turn's commit landed.
     assert captured["batch_keys"] == [
         "chat.stream",
         "postcommit.stream.final:stream-session",
@@ -3820,7 +3857,7 @@ def test_streaming_session_uses_generation_final_postcommit_without_retokenized_
 
 
 def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
-    monkeypatch,
+    monkeypatch, terminal_frame
 ):
     state = _fake_streaming_session_state()
     scheduled: list[dict] = []
@@ -3841,6 +3878,10 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
         }
 
     def fake_run_generation(_state, prompt_ids, **kwargs):
+        request_id = kwargs["request_observability"]["request_id"]
+        # The real generation writes the request's metrics row, keyed by
+        # its request id.
+        _state.last_metrics.append({"request_id": request_id})
         token_callback = kwargs.get("token_callback")
         tokens = [ord("O"), ord("K")]
         if token_callback is not None:
@@ -3849,6 +3890,7 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
             "text": "OK",
             "tokens": tokens,
             "stats": {
+                "request_id": request_id,
                 "generation_mode": kwargs["generation_mode"],
                 "mtp_depth": kwargs["depth"],
                 "completion_tokens": 2,
@@ -3888,16 +3930,26 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
         )
 
     assert response.status_code == 200
-    assert '"mode": "async_pending"' in response.text
-    assert '"reason": "retokenized_history_mismatch"' in response.text
-    assert '"session_prompt_prefix_commit"' in response.text
-    assert '"postcommit_prompt_prefix"' in response.text
+    outcome = _stream_commit_outcome(
+        state, "unsafe-session", response.text, terminal_frame
+    )
+    assert outcome["session_postcommit_snapshot"]["mode"] == "async_pending"
+    assert (
+        outcome["session_postcommit_snapshot"]["reason"]
+        == "retokenized_history_mismatch"
+    )
+    assert (
+        outcome["session_prompt_prefix_commit"]["boundary_kind"]
+        == "postcommit_prompt_prefix"
+    )
     metrics_with_frontier = [
         metric
         for metric in state.last_metrics
         if metric.get("session_prompt_prefix_commit")
     ]
     assert metrics_with_frontier
+    first_request_id = _stream_payloads(response.text)[0]["id"]
+    assert any(metric.get("request_id") == first_request_id for metric in metrics_with_frontier)
     assert (
         metrics_with_frontier[-1]["session_prompt_prefix_commit"]["boundary_kind"]
         == "postcommit_prompt_prefix"
@@ -3913,7 +3965,7 @@ def test_streaming_unsafe_postcommit_releases_without_blocking_second_request(
 
 
 def test_streaming_stop_boundary_mismatch_schedules_idle_retokenized_postcommit(
-    monkeypatch,
+    monkeypatch, terminal_frame
 ):
     state = _fake_streaming_session_state()
     scheduled: list[dict] = []
@@ -3971,9 +4023,18 @@ def test_streaming_stop_boundary_mismatch_schedules_idle_retokenized_postcommit(
         )
 
     assert response.status_code == 200
-    assert '"mode": "async_pending"' in response.text
-    assert '"reason": "stop_token_boundary_mismatch"' in response.text
-    assert '"postcommit_prompt_prefix"' in response.text
+    outcome = _stream_commit_outcome(
+        state, "stop-boundary-session", response.text, terminal_frame
+    )
+    assert outcome["session_postcommit_snapshot"]["mode"] == "async_pending"
+    assert (
+        outcome["session_postcommit_snapshot"]["reason"]
+        == "stop_token_boundary_mismatch"
+    )
+    assert (
+        outcome["session_prompt_prefix_commit"]["boundary_kind"]
+        == "postcommit_prompt_prefix"
+    )
     assert scheduled
 
 
@@ -4003,10 +4064,13 @@ def test_nonstream_unsafe_mtp_schedules_async_postcommit_in_default_mode(
 
     def fake_run_generation(_state, prompt_ids, **kwargs):
         tokens = [ord("O"), ord("K")]
+        request_id = kwargs["request_observability"]["request_id"]
+        _state.last_metrics.append({"request_id": request_id})
         return {
             "text": "OK",
             "tokens": tokens,
             "stats": {
+                "request_id": request_id,
                 "generation_mode": kwargs["generation_mode"],
                 "mtp_depth": kwargs["depth"],
                 "completion_tokens": 2,
@@ -4052,7 +4116,9 @@ def test_nonstream_unsafe_mtp_schedules_async_postcommit_in_default_mode(
     assert scheduled[0]["unsafe_reason"] == "missing_generation_final_state"
 
 
-def test_streaming_ar_schedules_async_postcommit_in_default_mode(monkeypatch):
+def test_streaming_ar_schedules_async_postcommit_in_default_mode(
+    monkeypatch, terminal_frame
+):
     state = _fake_streaming_session_state()
     scheduled: list[dict] = []
     foreground_batch_keys: list[str | None] = []
@@ -4117,10 +4183,16 @@ def test_streaming_ar_schedules_async_postcommit_in_default_mode(monkeypatch):
         )
 
     assert response.status_code == 200
+    outcome = _stream_commit_outcome(
+        state, "ar-session", response.text, terminal_frame
+    )
     assert scheduled
     assert scheduled[0]["unsafe_reason"] == "missing_generation_final_state"
-    assert '"mode": "async_pending"' in response.text
-    assert '"reason": "missing_generation_final_state"' in response.text
+    assert outcome["session_postcommit_snapshot"]["mode"] == "async_pending"
+    assert (
+        outcome["session_postcommit_snapshot"]["reason"]
+        == "missing_generation_final_state"
+    )
     assert '"generation_mode": "ar"' in response.text
     assert foreground_batch_keys == ["chat.stream"]
 
@@ -6819,6 +6891,8 @@ def test_streaming_tool_call_canonicalizes_shell_alias_to_bash(monkeypatch):
 
 
 def test_streaming_unclosed_tool_call_errors_instead_of_hidden_runaway(monkeypatch):
+    # The runaway backstop is opt-in (tests/test_hidden_tool_guard_opt_in.py).
+    monkeypatch.setenv("MTPLX_STREAM_HIDDEN_TOOL_GUARD", "on")
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
     state.args.stats_footer = False
@@ -6853,6 +6927,8 @@ def test_streaming_unclosed_tool_call_errors_instead_of_hidden_runaway(monkeypat
 
 
 def test_streaming_long_content_first_write_survives_hidden_tool_guard(monkeypatch):
+    # Armed, so the known-parameter stand-down is what this exercises.
+    monkeypatch.setenv("MTPLX_STREAM_HIDDEN_TOOL_GUARD", "on")
     state = _fake_state()
     state.runtime.tokenizer = CaptureTokenizer()
     state.args.stream_interval = 1
@@ -7209,6 +7285,122 @@ def test_gemma4_encoder_renders_assistant_tool_call_before_tool_result():
     assert "<parameter=description>\nList files\n</parameter>" in rendered
     assert "package.json\nsrc" in rendered
 
+
+
+def _gemma4_tool_round(tokenizer):
+    tool_call = {
+        "id": "call_bash",
+        "type": "function",
+        "function": {"name": "bash", "arguments": json.dumps({"command": "ls"})},
+    }
+    openai._encode_messages(
+        tokenizer,
+        [
+            openai.ChatMessage(role="user", content="Use ls once."),
+            openai.ChatMessage(role="assistant", content="", tool_calls=[tool_call]),
+            openai.ChatMessage(role="tool", tool_call_id="call_bash", content="package.json"),
+        ],
+        enable_thinking=True,
+        add_generation_prompt=True,
+        tools=[{"type": "function", "function": {"name": "bash", "parameters": {"type": "object"}}}],
+    )
+    return tokenizer.text
+
+
+def test_gemma4_tool_history_stays_native_when_the_tokenizer_reports_no_tool_calling():
+    """Gemma 4 packs ship no chat template, so mlx-lm's TokenizerWrapper
+    reports has_tool_calling=False. The history must still reach the Gemma 4
+    encoder structured: the model's own calls as the <tool_call> XML the tool
+    contract asks for, results as tool_response turns - not the generic
+    "[Calling tool: ...]" / "[Tool Result (...)]" user-turn fallback."""
+
+    class GemmaWrapperTokenizer:
+        bos_token = "<bos>"
+        has_tool_calling = False
+        model_specific_special_tokens = {
+            "think_token": "<|think|>",
+            "soc_token": "<|channel>",
+            "eoc_token": "<channel|>",
+        }
+
+        def encode(self, text, **_kwargs):
+            self.text = str(text)
+            return [ord(char) for char in self.text]
+
+    rendered = _gemma4_tool_round(GemmaWrapperTokenizer())
+    assert "[Calling tool:" not in rendered
+    assert "[Tool Result" not in rendered
+    assert "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>" in rendered
+    assert "<|turn>tool_response\npackage.json<turn|>" in rendered
+
+
+
+def _gemma4_capture_encode(messages, *, enable_thinking):
+    from mtplx.chat_encoding import encode_gemma4_messages
+
+    class Capture:
+        bos_token = "<bos>"
+
+        def encode(self, text, **_kwargs):
+            self.text = str(text)
+            return [ord(char) for char in self.text]
+
+    tok = Capture()
+    encode_gemma4_messages(tok, messages, enable_thinking=enable_thinking, add_generation_prompt=True)
+    return tok.text
+
+
+_GEMMA4_CALL = {"id": "c1", "type": "function",
+                "function": {"name": "bash", "arguments": json.dumps({"command": "ls"})}}
+
+
+def test_gemma4_thinking_off_history_keeps_the_empty_thought_scaffold():
+    """Thinking off, the generation prompt ends in an empty thought block and
+    the model writes its turn after it; the history must render the same
+    bytes, or every such turn diverges from the next prompt."""
+    first = _gemma4_capture_encode([{"role": "user", "content": "ls"}], enable_thinking=False)
+    generated = "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call><turn|>\n"
+    nxt = _gemma4_capture_encode([
+        {"role": "user", "content": "ls"},
+        {"role": "assistant", "content": "", "tool_calls": [_GEMMA4_CALL]},
+        {"role": "tool", "content": "ok"},
+    ], enable_thinking=False)
+    assert nxt.startswith(first + generated)
+
+
+def test_gemma4_thought_is_followed_directly_by_the_tool_call():
+    first = _gemma4_capture_encode([{"role": "user", "content": "ls"}], enable_thinking=True)
+    generated = ("<|channel>thought\nrun ls<channel|><tool_call>\n<function=bash>\n<parameter=command>\n"
+                 "ls\n</parameter>\n</function>\n</tool_call><turn|>\n")
+    nxt = _gemma4_capture_encode([
+        {"role": "user", "content": "ls"},
+        {"role": "assistant", "content": "", "reasoning_content": "run ls", "tool_calls": [_GEMMA4_CALL]},
+        {"role": "tool", "content": "ok"},
+    ], enable_thinking=True)
+    assert nxt.startswith(first + generated)
+
+def test_non_gemma_tokenizer_without_tool_calling_keeps_the_text_fallback():
+    from mtplx.server.omlx_bridge.adapter import normalize_messages_for_template
+
+    class PlainTokenizer:
+        has_tool_calling = False
+
+    normalized = normalize_messages_for_template(
+        [
+            openai.ChatMessage(role="user", content="Use ls once."),
+            openai.ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[{"id": "c1", "type": "function",
+                             "function": {"name": "bash", "arguments": "{}"}}],
+            ),
+            openai.ChatMessage(role="tool", tool_call_id="c1", content="ok"),
+        ],
+        tokenizer=PlainTokenizer(),
+    )
+    assert normalized[1]["content"].startswith("[Calling tool: bash(")
+    assert normalized[2] == {"role": "user", "content": "[Tool Result (c1)]: ok",
+                             **{k: v for k, v in normalized[2].items() if k not in ("role", "content")}}
 
 def test_agent_transcript_canonicalization_preserves_tool_history_text():
     tool_call = {
@@ -9229,6 +9421,7 @@ def test_opencode_agent_tool_client_uses_compact_prompt_mode(monkeypatch):
             ],
             "tools": [_bash_tool_schema(), _named_tool_schema("read"), _tool_schema()],
             "tool_choice": "auto",
+            "parallel_tool_calls": True,
             "max_tokens": 32,
         },
     )
@@ -9361,6 +9554,143 @@ def test_agent_tool_clients_repair_native_launch_mode_to_hybrid(legacy_rewrites,
         == "compact_tool_contract:schema_free:v1"
     )
     assert "tool_prompt_mode=hybrid" in seen["session_policy_fingerprint"]
+
+
+@pytest.mark.parametrize("client_hint", ["pi", "hermes"])
+def test_agent_tool_clients_use_native_mode_for_declared_parallel_requests(
+    monkeypatch, client_hint
+):
+    seen: dict[str, object] = {}
+    state = _fake_state()
+    foreground = ForegroundState()
+    state.lock = foreground.lock
+    state.has_foreground = foreground.has_foreground
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    state.args.tool_prompt_mode = "native"
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        seen["session_policy_fingerprint"] = kwargs["session_policy_fingerprint"]
+        return _fake_generation("Done")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": client_hint},
+        json={
+            "messages": [
+                {"role": "system", "content": "You are a coding agent."},
+                {
+                    "role": "user",
+                    "content": "Read package.json and pyproject.toml.",
+                },
+            ],
+            "tools": [_named_tool_schema("read")],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "max_tokens": 32,
+        },
+    )
+
+    assert response.status_code == 200
+    _messages, kwargs = state.runtime.tokenizer.calls[0]
+    stats = seen["request_observability"]
+    assert "tools" in kwargs
+    assert stats["tool_prompt_mode"] == "native"
+    assert stats["tool_prompt_mode_source"] == f"client:{client_hint}:parallel"
+    assert stats["tool_prompt_mode_client_repaired"] is False
+    assert stats["tool_contract_active"] is False
+    assert "tool_prompt_mode=native" in seen["session_policy_fingerprint"]
+
+
+@pytest.mark.parametrize("client_hint", ["pi", "hermes"])
+@pytest.mark.parametrize("parallel_tool_calls", [False, None])
+def test_parallel_opt_out_keeps_agent_client_hybrid_mode(
+    monkeypatch, client_hint, parallel_tool_calls
+):
+    seen: dict[str, object] = {}
+    state = _fake_state()
+    foreground = ForegroundState()
+    state.lock = foreground.lock
+    state.has_foreground = foreground.has_foreground
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    state.args.tool_prompt_mode = "native"
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        return _fake_generation("Done")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    request = {
+        "messages": [
+            {"role": "system", "content": "You are a coding agent."},
+            {
+                "role": "user",
+                "content": "Read package.json and pyproject.toml in parallel.",
+            },
+        ],
+        "tools": [_named_tool_schema("read")],
+        "tool_choice": "auto",
+        "max_tokens": 32,
+    }
+    if parallel_tool_calls is not None:
+        request["parallel_tool_calls"] = parallel_tool_calls
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "x-mtplx-client": client_hint},
+        json=request,
+    )
+
+    assert response.status_code == 200
+    stats = seen["request_observability"]
+    assert stats["tool_prompt_mode"] == "hybrid"
+    assert stats["tool_prompt_mode_source"] == f"client:{client_hint}"
+    assert stats["tool_contract_active"] is True
+
+
+def test_declared_parallel_request_keeps_explicit_tool_prompt_mode_override(
+    monkeypatch,
+):
+    seen: dict[str, object] = {}
+    state = _fake_state()
+    foreground = ForegroundState()
+    state.lock = foreground.lock
+    state.has_foreground = foreground.has_foreground
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    state.args.tool_prompt_mode = "native"
+    client = TestClient(create_app(state))
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        return _fake_generation("Done")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    response = client.post(
+        "/v1/chat/completions",
+        headers={
+            "x-mtplx-cache-mode": "bypass",
+            "x-mtplx-client": "hermes",
+            "x-mtplx-tool-prompt-mode": "hybrid",
+        },
+        json={
+            "messages": [{"role": "user", "content": "Read both files."}],
+            "tools": [_named_tool_schema("read")],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "max_tokens": 32,
+        },
+    )
+
+    assert response.status_code == 200
+    stats = seen["request_observability"]
+    assert stats["tool_prompt_mode"] == "hybrid"
+    assert stats["tool_prompt_mode_source"] == "request"
+    assert stats["tool_contract_active"] is True
 
 
 def test_launch_client_env_labels_headerless_hermes(monkeypatch):
@@ -10314,10 +10644,12 @@ def test_read_only_force_answer_visible_text_strips_rehearsal_before_final():
 
 def test_merge_final_metrics_keeps_read_only_buffer_observability():
     state = _fake_state()
+    state.last_metrics[-1]["request_id"] = "read-only-request"
 
     openai._merge_final_bridge_stats_into_latest_metrics(
         state,
         {
+            "request_id": "read-only-request",
             "read_only_force_answer_buffered_stream": True,
             "read_only_force_answer_visible_prefix_stripped_chars": 512,
             "read_only_force_answer_visible_tokens": 231,
@@ -10461,7 +10793,9 @@ def test_read_only_force_answer_stream_fallback_emits_without_marker(monkeypatch
     assert stats["read_only_force_answer_visible_prefix_stripped_chars"] > 0
 
 
-def test_read_only_force_answer_stream_postcommit_uses_client_history(monkeypatch):
+def test_read_only_force_answer_stream_postcommit_uses_client_history(
+    monkeypatch, terminal_frame
+):
     monkeypatch.setenv("MTPLX_READ_ONLY_INSPECTION_FORCE_ANSWER_AFTER_TOOLS", "2")
     state = _fake_streaming_session_state()
     # The char-level tokenizer plus the injected force-answer contract
@@ -10560,9 +10894,8 @@ def test_read_only_force_answer_stream_postcommit_uses_client_history(monkeypatc
     )
 
     assert response.status_code == 200
-    payloads = _stream_payloads(response.text)
-    final = [payload for payload in payloads if payload["choices"][0]["finish_reason"]]
-    stats = final[-1]["mtplx_stats"]
+    # Read once the commit landed (it may run after the terminal frame).
+    stats = _stream_commit_outcome(state, "speedqa0606", response.text, terminal_frame)
     generation_final_text = "\n".join(
         str(message.content or "") for message in captured["generation_final_messages"]
     )
@@ -11938,8 +12271,13 @@ def test_chat_stream_hermes_suppresses_tool_call_preamble(monkeypatch, with_visi
         assert commit["strip_tool_call_preamble_text"] is True
     if with_vision:
         # Even the unsafe/idle-postcommit arm must not publish raw image
-        # placeholders as a session frontier that different pixels can adopt.
-        assert state.sessions.peek("hermes-preamble").committed_token_ids == ()
+        # placeholders as a session frontier that different pixels can adopt:
+        # the prompt prefix it commits is the content-keyed view.
+        from mtplx.vision.splice import is_image_key
+
+        committed = state.sessions.peek("hermes-preamble").committed_token_ids
+        assert committed and 999999 not in committed
+        assert is_image_key(committed[-1])
 
 
 def test_chat_stream_hermes_defers_content_until_native_tool_extraction(monkeypatch):
@@ -13757,6 +14095,40 @@ def test_thinking_guard_never_touches_plain_chat_even_opted_in(monkeypatch):
     )
     assert no_tools is None and no_thinking is None
 
+
+
+def test_thinking_guard_scope_all_covers_plain_chat_with_thinking(monkeypatch):
+    monkeypatch.setenv("MTPLX_THINKING_BUDGET", "2048")
+    monkeypatch.setenv("MTPLX_THINKING_GUARD_SCOPE", "all")
+    config = openai._thinking_guard_config_for_request(
+        _guard_request_state([]),
+        prompt_ids=[1, 2, 3],
+        request_observability={"request_enable_thinking": True, "request_tool_count": 0},
+    )
+    assert config is not None and config.enabled
+    assert config.budget_tokens == 2048
+
+
+def test_thinking_guard_scope_all_still_skips_no_think(monkeypatch):
+    monkeypatch.setenv("MTPLX_THINKING_BUDGET", "2048")
+    monkeypatch.setenv("MTPLX_THINKING_GUARD_SCOPE", "all")
+    config = openai._thinking_guard_config_for_request(
+        _guard_request_state([]),
+        prompt_ids=[1, 2, 3],
+        request_observability={"request_enable_thinking": False, "request_tool_count": 0},
+    )
+    assert config is None
+
+
+def test_thinking_guard_scope_all_is_still_opt_in(monkeypatch):
+    monkeypatch.delenv("MTPLX_THINKING_BUDGET", raising=False)
+    monkeypatch.setenv("MTPLX_THINKING_GUARD_SCOPE", "all")
+    config = openai._thinking_guard_config_for_request(
+        _guard_request_state([]),
+        prompt_ids=[1, 2, 3],
+        request_observability={"request_enable_thinking": True, "request_tool_count": 0},
+    )
+    assert config is None
 
 # --- parallel_tool_calls wiring ---------------------------------------------
 

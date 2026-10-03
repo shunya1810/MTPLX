@@ -51,10 +51,11 @@ def pack_config(**overrides) -> dict:
     return config
 
 
-def text_args(*, tie: bool = True):
+def text_args(*, tie: bool = True, **overrides):
+    """``overrides`` replace fields, such as the GDN key head size."""
     from mlx_lm.models.qwen3_5 import TextModelArgs
 
-    return TextModelArgs(
+    fields = dict(
         model_type="qwen3_5",
         hidden_size=64,
         intermediate_size=128,
@@ -72,18 +73,20 @@ def text_args(*, tie: bool = True):
         full_attention_interval=2,
         rope_parameters=rope_parameters(),
     )
+    fields.update(overrides)
+    return TextModelArgs(**fields)
 
 
-def text_model(seed: int = 7, *, tie: bool = True):
+def text_model(seed: int = 7, *, tie: bool = True, **overrides):
     from mlx_lm.models.qwen3_5 import TextModel
 
     mx.random.seed(seed)
-    model = TextModel(text_args(tie=tie))
+    model = TextModel(text_args(tie=tie, **overrides))
     mx.eval(model.parameters())
     return model
 
 
-def model_with_draft_head(tmp_path, seed: int = 7, *, tie: bool = True):
+def model_with_draft_head(tmp_path, seed: int = 7, *, tie: bool = True, **overrides):
     """The same model with a one-layer MTP head, injected the product way.
 
     ``tie=False`` gives the model its own random LM head, so greedy decoding
@@ -93,7 +96,7 @@ def model_with_draft_head(tmp_path, seed: int = 7, *, tie: bool = True):
 
     from mtplx.mtp_patch import inject_mtp_support
 
-    model = text_model(seed, tie=tie)
+    model = text_model(seed, tie=tie, **overrides)
     args = model.args
     donor = DecoderLayer(args, layer_idx=args.full_attention_interval - 1)
     tensors = {

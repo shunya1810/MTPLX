@@ -91,6 +91,37 @@ public enum DaemonRestartEligibility: Equatable, Sendable {
     case adoptedPriorSession
 }
 
+/// A daemon the supervisor holds that passed its /health check when it was
+/// launched or adopted. An answer on /health belongs to this daemon only if
+/// it comes from `baseURL`, the address that check ran against, and reports
+/// `launchID`, the `MTPLX_APP_LAUNCH_ID` the daemon runs under (#528).
+public struct HeldDaemon: Equatable, Sendable {
+    public let lifecycleEpoch: Int
+    public let launchID: String?
+    public let baseURL: URL
+    public let adopted: Bool
+
+    public init(lifecycleEpoch: Int, launchID: String?, baseURL: URL, adopted: Bool) {
+        self.lifecycleEpoch = lifecycleEpoch
+        self.launchID = launchID
+        self.baseURL = baseURL
+        self.adopted = adopted
+    }
+}
+
+/// What a start request finds in the supervisor (#528). `start` throws
+/// `alreadyRunning` in every case except `.none`, so a caller that asks first
+/// can reconnect to a daemon it already runs instead of failing.
+public enum DaemonHold: Equatable, Sendable {
+    /// Nothing is held: `start` launches a daemon or adopts one.
+    case none
+    /// A launch, an automatic restart or a stop holds the slot and has not
+    /// settled. Its own outcome is the one to show.
+    case settling
+    /// A daemon that passed its health check at launch or adoption.
+    case held(HeldDaemon)
+}
+
 /// Small, secret-free status surface for the app chrome and logs view.
 public struct DaemonSupervisionSnapshot: Equatable, Sendable {
     /// Monotonic delivery revision. Consumers that hop onto another executor
@@ -143,6 +174,16 @@ public final class DaemonSupervisor: @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
     private var adoptedProcessID: pid_t?
+    /// The launch id an adopted daemon reported when it was adopted, so a
+    /// later /health answer can be matched to it (`currentHold`).
+    private var adoptedLaunchID: String?
+    /// Where the held daemon's health was verified: the owned launch's
+    /// health URL or the adopted daemon's. Read only while a daemon is held.
+    private var heldBaseURL: URL?
+    /// The API key the held daemon was launched or adopted with (#528). A
+    /// daemon reads its key once at startup, so a key changed in settings
+    /// since then is not the key it accepts.
+    private var heldAPIKey: String?
     private let logStore: BoundedLogStore
     /// Where a failed start's output is written (#504). `nil` writes nothing:
     /// the default, so a test that fails a launch never touches the real home.
@@ -151,6 +192,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
     private let restartSleeper: @Sendable (TimeInterval) async -> Void
     private let initialHealthProbe: @Sendable (URL, String?) async -> HealthPayload?
     private let healthWaitProbe: @Sendable (URL, String?) async -> HealthPayload?
+    private let beforeLaunchOwnershipCheck: @Sendable () async -> Void
     private let beforeProcessReservation: @Sendable () async -> Void
     private let beforeProcessRun: @Sendable () async -> Void
     private let beforePostRunLivenessCheck: @Sendable () async -> Void
@@ -191,25 +233,29 @@ public final class DaemonSupervisor: @unchecked Sendable {
         logStore: BoundedLogStore = BoundedLogStore(),
         restartPolicy: DaemonRestartPolicy = .default,
         startFailureReportURL: URL? = nil,
-        restartSleeper: @escaping @Sendable (TimeInterval) async -> Void = DaemonSupervisor.defaultRestartSleeper,
-        initialHealthProbe: @escaping @Sendable (URL, String?) async -> HealthPayload? = DaemonSupervisor.defaultHealthProbe,
-        healthWaitProbe: @escaping @Sendable (URL, String?) async -> HealthPayload? = DaemonSupervisor.defaultHealthProbe,
+        restartSleeper: (@Sendable (TimeInterval) async -> Void)? = nil,
+        initialHealthProbe: (@Sendable (URL, String?) async -> HealthPayload?)? = nil,
+        healthWaitProbe: (@Sendable (URL, String?) async -> HealthPayload?)? = nil,
+        // Test seam at the start of every owned launch (a start, or the start
+        // half of a restart), before it checks that no daemon is held.
+        // Production uses the no-op.
+        beforeLaunchOwnershipCheck: (@Sendable () async -> Void)? = nil,
         // Test seam immediately before the atomic lifecycle reservation.
-        beforeProcessReservation: @escaping @Sendable () async -> Void = {},
+        beforeProcessReservation: (@Sendable () async -> Void)? = nil,
         // Test seam for the narrow period after ownership is published but
         // before Process.run() assigns a PID. Production uses the no-op.
-        beforeProcessRun: @escaping @Sendable () async -> Void = {},
+        beforeProcessRun: (@Sendable () async -> Void)? = nil,
         // Test seam after Process.run() but before the first liveness check.
-        beforePostRunLivenessCheck: @escaping @Sendable () async -> Void = {},
+        beforePostRunLivenessCheck: (@Sendable () async -> Void)? = nil,
         // Test seam after automatic restart state is published but before it
         // starts the next owned launch. Production uses the no-op.
-        beforeAutomaticRestartStart: @escaping @Sendable () async -> Void = {},
+        beforeAutomaticRestartStart: (@Sendable () async -> Void)? = nil,
         // Test seam immediately before Stop resolves the current process
         // family. Production uses the no-op.
-        beforeStopProcessFamilyResolution: @escaping @Sendable () async -> Void = {},
+        beforeStopProcessFamilyResolution: (@Sendable () async -> Void)? = nil,
         // Test seam after the full process family is snapshotted for Stop,
         // before any signal is sent. Production uses the no-op.
-        beforeStopProcessFamilySignal: @escaping @Sendable () async -> Void = {},
+        beforeStopProcessFamilySignal: (@Sendable () async -> Void)? = nil,
         // Test seam immediately before a Process termination handler acquires
         // supervisor state. Production uses the no-op.
         beforeTerminationHandling: @escaping @Sendable (Process) -> Void = { _ in }
@@ -217,19 +263,21 @@ public final class DaemonSupervisor: @unchecked Sendable {
         self.logStore = logStore
         self.restartPolicy = restartPolicy
         self.startFailureReportURL = startFailureReportURL
-        self.restartSleeper = restartSleeper
-        self.initialHealthProbe = initialHealthProbe
-        self.healthWaitProbe = healthWaitProbe
-        self.beforeProcessReservation = beforeProcessReservation
-        self.beforeProcessRun = beforeProcessRun
-        self.beforePostRunLivenessCheck = beforePostRunLivenessCheck
-        self.beforeAutomaticRestartStart = beforeAutomaticRestartStart
-        self.beforeStopProcessFamilyResolution = beforeStopProcessFamilyResolution
-        self.beforeStopProcessFamilySignal = beforeStopProcessFamilySignal
+        self.restartSleeper = restartSleeper ?? DaemonSupervisor.defaultRestartSleeper
+        self.initialHealthProbe = initialHealthProbe ?? DaemonSupervisor.defaultHealthProbe
+        self.healthWaitProbe = healthWaitProbe ?? DaemonSupervisor.defaultHealthProbe
+        self.beforeLaunchOwnershipCheck = beforeLaunchOwnershipCheck ?? DaemonSupervisor.noSeam
+        self.beforeProcessReservation = beforeProcessReservation ?? DaemonSupervisor.noSeam
+        self.beforeProcessRun = beforeProcessRun ?? DaemonSupervisor.noSeam
+        self.beforePostRunLivenessCheck = beforePostRunLivenessCheck ?? DaemonSupervisor.noSeam
+        self.beforeAutomaticRestartStart = beforeAutomaticRestartStart ?? DaemonSupervisor.noSeam
+        self.beforeStopProcessFamilyResolution = beforeStopProcessFamilyResolution ?? DaemonSupervisor.noSeam
+        self.beforeStopProcessFamilySignal = beforeStopProcessFamilySignal ?? DaemonSupervisor.noSeam
         self.beforeTerminationHandling = beforeTerminationHandling
     }
 
-    // The production defaults of `init` are named functions on purpose.
+    // The async parameters of `init` default to `nil` and the production
+    // functions are chosen inside `init`, on purpose.
     //
     // A default argument of a public function is compiled into every module
     // that calls it. When the default was an `async` closure literal, each
@@ -244,9 +292,16 @@ public final class DaemonSupervisor: @unchecked Sendable {
     // runtime aborted in `swift_task_dealloc` ("freed pointer was not the last
     // allocation"), found by a watchpoint on that header. Which pair the
     // linker kept changed when 666f16e7 added a parameter ahead of these and
-    // renumbered the default arguments, which is why a cancelled start began
-    // to abort the debug test run there. One definition in this module cannot
-    // be mismatched.
+    // renumbered the default arguments.
+    //
+    // Naming a function as the default (4fba12ca) was not enough: converting
+    // it to a closure value still emits an "implicit closure in default
+    // argument N" thunk in every calling module, with the same direct-call
+    // versus function-pointer split. Adding the #528 test file changed the
+    // link order, and the debug test run died with SIGSEGV in
+    // `swift_task_alloc` inside that thunk for `initialHealthProbe`. A `nil`
+    // default compiles to no code at all, and the conversion below happens
+    // once, in this module.
     public static func defaultHealthProbe(_ baseURL: URL, _ apiKey: String?) async -> HealthPayload? {
         try? await MTPLXAPIClient(baseURL: baseURL, apiKey: apiKey).health()
     }
@@ -255,6 +310,8 @@ public final class DaemonSupervisor: @unchecked Sendable {
         guard delay > 0 else { return }
         try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
     }
+
+    private static func noSeam() async {}
 
     public var logs: BoundedLogStore {
         logStore
@@ -337,6 +394,103 @@ public final class DaemonSupervisor: @unchecked Sendable {
         }
     }
 
+    /// What a start request would find (#528). Mirrors the `alreadyRunning`
+    /// guard in `startOwned`: `.none` exactly when a start would proceed.
+    /// A daemon counts as held once its launch or adoption has passed
+    /// /health; until then the slot is `.settling`.
+    public func currentHold() -> DaemonHold {
+        lock.withLock {
+            guard process != nil || adoptedProcessID != nil || launchInProgress else {
+                return .none
+            }
+            guard state == .running, !launchInProgress, let heldBaseURL else {
+                return .settling
+            }
+            if adoptedProcessID != nil {
+                return .held(HeldDaemon(
+                    lifecycleEpoch: lifecycleEpoch,
+                    launchID: adoptedLaunchID,
+                    baseURL: heldBaseURL,
+                    adopted: true
+                ))
+            }
+            // An exited root whose termination handler has not run yet is
+            // about to be released; it is not a daemon to reconnect to.
+            guard process?.isRunning == true else { return .settling }
+            return .held(HeldDaemon(
+                lifecycleEpoch: lifecycleEpoch,
+                launchID: ownedLaunchID,
+                baseURL: heldBaseURL,
+                adopted: false
+            ))
+        }
+    }
+
+    /// Where the daemon this supervisor runs, adopted or is launching
+    /// listens, or `nil` when it holds none (#528). The app reaches its
+    /// daemon here rather than at the configured address: a port fallback
+    /// (#503) or settings reloaded from disk change where the next launch
+    /// listens, not where the running one does.
+    public func activeBaseURL() -> URL? {
+        activeConnection()?.baseURL
+    }
+
+    /// Where the held daemon listens and the API key it was launched or
+    /// adopted with, or `nil` when the supervisor holds none (#528). Both
+    /// belong to the daemon, not to the settings: the settings describe the
+    /// next launch, and the running daemon read its key once at startup.
+    public func activeConnection() -> (baseURL: URL, apiKey: String?)? {
+        lock.withLock {
+            guard process != nil || adoptedProcessID != nil || launchInProgress,
+                  let heldBaseURL
+            else { return nil }
+            return (heldBaseURL, heldAPIKey)
+        }
+    }
+
+    /// The launch id of the daemon this supervisor runs, adopted or is
+    /// launching, or `nil` when it holds none (#528). A /health answer
+    /// speaks for that daemon only when it carries this id: another server
+    /// can take the port, and it answers /health too.
+    public func activeLaunchID() -> String? {
+        lock.withLock {
+            if adoptedProcessID != nil {
+                return adoptedLaunchID
+            }
+            guard process != nil || launchInProgress else { return nil }
+            return ownedLaunchID
+        }
+    }
+
+    /// Whether `pid` is still the daemon this supervisor holds (#528): the
+    /// owned root while its Process runs, or a live process whose
+    /// environment carries the held launch id. A pid alone proves nothing
+    /// once its process has exited: the kernel hands the number out again.
+    public func pidRunsHeldDaemon(_ pid: pid_t) -> Bool {
+        let held = lock.withLock { () -> (process: Process?, launchID: String?) in
+            (process, adoptedProcessID != nil ? adoptedLaunchID : ownedLaunchID)
+        }
+        if let process = held.process, process.processIdentifier == pid {
+            return process.isRunning
+        }
+        guard pid > 1, let launchID = held.launchID, Self.pidIsAlive(pid) else { return false }
+        return Self.appLaunchID(ofProcess: pid) == launchID
+    }
+
+    /// Whether the daemon this supervisor holds still runs (#528). An
+    /// adopted daemon gives no exit callback, so this is the only way to
+    /// learn that it is gone while something else answers on its port.
+    public func heldDaemonIsRunning() -> Bool {
+        let held = lock.withLock { (process: process, adoptedPID: adoptedProcessID) }
+        if let process = held.process {
+            return process.isRunning
+        }
+        if let adoptedPID = held.adoptedPID {
+            return pidRunsHeldDaemon(adoptedPID)
+        }
+        return false
+    }
+
     /// The daemon root pid this supervisor owns or adopted, for liveness
     /// checks that must not depend on HTTP answering (issue #487).
     public func daemonProcessIdentifier() -> pid_t? {
@@ -397,6 +551,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
         let expectedLaunchID = launch.expectedLaunchID
         let requireActualFanRamp = launch.requireActualFanRamp
         let onPhase = launch.onPhase
+        await beforeLaunchOwnershipCheck()
         let launchContext = try lock.withLock { () throws -> (generation: Int, lifecycleEpoch: Int) in
             if process != nil || adoptedProcessID != nil || launchInProgress {
                 throw DaemonSupervisorError.alreadyRunning
@@ -441,6 +596,8 @@ public final class DaemonSupervisor: @unchecked Sendable {
                canAdopt(existing, for: command, requireActualFanRamp: requireActualFanRamp) {
                 guard adoptCurrentLaunch(
                     existing,
+                    healthBaseURL: healthBaseURL,
+                    apiKey: apiKey,
                     generation: launchGeneration,
                     lifecycleEpoch: launchLifecycleEpoch,
                     automaticAttempt: automaticAttempt
@@ -501,7 +658,10 @@ public final class DaemonSupervisor: @unchecked Sendable {
             else { return false }
             process = next
             adoptedProcessID = nil
+            adoptedLaunchID = nil
             ownedLaunchID = launchIdentifier(from: command)
+            heldBaseURL = healthBaseURL
+            heldAPIKey = apiKey
             launchInProgress = true
             // A Process has been reserved but does not have a usable PID until
             // run() returns. Keep the public phase at .starting through that
@@ -982,6 +1142,8 @@ public final class DaemonSupervisor: @unchecked Sendable {
 
     private func adoptCurrentLaunch(
         _ health: HealthPayload,
+        healthBaseURL: URL,
+        apiKey: String?,
         generation: Int,
         lifecycleEpoch: Int,
         automaticAttempt: Int?
@@ -995,6 +1157,9 @@ public final class DaemonSupervisor: @unchecked Sendable {
                process == nil, adoptedProcessID == nil, !launchInProgress
             else { return false }
             adoptedProcessID = pid
+            adoptedLaunchID = health.startup?.launchId
+            heldBaseURL = healthBaseURL
+            heldAPIKey = apiKey
             lastOwnedLaunch = nil
             automaticRestartEligible = false
             restartStatus = .idle
@@ -1072,6 +1237,8 @@ public final class DaemonSupervisor: @unchecked Sendable {
         }
         guard adoptCurrentLaunch(
             existing,
+            healthBaseURL: healthBaseURL,
+            apiKey: apiKey,
             generation: adoptionGeneration,
             lifecycleEpoch: adoptionLifecycleEpoch,
             automaticAttempt: nil
@@ -1109,6 +1276,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
             waitsForLaunch: Bool,
             process: Process?,
             adoptedPID: pid_t?,
+            adoptedLaunchID: String?,
             lifecycleEpoch: Int,
             launchID: String?
         )? in
@@ -1140,6 +1308,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
             // root PID after the launch barrier opens.
             let currentProcess = expectedProcess ?? process
             let currentAdoptedPID = adoptedProcessID
+            let currentAdoptedLaunchID = adoptedLaunchID
             let currentLaunchID = ownedLaunchID
             let currentLifecycleEpoch = lifecycleEpoch
             state = .stopping
@@ -1147,6 +1316,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
                 launchInProgress,
                 currentProcess,
                 currentAdoptedPID,
+                currentAdoptedLaunchID,
                 currentLifecycleEpoch,
                 currentLaunchID
             )
@@ -1159,15 +1329,41 @@ public final class DaemonSupervisor: @unchecked Sendable {
         if stopContext.waitsForLaunch {
             await waitForLaunchCompletion()
         }
+        // Signal only processes confirmed as this lifecycle's daemon (#528).
+        // A pid is a number the kernel hands out again once its process has
+        // exited and been reaped: an adopted daemon that exited while the
+        // Mac slept, or a pid from an older /health answer, can name an
+        // unrelated process by the time Stop runs. The owned root is
+        // confirmed by its Process object while it runs. Any other pid is
+        // confirmed only when the process holding it carries this
+        // lifecycle's launch id in its environment, read from the kernel as
+        // for #503. A pid that cannot be confirmed is never signalled.
         var rootPIDs: [pid_t] = []
-        if let currentPID = stopContext.process?.processIdentifier {
-            rootPIDs.append(currentPID)
+        if let owned = stopContext.process,
+           owned.processIdentifier > 1,
+           owned.isRunning {
+            rootPIDs.append(owned.processIdentifier)
         }
-        if let adopted = stopContext.adoptedPID {
-            rootPIDs.append(adopted)
+        let confirmingLaunchID = stopContext.adoptedPID != nil
+            ? stopContext.adoptedLaunchID
+            : stopContext.launchID
+        var unconfirmedPIDs: [pid_t] = []
+        let otherPIDs = ([stopContext.adoptedPID].compactMap { $0 } + additionalProcessIDs)
+            .filter { $0 > 1 }
+        for pid in otherPIDs where !rootPIDs.contains(pid) && !unconfirmedPIDs.contains(pid) {
+            if let confirmingLaunchID, Self.appLaunchID(ofProcess: pid) == confirmingLaunchID {
+                rootPIDs.append(pid)
+            } else if Self.pidIsAlive(pid) {
+                unconfirmedPIDs.append(pid)
+            }
         }
-        rootPIDs.append(contentsOf: additionalProcessIDs)
-        rootPIDs = rootPIDs.filter { $0 > 1 }
+        if !unconfirmedPIDs.isEmpty {
+            let list = unconfirmedPIDs.map(String.init).joined(separator: ",")
+            await logStore.append(
+                "stop: not signalling pid \(list): the process there does not carry this daemon's launch id (the daemon exited and the pid now belongs to another process)",
+                stream: .system
+            )
+        }
         // A daemon can exit after Stop has claimed the lifecycle but before
         // pgrep expands its descendants. Those descendants then reparent and
         // are no longer discoverable by PPID, so include the exact inherited
@@ -1210,6 +1406,7 @@ public final class DaemonSupervisor: @unchecked Sendable {
             }
             process = nil
             adoptedProcessID = nil
+            adoptedLaunchID = nil
             automaticLaunchGeneration = nil
             if ownedLaunchID == stopContext.launchID {
                 ownedLaunchID = nil

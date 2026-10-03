@@ -30,6 +30,7 @@ from functools import lru_cache
 import mlx.core as mx
 
 from ..nax_verify import nax_available
+from .sdpa_2pass import unnormalized_partials_dtype
 from .sdpa_gqa_packed import _paged_reduce_kernel
 
 nax_flash_bail_counts: dict[str, int] = {}
@@ -54,10 +55,11 @@ inline short2 nax_get_coord(ushort lid) {
 }
 """
 
-# Template params (mx.fast.metal_kernel): InT, D, QL, GQA_F, KS, QTG.
+# Template params (mx.fast.metal_kernel): InT, PartT, D, QL, GQA_F, KS, QTG.
 # Inputs: queries [HQ*QL, D] flat, keys/values [HK, kcap, D], offset(i32[1]), kcap,
 #         scale(f32), blocks(i32[1]).
-# Outputs: partials [1, HQ, QL, blocks, D] InT; sums/maxs [1, HQ, QL, blocks] f32.
+# Outputs: partials [1, HQ, QL, blocks, D] PartT (sdpa_2pass.unnormalized_partials_dtype:
+# f32 for fp16 queries, else InT); sums/maxs [1, HQ, QL, blocks] f32.
 _SOURCE = r"""
     constexpr int TK = 32;                       // keys per tile (N of the NT matmul)
     constexpr int MROWS = 16;                    // M rows per simdgroup
@@ -310,11 +312,11 @@ _SOURCE = r"""
         const int m_local = m_base + sc.y + i * kElemRowsJump;
         if (m_local >= LIVE) continue;
         const int hq_row = kv_head * LIVE + m_local;
-        device InT* prow = partials + ((size_t)hq_row * n_blocks + block_idx) * D;
+        device PartT* prow = partials + ((size_t)hq_row * n_blocks + block_idx) * D;
         for (int g = 0; g < NGROUPS; g++)
           for (short hh = 0; hh < 2; hh++)
             for (short j = 0; j < kElemCols; j++)
-              prow[g * 32 + hh * 16 + sc.x + j] = InT(o_frag[g][hh][i * kElemCols + j]);
+              prow[g * 32 + hh * 16 + sc.x + j] = PartT(o_frag[g][hh][i * kElemCols + j]);
       }
       if ((lane & 0x9) == 0) {
         for (short i = 0; i < 2; i++) {
@@ -431,6 +433,7 @@ def sdpa_nax_flash(
                     float(scale), blocks_arr],
             template=[
                 ("InT", queries.dtype),
+                ("PartT", unnormalized_partials_dtype(queries.dtype)),
                 ("D", d),
                 ("QL", q_len),
                 ("GQA_F", gqa_factor),
@@ -440,7 +443,7 @@ def sdpa_nax_flash(
             grid=(hk * nthreads, 1, blocks),
             threadgroup=(nthreads, 1, 1),
             output_shapes=[partial_shape, stats_shape, stats_shape],
-            output_dtypes=[queries.dtype, mx.float32, mx.float32],
+            output_dtypes=[unnormalized_partials_dtype(queries.dtype), mx.float32, mx.float32],
         )
     except Exception as exc:  # noqa: BLE001 — dispatch/compile failure => stock fallback
         return _bail(f"dispatch_failed: {type(exc).__name__}: {str(exc)[:2000]}")

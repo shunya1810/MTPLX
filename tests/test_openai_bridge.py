@@ -1081,6 +1081,7 @@ def test_final_bridge_stats_update_latest_metrics_with_frontier_cache_fields():
     _merge_final_bridge_stats_into_latest_metrics(
         state,
         {
+            "request_id": "resp_1",
             "tool_parse_success": True,
             "session_prompt_prefix_commit": {
                 "committed": True,
@@ -1107,6 +1108,16 @@ def test_final_bridge_stats_update_latest_metrics_with_frontier_cache_fields():
         "mode": "async_pending",
         "reason": "tool_call_history_rewrite",
     }
+
+
+def test_final_bridge_stats_without_a_request_id_leave_other_requests_rows_alone():
+    # A stats dict that names no request must not land on whichever row is last:
+    # that row can belong to another request that finished in between.
+    state = SimpleNamespace(last_metrics=[{"request_id": "resp_other"}])
+
+    _merge_final_bridge_stats_into_latest_metrics(state, {"tool_parse_success": True})
+
+    assert state.last_metrics == [{"request_id": "resp_other"}]
 
 
 def _anthropic_stream_events(chunks):

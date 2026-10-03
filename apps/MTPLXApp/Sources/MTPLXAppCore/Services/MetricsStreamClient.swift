@@ -162,6 +162,13 @@ public final class MetricsStreamClient: Sendable {
                     if Task.isCancelled { return }
                     await onEvent(try decode(message: message))
                 }
+                // The server ended the stream. The daemon keeps it open for
+                // as long as it runs, so this is a drop like any other and
+                // is reported as one: the reopen can reach another server
+                // that took the port, and the app checks who answers when
+                // the stream comes back (#528). Reconnect at once.
+                if Task.isCancelled { return }
+                await onState(.reconnecting(attempt + 1))
             } catch {
                 if Task.isCancelled { return }
                 attempt += 1

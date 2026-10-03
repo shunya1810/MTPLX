@@ -62,8 +62,12 @@ from mlx_lm.models.qwen3_next import (
     Qwen3NextSparseMoeBlock as _Qwen3NextSparseMoeBlock,
 )
 
-from mtplx import nax_detect
+from mtplx import moe_sorted_gather, nax_detect
 from mtplx.attention_context import current_attention_phase
+from mtplx.compile_state import in_compiled_step_body
+from mtplx.kernels import hc_verify_read
+from mtplx.attention_math import attention_gate
+from mtplx.float32_operand import float32_operand
 from mtplx.runtime_options import qwen4_opdiet_enabled, qwen4_verify_glue_enabled
 
 
@@ -289,12 +293,22 @@ def _rope_cos_sin(
 
     angles = positions.astype(mx.float32)[:, None] * inv_freq[None, :]
     emb = mx.concatenate([angles, angles], axis=-1)
-    cosine = mx.cos(emb)
-    sine = mx.sin(emb)
-    if attention_scaling != 1.0:
-        cosine = cosine * float(attention_scaling)
-        sine = sine * float(attention_scaling)
-    return cosine, sine
+    return _yarn_amplitude(mx.cos(emb), attention_scaling), _yarn_amplitude(
+        mx.sin(emb), attention_scaling
+    )
+
+
+def _yarn_amplitude(table: mx.array, attention_scaling: float) -> mx.array:
+    """A float32 rotary table times the static-YaRN amplitude.
+
+    The amplitude (0.1 * ln(factor) + 1, 1.1386294 at factor 4) is read from
+    memory, not written into a fused kernel of the compiled verifier with 7
+    significant digits (mtplx/float32_operand.py). 1.0 leaves the table as is.
+    """
+
+    if attention_scaling == 1.0:
+        return table
+    return table * float32_operand(attention_scaling)
 
 
 def _build_mrope_axes(section: list, interleaved: bool) -> list[int]:
@@ -353,7 +367,7 @@ def _vision_position_cos_sin(positions, inv_freq, axes, scaling=1.0):
         prompt_positions = mx.take(table, mx.clip(positions, 0, table.shape[1] - 1), axis=1)
         positions3 = mx.where((positions < table.shape[1])[None, :], prompt_positions, positions3)
     cos, sin = _mrope_cos_sin(positions3, inv_freq, axes)
-    return cos * scaling, sin * scaling
+    return _yarn_amplitude(cos, scaling), _yarn_amplitude(sin, scaling)
 
 
 def _vision_chunk_cos_sin(
@@ -398,9 +412,8 @@ def _vision_chunk_cos_sin(
         cos_in, sin_in = _mrope_cos_sin(
             table[:, pos_start : pos_start + inside], inv_freq, axes
         )
-        if attention_scaling != 1.0:
-            cos_in = cos_in * float(attention_scaling)
-            sin_in = sin_in * float(attention_scaling)
+        cos_in = _yarn_amplitude(cos_in, attention_scaling)
+        sin_in = _yarn_amplitude(sin_in, attention_scaling)
         if not past:
             return cos_in, sin_in
     first_past = pos_start + inside + delta
@@ -457,12 +470,9 @@ def _rope_cos_sin_half(
     """
 
     angles = positions.astype(mx.float32)[:, None] * inv_freq[None, :]
-    cosine = mx.cos(angles)
-    sine = mx.sin(angles)
-    if attention_scaling != 1.0:
-        cosine = cosine * float(attention_scaling)
-        sine = sine * float(attention_scaling)
-    return cosine, sine
+    return _yarn_amplitude(mx.cos(angles), attention_scaling), _yarn_amplitude(
+        mx.sin(angles), attention_scaling
+    )
 
 
 def _apply_partial_rope_half(
@@ -1100,6 +1110,17 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
         )
 
 
+@mx.compile
+def _verify_inject(logits: mx.array, hc_count: int) -> mx.array:
+    # The inject gate as the compiled verifier computes it. Inside a verify
+    # trace the divide, the sigmoid and the multiply fuse into one kernel,
+    # and MLX 0.32.2's fused sigmoid (fast exp) differs from its standalone
+    # kernel (precise exp) at some inputs, in bfloat16 at -6.84375 after the
+    # divide. The eager verify forward runs this same fused expression, the
+    # contract mtplx/attention_math.py sets for the attention output gate.
+    return 2.0 * mx.sigmoid(logits / hc_count)
+
+
 class GatedResidual(nn.Module):
     """The Gated Residual read/write mixer (hyper-connections)."""
 
@@ -1161,7 +1182,78 @@ class GatedResidual(nn.Module):
             self._v3_pack = prepare_v3_pack(self)
         return True
 
-    def __call__(self, hyper_input: mx.array):
+    def _verify_rows_read_applies(self, hyper_input: mx.array, pending=None) -> bool:
+        # The verify-width read (mtplx.kernels.hc_verify_read) reproduces the
+        # compiled stock chain bit for bit, so it engages only inside a
+        # compiled step body (whose fused lowering that is), at the widths
+        # its install probe proved on this GPU.
+        if not in_compiled_step_body():
+            return False
+        rows = 1
+        for s in hyper_input.shape[:-1]:
+            rows *= s
+        if not hc_verify_read.MIN_ROWS <= rows <= hc_verify_read.MAX_ROWS:
+            return False
+        if pending is not None:
+            # The kernels write the stream in its own dtype. A block output
+            # or inject of another dtype promotes the stock write (a float32
+            # block output makes a float32 stream), so it keeps that write.
+            block_out, inject = pending
+            lead = tuple(hyper_input.shape[:-1])
+            if block_out.dtype != hyper_input.dtype or inject.dtype != hyper_input.dtype:
+                return False
+            if tuple(block_out.shape) != lead + (self.hidden_size,):
+                return False
+            if tuple(inject.shape) != lead + (self.hc_count,):
+                return False
+        return hc_verify_read.serves(self, hyper_input.dtype, rows)
+
+    def _verify_rows_read(self, hyper_input: mx.array, pending):
+        lead = hyper_input.shape[:-1]
+        rows = 1
+        for s in lead:
+            rows *= s
+        combine = "block_inject_weight" in self
+        block_out = inject_in = None
+        if pending is not None:
+            block_out = pending[0].reshape(rows, self.hidden_size)
+            inject_in = pending[1].reshape(rows, self.hc_count)
+        mixed, written, inject = hc_verify_read.read_rows(
+            hyper_input.reshape(rows, self.hc_count * self.hidden_size),
+            self.hc_norm.weight,
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+            self.block_inject_weight.weight if combine else None,
+            block_out,
+            inject_in,
+            hc=self.hc_count,
+            eps=self.hc_norm.eps,
+            sigmoid=hc_verify_read.installed_sigmoid(),
+        )
+        hc_verify_read.note_engaged(rows)
+        mixed = mixed.reshape(*lead, self.hidden_size)
+        if not combine:
+            return mixed
+        return (
+            mixed,
+            written.reshape(hyper_input.shape),
+            inject.reshape(*lead, self.hc_count),
+        )
+
+    def __call__(self, hyper_input: mx.array, pending=None):
+        """Read the hyper-connection streams.
+
+        ``pending`` is the previous block's residual write, ``(block_out,
+        inject)``, handed over instead of written first: the verify-width read
+        folds it into its norm pass, and every other path writes it with
+        ``_hyper_residual_write`` before reading. Either way the stream that
+        comes back as the second output is the written one.
+        """
+
+        if self._verify_rows_read_applies(hyper_input, pending):
+            return self._verify_rows_read(hyper_input, pending)
+        if pending is not None:
+            hyper_input = _hyper_residual_write(hyper_input, *pending)
         if self._v3_read_applies(hyper_input):
             from mtplx.kernels.hyper_connection_v3 import fused_hyper_read_v3
 
@@ -1207,7 +1299,11 @@ class GatedResidual(nn.Module):
         mixed_input = mx.mean(mix * grouped, axis=-2)
         if "block_inject_weight" not in self:
             return mixed_input
-        inject = 2.0 * mx.sigmoid(self.block_inject_weight(normed) / self.hc_count)
+        logits = self.block_inject_weight(normed)
+        if current_attention_phase() == "decode_verify":
+            inject = _verify_inject(logits, self.hc_count)
+        else:
+            inject = 2.0 * mx.sigmoid(logits / self.hc_count)
         return mixed_input, hyper_input, inject
 
 
@@ -1268,7 +1364,7 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
                 gu_group_size=int(sw.group_size),
                 dn_group_size=int(dn.group_size),
             ).reshape(x.shape)
-            shared = mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
+            shared = attention_gate(self.shared_expert(x), self.shared_expert_gate(x))
             return (y + shared).astype(x.dtype)
         if (
             # Fused verify path (MTPLX_FUSED_MOE_VERIFY=1, dark): the M=2..4
@@ -1309,11 +1405,40 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
                 gu_group_size=int(sw.group_size),
                 dn_group_size=int(dn.group_size),
             ).reshape(x.shape)
-            shared = mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
+            shared = attention_gate(self.shared_expert(x), self.shared_expert_gate(x))
             return (y + shared).astype(x.dtype)
         if _moe_prefill_combine_applies(self, x):
             return self._prefill_call(x)
+        if (
+            current_attention_phase() == "decode_verify"
+            and getattr(self, "sharding_group", None) is None
+        ):
+            return self._verify_call(x)
         return super().__call__(x)
+
+    def _verify_call(self, x: mx.array) -> mx.array:
+        """The parent's forward with the shared-expert gate under the verify
+        gate contract.
+
+        mlx_lm's Qwen3NextSparseMoeBlock computes
+        ``sigmoid(shared_expert_gate(x)) * shared_expert(x)``. Inside the
+        compiled verifier's trace that sigmoid fuses with the multiply and the
+        add, and MLX 0.32.2's fused sigmoid differs from its standalone kernel
+        at some inputs (bfloat16 -6.84375), so the eager verify forward takes
+        the same lowering through attention_gate (mtplx/attention_math.py).
+        Routing and experts are the parent's own ops, in its order.
+        """
+
+        gates = mx.softmax(self.gate(x), axis=-1, precise=True)
+        k = self.top_k
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores = scores / scores.sum(axis=-1, keepdims=True)
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2)
+        shared_y = attention_gate(self.shared_expert(x), self.shared_expert_gate(x))
+        return y + shared_y
 
     def _prefill_call(self, x: mx.array) -> mx.array:
         """The parent's forward with the combine tail as one kernel.
@@ -1400,7 +1525,10 @@ class _FusedGateUpSwitchGLU(nn.Module):
         # +0.31G per fused module straight into a Metal OOM).
 
     def _gu(self, x, idx, sorted_indices=False):
-        gu = mx.gather_qmm(
+        # Expert-sorted (prefill-width) calls take the sorted-rows guard; the
+        # decode and verify widths keep calling MLX directly.
+        gather = moe_sorted_gather.gather_qmm if sorted_indices else mx.gather_qmm
+        gu = gather(
             x,
             self.gu_weight,
             self.gu_scales,
@@ -1415,31 +1543,46 @@ class _FusedGateUpSwitchGLU(nn.Module):
         return mx.split(gu, 2, axis=-1)
 
     def __call__(self, x, indices) -> mx.array:
-        from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
+        from mlx_lm.models.switch_layers import _scatter_unsort
 
-        x = mx.expand_dims(x, (-2, -3))
-        do_sort = indices.size >= 64
-        idx = indices
-        inv_order = None
-        if do_sort:
-            x, idx, inv_order = _gather_sort(x, indices)
-        gate, up = self._gu(x, idx, sorted_indices=do_sort)
-        x = self.down_proj(nn.silu(gate) * up, idx, sorted_indices=do_sort)
-        if do_sort:
-            x = _scatter_unsort(x, inv_order, indices.shape)
-        return x.squeeze(-2)
+        if indices.size < 64:
+            # Decode and verify widths: unsorted, straight to MLX.
+            x = mx.expand_dims(x, (-2, -3))
+            gate, up = self._gu(x, indices, sorted_indices=False)
+            x = self.down_proj(nn.silu(gate) * up, indices, sorted_indices=False)
+            return x.squeeze(-2)
+        y, inv_order = self._sorted(x, indices)
+        return _scatter_unsort(y, inv_order, indices.shape).squeeze(-2)
+
+    def _sorted(self, x, indices):
+        """Expert outputs ``[rows * top_k, 1, hidden]`` in expert-sorted order and
+        the permutation that unsorts them.  The rows are sorted the way mlx-lm's
+        gather-sort sorts them; on a tensor-unit GPU one kernel reads each token
+        row in place through the sort's row map and writes ``silu(gate) * up``
+        (mtplx.moe_sorted_gather.swiglu_rows, bit-identical to the gather, split
+        and ``nn.silu(gate) * up`` chain it replaces)."""
+
+        tokens, row_map, idx, inv_order = moe_sorted_gather.sort_rows(x, indices)
+        h = moe_sorted_gather.swiglu_rows(
+            tokens,
+            row_map,
+            self.gu_weight,
+            self.gu_scales,
+            self.gu_biases,
+            idx,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+        )
+        y = moe_sorted_gather.switch_linear(self.down_proj, h, idx, sorted_indices=True)
+        return y, inv_order
 
     def sorted_experts(self, x, indices):
         """The expert outputs in expert-sorted order, ``[rows * top_k, hidden]``,
         with the inverse permutation that unsorts them: ``__call__`` for the
         sorted regime (64 or more routed rows) minus its final unsort."""
 
-        from mlx_lm.models.switch_layers import _gather_sort
-
-        x = mx.expand_dims(x, (-2, -3))
-        x, idx, inv_order = _gather_sort(x, indices)
-        gate, up = self._gu(x, idx, sorted_indices=True)
-        y = self.down_proj(nn.silu(gate) * up, idx, sorted_indices=True)
+        y, inv_order = self._sorted(x, indices)
         return y.reshape(y.shape[0], -1), inv_order
 
 
@@ -1989,6 +2132,32 @@ def _qsa_dense_band_sdpa_applies(q: mx.array, k: mx.array, mask) -> bool:
     from mtplx.kernels.qsa_dense_band_sdpa import dense_band_eligible
 
     return dense_band_eligible(q, k, mask)
+
+
+def verify_route_max_rows() -> int:
+    """The widest forward that takes a verify window's routes in every layer.
+
+    Below every prefill-width threshold a forward keeps the per-row routes of
+    a verify window, whose eager spelling is the compiled verifier's (the
+    shared-expert, attention output and inject gates under the verify gate
+    contract of mtplx/attention_math.py). From the narrowest threshold up it
+    takes prefill routes instead: the fused MoE combine (its shared-expert
+    sigmoid is the stock one), the hyper-connection prefill read and compiled
+    write, the GDN prefill kernels and the dense-band SDPA. None of those was
+    proven equal to a compiled trace, so a compiled replay of a wider window
+    would not be the eager forward it replaces.
+    """
+
+    return (
+        min(
+            _HC_COMPILE_MIN_ROWS,
+            _GDN_GATED_NORM_MIN_ROWS,
+            _GDN_PREFILL_PREWORK_MIN_ROWS,
+            _MOE_PREFILL_COMBINE_MIN_ROWS,
+            _QSA_DENSE_BAND_SDPA_MIN_ROWS,
+        )
+        - 1
+    )
 
 
 def _verify_sdpa(q, k, v, *, scale, mask):
@@ -2546,6 +2715,42 @@ def _qsa_cache_arrays(cache: "QSACache") -> list:
     ]
 
 
+def _after_index_block_writes(rows: mx.array, cache: "QSACache") -> mx.array:
+    """``rows`` ordered after the index-block writes held on ``cache``.
+
+    ``pooled`` and its fp32 mirror take one lazy slice update per completed
+    index block, but a forward reads them only past the selection budget, and
+    then only one of the two: the eager selector reads the mirror, the fused
+    selector reads ``pooled``, and a draft-head history append reads neither.
+    An unread buffer stacks its updates into one unevaluated graph for as long
+    as the cache lives. That graph keeps every written block alive, and with
+    it the Metal shared event of the ``mx.async_eval`` that computed the
+    block (MLX releases an event only when its array is read, reused as an
+    input after the event signalled, or freed). The session bank snapshots
+    lazily, so each banked final state kept one event per index write of its
+    request, and a long-running server ran out of Metal shared events (#544).
+
+    A forward's new KV rows are always evaluated: attention reads the KV,
+    and a lazy draft-history append is evaluated by the next draft forward,
+    or by the generation before its next append when no draft reads it
+    (``generate_mtpk``). Making the rows depend on these buffers therefore
+    evaluates the block maintenance with the forward that did it. Values
+    are unchanged; only the evaluation order moves.
+
+    ``raw_keys`` stays out: the next completed block's pooling reads it, so
+    its backlog never outgrows one block, and a dependency would cost its
+    in-place update whenever a lazy history append and a draft forward are
+    evaluated together.
+    """
+
+    pending = [
+        value
+        for value in (cache.pooled, cache.pooled_f32_t)
+        if isinstance(value, mx.array)
+    ]
+    return mx.depends(rows, pending) if pending else rows
+
+
 # In-forward boundary capture (prefill). A restore boundary at prompt position
 # p needs the recurrent state AFTER token p - 1. Until now the only way to get
 # it was to END a forward at p, so the prefill loop cut the last chunk into
@@ -2638,28 +2843,32 @@ def prefill_midloop_eval_setting() -> int:
         return _PREFILL_MIDLOOP_DEFAULT_LAYERS
 
 
+def _walk_arrays(node, found: list) -> None:
+    if isinstance(node, mx.array):
+        found.append(node)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            _walk_arrays(item, found)
+    elif isinstance(node, dict):
+        for item in node.values():
+            _walk_arrays(item, found)
+
+
 def _midloop_state_arrays(entries) -> list:
     """The lazy arrays a finished layer group leaves on its cache entries:
     the recurrent states and any in-forward boundary captures. KV entries are
-    consumed by their own layer's attention and need no naming."""
+    consumed by their own layer's attention and need no naming.
+
+    The walker is a module function: a closure that calls itself is a
+    reference cycle, and it kept every group's list of states alive until
+    the cyclic collector ran (the SSD decoder's 4.17 GB, 2026-10-01)."""
 
     found: list = []
-
-    def walk(node) -> None:
-        if isinstance(node, mx.array):
-            found.append(node)
-        elif isinstance(node, (list, tuple)):
-            for item in node:
-                walk(item)
-        elif isinstance(node, dict):
-            for item in node.values():
-                walk(item)
-
     for entry in entries:
         if not isinstance(entry, ArraysCache):
             continue
-        walk(getattr(entry, "cache", None))
-        walk(getattr(entry, _BOUNDARY_CAPTURE_ATTR, None))
+        _walk_arrays(getattr(entry, "cache", None), found)
+        _walk_arrays(getattr(entry, _BOUNDARY_CAPTURE_ATTR, None), found)
     return found
 
 
@@ -2748,6 +2957,83 @@ def _qsa_rows_gather_kv_route(cache: Any, rows: int) -> Any:
     return _qsa_stock_rows_gather_kv
 
 
+_QSA_ROWS_TARGET: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "mtplx_qsa_rows_target", default=0
+)
+
+
+@contextlib.contextmanager
+def qsa_rows_target(rows: int | None):
+    """Size every QSA buffer that grows inside this scope to ``rows`` at once.
+
+    The fixed-M4 verifier keeps the conversation in fixed banks of a planned
+    number of rows. A prefill that grows its stock buffers step by step ends
+    at a different size, so the bank used to be built as a second, padded
+    copy of the whole history, and the stock growth itself re-copied the
+    history on every chunk. Inside this scope the first write that needs
+    more room allocates exactly ``rows`` for the attention keys and values,
+    the raw index keys and the pooled keys, so the buffers the prefill fills
+    are the buffers the verifier adopts (graphbank's from_qsa_cache). Only
+    growth consults it: a buffer that already holds ``rows`` is untouched,
+    and a write past ``rows`` grows the stock way. ``None`` or 0 is a no-op.
+    """
+
+    token = _QSA_ROWS_TARGET.set(max(0, int(rows or 0)))
+    try:
+        yield
+    finally:
+        _QSA_ROWS_TARGET.reset(token)
+
+
+def qsa_rows_target_value() -> int:
+    """Rows the current scope asks QSA growth to allocate, or 0."""
+
+    return int(_QSA_ROWS_TARGET.get())
+
+
+class QSAKVCache(KVCache):
+    """The stock KV cache of one QSA layer, sized once to the rows target.
+
+    Identical to ``KVCache`` except when a write needs more room while a
+    ``qsa_rows_target`` scope is active and the target covers the write: the
+    buffers then grow straight to the target (the history kept, the rest
+    zeros) instead of by one step. The write itself and the views it returns
+    are the stock ones, so attention reads exactly the same rows.
+    """
+
+    def update_and_fetch(self, keys, values):
+        prev = int(self.offset)
+        needed = prev + int(keys.shape[2])
+        if self.keys is None or needed > int(self.keys.shape[2]):
+            target = qsa_rows_target_value()
+            if target >= needed:
+                self._grow_to(target, keys, values)
+        return super().update_and_fetch(keys, values)
+
+    def _grow_to(self, rows: int, keys: mx.array, values: mx.array) -> None:
+        batch, heads, _steps, key_dim = keys.shape
+        value_dim = values.shape[3]
+        prev = int(self.offset)
+        if self.keys is None or prev == 0:
+            self.keys = mx.zeros((batch, heads, rows, key_dim), keys.dtype)
+            self.values = mx.zeros((batch, heads, rows, value_dim), values.dtype)
+            return
+        self.keys = mx.concatenate(
+            [
+                self.keys[..., :prev, :],
+                mx.zeros((batch, heads, rows - prev, key_dim), self.keys.dtype),
+            ],
+            axis=2,
+        )
+        self.values = mx.concatenate(
+            [
+                self.values[..., :prev, :],
+                mx.zeros((batch, heads, rows - prev, value_dim), self.values.dtype),
+            ],
+            axis=2,
+        )
+
+
 class QSACache:
     """Cache for one QSA layer: the attention KV plus the indexer's raw key
     stream and the incrementally maintained pooled (mean->norm->rope) block
@@ -2768,7 +3054,7 @@ class QSACache:
     step = 256
 
     def __init__(self, compress_ratio: int = 4):
-        self.kv = KVCache()
+        self.kv = QSAKVCache()
         self.ratio = max(1, int(compress_ratio))
         self.rows_gather_kv_m4 = _qsa_stock_rows_gather_kv
         self.raw_keys: Optional[mx.array] = None  # [1, cap, index_head_dim]
@@ -2803,6 +3089,21 @@ class QSACache:
         cap = ((end + step - 1) // step) * step
         return max(cap, 2 * current)
 
+    def _growth_rows(self, end: int, current: int, reserved: int, per_row: int = 1) -> int:
+        """Rows a growing raw (per_row 1) or pooled (per_row = ratio) buffer takes.
+
+        Inside a ``qsa_rows_target`` scope that covers the write, the target
+        (in this buffer's own rows), so the index buffers stay the same size
+        as the attention buffers; otherwise the geometric growth above. A
+        staged host reservation (compiled-indexer graph buckets) may demand a
+        wider backing in either case.
+        """
+
+        target = qsa_rows_target_value() // max(1, int(per_row))
+        if target >= end:
+            return max(target, reserved)
+        return max(self._grown_cap(end, current, self.step), reserved)
+
     def write_raw(self, keys: mx.array) -> None:
         """Store this forward's indexer keys at their absolute positions.
 
@@ -2813,9 +3114,7 @@ class QSACache:
         end = start + keys.shape[1]
         if self.raw_keys is None or end > self.raw_keys.shape[1]:
             current = 0 if self.raw_keys is None else self.raw_keys.shape[1]
-            # Geometric growth bounds copy traffic; a staged host reservation
-            # (compiled-indexer graph buckets) may demand a wider backing.
-            cap = max(self._grown_cap(end, current, self.step), self._reserved_raw_capacity)
+            cap = self._growth_rows(end, current, self._reserved_raw_capacity)
             grown = mx.zeros((1, cap, keys.shape[2]), keys.dtype)
             if self.raw_keys is not None:
                 grown[:, : self.raw_keys.shape[1], :] = self.raw_keys
@@ -2825,9 +3124,8 @@ class QSACache:
     def write_pooled(self, blocks: mx.array, nb_start: int, nb_total: int) -> None:
         if self.pooled is None or nb_total > self.pooled.shape[1]:
             current = 0 if self.pooled is None else self.pooled.shape[1]
-            cap = max(
-                self._grown_cap(nb_total, current, self.step),
-                self._reserved_pooled_capacity,
+            cap = self._growth_rows(
+                nb_total, current, self._reserved_pooled_capacity, self.ratio
             )
             grown = mx.zeros((1, cap, blocks.shape[2]), blocks.dtype)
             if self.pooled is not None:
@@ -2945,10 +3243,9 @@ class QSACache:
     @property
     def nbytes(self) -> int:
         total = self.kv.nbytes
-        if self.raw_keys is not None:
-            total += self.raw_keys.nbytes
-        if self.pooled is not None:
-            total += self.pooled.nbytes
+        for buffer in (self.raw_keys, self.pooled, self.pooled_f32_t):
+            if buffer is not None:
+                total += buffer.nbytes
         return total
 
     @property
@@ -3020,6 +3317,21 @@ class QSAIndexer(nn.Module):
             if args.mrope_section and sum(args.mrope_section) == int(args.rotary_dim) // 2
             else None
         )
+
+    def _score_divisor(self) -> mx.array:
+        """The block-score divisor float32(sqrt(head_dim)), read from memory.
+
+        The fixed-bank verify lane records ``_select_eager`` into the compiled
+        verifier. As a Python float, sqrt(head_dim) would be a constant of the
+        fused kernel the division joins, written with 7 significant digits:
+        sqrt(128) = 11.3137083 reads back as 11.31371, which turns distinct
+        scores such as 1.5000001 / sqrt(128) and 1.5000002 / sqrt(128) into a
+        tie that the top-k cutoff breaks by block id (mtplx/float32_operand.py).
+        The operand is the float32 the eager division and the Metal selectors
+        (SQRT_HEAD_DIM) use.
+        """
+
+        return float32_operand(math.sqrt(self.head_dim))
 
     def _uses_vision_positions(self) -> bool:
         return vision_qsa_enabled() and self._mrope_axes is not None and vision_rope_state() is not None
@@ -3096,6 +3408,16 @@ class QSAIndexer(nn.Module):
             return None
         return cache.pooled[:, :nb_total, :]
 
+    def _pooled_row_applies(self, cache, pooled: mx.array) -> bool:
+        # The one-kernel pooled-key row reproduces the compiled update (its
+        # rotation and sum spellings were matched against that lowering at
+        # install), so it engages only inside a compiled step body.
+        if not in_compiled_step_body():
+            return False
+        from mtplx.kernels import qsa_pooled_row
+
+        return qsa_pooled_row.serves(self, pooled, cache.raw_keys)
+
     def _extend_pooled_fixed(self, cache: QSACache, total) -> mx.array:
         """Update only newly completed blocks in a fixed QSA bank.
 
@@ -3119,11 +3441,32 @@ class QSAIndexer(nn.Module):
         # (``_call_rows`` has already read ``cache.rope_offset`` strictly by
         # the time a forward gets here.)
         rope_delta = getattr(cache, "rope_delta", None)
+        fused_row = self._pooled_row_applies(cache, pooled)
         for rel in range(max_new):
             block = nb_old + rel
             safe_block = mx.minimum(
                 block, mx.array(pooled_capacity - 1, dtype=block.dtype)
             )
+            if fused_row:
+                # The row below (mean, norm, rotation, select) in one kernel,
+                # bit for bit with it (mtplx.kernels.qsa_pooled_row).
+                from mtplx.kernels import qsa_pooled_row
+
+                merged = qsa_pooled_row.pooled_row(
+                    cache.raw_keys,
+                    pooled,
+                    block,
+                    nb_total,
+                    rope_delta,
+                    self.k_layernorm.weight,
+                    self._inv_freq,
+                    ratio=self.ratio,
+                    eps=self.k_layernorm.eps,
+                    amplitude=self._rope_attention_scaling,
+                )
+                qsa_pooled_row.note_engaged()
+                pooled = mx.slice_update(pooled, merged, safe_block, axes=(1,))
+                continue
             start = safe_block * self.ratio
             fresh = mx.slice(
                 cache.raw_keys,
@@ -3220,7 +3563,7 @@ class QSAIndexer(nn.Module):
         for s0 in range(0, S, tile):
             s1 = min(s0 + tile, S)
             sc = mx.matmul(q[:, s0:s1].astype(mx.float32), pooled_t)
-            sc = mx.maximum(sc, 0.0).sum(axis=2) / math.sqrt(self.head_dim)
+            sc = mx.maximum(sc, 0.0).sum(axis=2) / self._score_divisor()
             sc = sc[0]  # [s1-s0, nb]
             valid_t = blk[None, :] < nb_q[s0:s1, None]
             masked_t = mx.where(valid_t, sc, neg) - tie
@@ -3233,6 +3576,62 @@ class QSAIndexer(nn.Module):
             _owner_progress_tick()
             parts.append(top_t)
         return mx.concatenate(parts, axis=0)
+
+    def _verify_select_fused(
+        self,
+        q: mx.array,
+        pos_start,
+        cache,
+        pooled_t: mx.array,
+        nb_total: int,
+        k_eff: int,
+        tile: int,
+    ):
+        """A fixed bank's selection in two kernels around the score GEMM and
+        ``argpartition`` (mtplx.kernels.qsa_verify_select), bit for bit with
+        the stock chain below; None keeps that chain.
+
+        The lane choice mirrors the stock one: rows-gather when the bank chose
+        it at promotion, for more than one row, and no score tile splits the
+        rows; the dense mask otherwise.
+        """
+
+        from mtplx.kernels import qsa_verify_select
+
+        if not in_compiled_step_body():
+            # The kernels spell the division and the tie-break the way the
+            # compiled graph's fused kernels evaluate them; an eager call has
+            # the library's standalone kernels as its parent.
+            return None
+        S = int(q.shape[1])
+        rows_gather = (
+            S > 1
+            and not (0 < tile < S)
+            and bool(getattr(cache, "fixed_rows_gather", False))
+        )
+        if not qsa_verify_select.serves(self, S, nb_total, dense=not rows_gather):
+            return None
+        if not rows_gather and int(cache.raw_keys.shape[1]) != nb_total * self.ratio:
+            return None
+        raw = mx.matmul(q.astype(mx.float32), pooled_t)  # [1, S, H, nb]
+        masked = qsa_verify_select.block_scores(
+            raw,
+            pos_start,
+            self._score_divisor(),
+            ratio=self.ratio,
+            topk=self.block_topk,
+        )
+        part = mx.argpartition(masked, kth=nb_total - k_eff, axis=-1)
+        if rows_gather:
+            qsa_verify_select.note_engaged(S, "rows-gather")
+            token_idx, token_ok = qsa_verify_select.token_lists(
+                part, pos_start, ratio=self.ratio, topk=self.block_topk
+            )
+            return ("gather_rows", token_idx, token_ok)
+        qsa_verify_select.note_engaged(S, "dense")
+        return qsa_verify_select.dense_mask(
+            part, pos_start, ratio=self.ratio, topk=self.block_topk
+        )
 
     def _select_eager(
         self,
@@ -3264,6 +3663,12 @@ class QSAIndexer(nn.Module):
         k_eff = min(self.block_topk, nb_total)
 
         tile = _qsa_score_tile_rows()
+        if fixed_capacity:
+            fused = self._verify_select_fused(
+                q, pos_start, cache, pooled_t, nb_total, k_eff, tile
+            )
+            if fused is not None:
+                return fused
         if S > 1 and not fixed_capacity and 0 < tile < S:
             # Tiled scoring (see _qsa_score_tile_rows): bounds the live fp32
             # score transient at one tile; per-row selection math identical.
@@ -3273,7 +3678,7 @@ class QSAIndexer(nn.Module):
         else:
             scores = mx.matmul(q.astype(mx.float32), pooled_t)  # [1,S,H,nb]
             scores = (
-                mx.maximum(scores, 0.0).sum(axis=2) / math.sqrt(self.head_dim)
+                mx.maximum(scores, 0.0).sum(axis=2) / self._score_divisor()
             )
             scores = scores[0]  # [S, nb]
             masked_scores = mx.where(valid, scores, neg)
@@ -3406,7 +3811,7 @@ class QSAIndexer(nn.Module):
             # compiled graph keeps one shape; ``causal`` below hides every
             # column past the live frontier, so the math matches the stock
             # mask over the visible set.
-            mask_width = int(cache.raw_keys.shape[1])
+            mask_width = int(pooled.shape[1]) * self.ratio
         else:
             if nb_total * self.ratio < total:
                 pad = mx.zeros((S, total - nb_total * self.ratio), dtype=mx.bool_)
@@ -4003,6 +4408,7 @@ class QSAIndexer(nn.Module):
         """Shared arithmetic behind the explicit prefill/decode entry points."""
 
         B, S, _ = hidden.shape
+        cache.indexer_budget = self.block_topk * self.ratio
         if decode != (S == 1):
             raise ValueError(
                 f"QSA decode route requires S=1 and prefill requires S>1; got S={S}"
@@ -4059,7 +4465,7 @@ class QSAIndexer(nn.Module):
                 q = self._prepare_queries_plain(q, rope_start)
             cache.write_raw(k)
             cache._last_write_rows = int(S)
-            pooled = self._extend_pooled(cache, T)
+            pooled = cache.selector_pooled(self._extend_pooled(cache, T), S)
             return self._select_eager(q, pos_start, cache, pooled, T)
         q = self._prepare_queries(q, pos_start)
 
@@ -4204,7 +4610,10 @@ def _qsa_rows_gather_attention(
     materialized: q is viewed [1, H_kv, rep, S, 1, D] against
     [1, H_kv, 1, S, D, K]. Invalid slots score -inf before the fp32
     softmax, identical math to the dense bool-mask product over the same
-    visible set.
+    visible set. The float32 scores take the softmax scale from memory, not
+    as a 7-digit constant of a fused kernel (mtplx/float32_operand.py): the
+    shipping head size 256 gives 0.0625, exact either way, but 128 or 32 would
+    not.
     """
     B, H, S, D = q.shape
     H_kv = int(k.shape[1])
@@ -4215,16 +4624,17 @@ def _qsa_rows_gather_attention(
         rep = H // H_kv
         q_view = q.reshape(1, H_kv, rep, S, 1, D)
         k_view = k_sel.swapaxes(-1, -2).reshape(1, H_kv, 1, S, D, K)
-        scores = mx.matmul(q_view, k_view).squeeze(-2).astype(mx.float32) * scale
+        scores = mx.matmul(q_view, k_view).squeeze(-2).astype(mx.float32) * float32_operand(
+            scale
+        )
         scores = mx.where(token_ok[None, None, None], scores, neg)
         probs = mx.softmax(scores, axis=-1).astype(q.dtype)
         v_view = v_sel.reshape(1, H_kv, 1, S, K, D)
         out = mx.matmul(probs[..., None, :], v_view).squeeze(-2)
         return out.reshape(1, H, S, D)
-    scores = (
-        mx.matmul(q[..., None, :], k_sel.swapaxes(-1, -2)).squeeze(-2).astype(mx.float32)
-        * scale
-    )
+    scores = mx.matmul(q[..., None, :], k_sel.swapaxes(-1, -2)).squeeze(-2).astype(
+        mx.float32
+    ) * float32_operand(scale)
     scores = mx.where(token_ok[None, None], scores, neg)
     probs = mx.softmax(scores, axis=-1).astype(q.dtype)
     return mx.matmul(probs[..., None, :], v_sel).squeeze(-2)
@@ -4354,7 +4764,14 @@ def _qsa_blocks_to_dense_mask(
 
 class Attention(nn.Module):
     """Gated GQA (qwen3_5 style: double-width q_proj, sigmoid output gate,
-    per-head q/k RMSNorm, partial rotary) masked by the QSA indexer."""
+    per-head q/k RMSNorm, partial rotary) masked by the QSA indexer.
+
+    Every lane applies the output gate through attention_gate: on a verify
+    forward an eager call takes the same sigmoid lowering as the compiled
+    verifier's trace (in bfloat16 MLX 0.32.2's fused and standalone sigmoid
+    differ at -6.84375; mtplx/attention_math.py); elsewhere it is
+    ``out * mx.sigmoid(gate)``. This class never reaches the dense attention
+    hook of mtplx/attention_split.py, which applies the same contract."""
 
     # The QSA indexer mask is part of this module's semantics (and __call__
     # takes (x, cache)): any generic dense-SDPA rewrite that replaces
@@ -4517,7 +4934,12 @@ class Attention(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
+        if not fixed:
+            # A fixed bank's leaves are inputs and outputs of every compiled
+            # replay, so they never build a backlog; see the helper.
+            k = _after_index_block_writes(k, cache)
         k, v = cache.kv.update_and_fetch(k, v)
+        k, v = cache.attention_kv(k, v, S) if fixed else (k, v)
         if _QSA_HISTORY_ONLY.get():
             # Draft-head history append: the cache holds this chunk now, and
             # the caller evaluates the cache arrays instead of an output.
@@ -4547,7 +4969,7 @@ class Attention(nn.Module):
                 self.scale,
             )
             out = out.reshape(B, S, -1)
-            return self.o_proj(out * mx.sigmoid(gate))
+            return self.o_proj(attention_gate(out, gate))
 
         if isinstance(sel_mask, tuple) and sel_mask and sel_mask[0] == "flash_prefill":
             # Large-S prefill consumes compact per-row block selections
@@ -4652,7 +5074,7 @@ class Attention(nn.Module):
             )
             if out is not None:
                 out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
-                return _linear(self.o_proj, out * mx.sigmoid(gate))
+                return _linear(self.o_proj, attention_gate(out, gate))
 
             # Static unsupported geometry falls back exactly.  Once the
             # supported kernel is dispatched, failures propagate instead of
@@ -4681,7 +5103,7 @@ class Attention(nn.Module):
                 _qsa_rows_gather_kv_route(cache, S),
             )
             out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
-            return self.o_proj(out * mx.sigmoid(gate))
+            return self.o_proj(attention_gate(out, gate))
 
         if sel_mask is not None and sel_mask.ndim == 1:
             # QSA gather lane (decode): the indexer returned the selected
@@ -4712,7 +5134,7 @@ class Attention(nn.Module):
         else:
             out = _verify_sdpa(q, k, v, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
-        return _linear(self.o_proj, out * mx.sigmoid(gate))
+        return _linear(self.o_proj, attention_gate(out, gate))
 
 
 _MASK64 = (1 << 64) - 1
@@ -5812,7 +6234,12 @@ class PLELayer(nn.Module):
         query = query.reshape(*query.shape[:-1], self.hc_count, self.hidden_size)
         gate = (key * query).sum(axis=-1, keepdims=True) / math.sqrt(self.hidden_size)
         gate = mx.sqrt(mx.maximum(mx.abs(gate), 1e-6)) * mx.sign(gate)
-        gated = mx.sigmoid(gate) * value[..., None, :]
+        # value * sigmoid(gate) under the verify gate contract: inside the
+        # compiled verifier's trace this sigmoid fuses with the multiply, and
+        # MLX 0.32.2's fused bfloat16 sigmoid differs from its standalone one
+        # at -6.84375 (mtplx/attention_math.py); a verify forward's eager
+        # reference must take the same lowering.
+        gated = attention_gate(value[..., None, :], gate)
         gated = gated.reshape(*hidden.shape)
         return gated + self._short_conv(self.norm_conv(gated), cache, capture)
 
@@ -5842,9 +6269,11 @@ class DecoderLayer(nn.Module):
             block_out = self.linear_attn(mixed, ssm_mask, cache)
         else:
             block_out = self.self_attn(mixed, cache)
-        hidden = _hyper_residual_write(hyper, block_out, inject)
-
-        mixed, hyper, inject = self.mlp_hyper_connection(hidden)
+        # The attention write rides into the MLP read, which folds it into its
+        # norm pass at verify widths and writes it first everywhere else.
+        mixed, hyper, inject = self.mlp_hyper_connection(
+            hyper, pending=(block_out, inject)
+        )
         block_out = self.mlp(mixed)
         hidden = _hyper_residual_write(hyper, block_out, inject)
         return hidden

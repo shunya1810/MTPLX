@@ -36,6 +36,8 @@ import time
 from collections import deque
 from typing import Any, Callable
 
+from mtplx import thermal_pressure
+
 _FLIGHT_LOG_MAX_BYTES = 64 * 1024 * 1024
 _FLIGHT_LOG_KEEP_GENERATIONS = 4
 _TEXT_CAPTURE_MAX_CHARS = 4_000_000
@@ -320,6 +322,8 @@ class FlightRecorder:
                 "rc": record.reasoning_chars,
                 "cc": record.content_chars,
                 "ctx": (record.prompt_tokens or 0) + record.gen_tokens,
+                # Cached by the background sampler; never an OS call here.
+                "thermal": thermal_pressure.current_level(),
             }
             depth = record.live_depth
             if depth:
@@ -371,6 +375,7 @@ class FlightRecorder:
                 "rc": record.reasoning_chars,
                 "cc": record.content_chars,
                 "ctx": (record.prompt_tokens or 0) + max(generated, record.gen_tokens),
+                "thermal": thermal_pressure.current_level(),
             }
             if record.token_times:
                 # Stream-fed rates only; a non-streaming request has no
@@ -459,6 +464,10 @@ class FlightRecorder:
             "new_prefill_tokens",
             "decode_tok_s",
             "ttft_s",
+            # Thermal pressure at completion and the worst level during the
+            # request (mtplx.thermal_pressure; cached, never an OS call).
+            "thermal_pressure",
+            "thermal_pressure_max",
             # Fork-EV shadow aggregate (MTPLX_FORKEV_TELEMETRY); absent when
             # the instrument is off, so existing flight rows are unchanged.
             "forkev",

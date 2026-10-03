@@ -53,6 +53,33 @@ def _compute_blocks(gqa_factor: int, n_kv: int) -> int:
     return int(blocks)
 
 
+def unnormalized_partials_dtype(query_dtype: Any) -> Any:
+    """Storage dtype for a two-pass kernel's UNNORMALIZED partial numerators.
+
+    Pass one stores ``sum_j exp(s_j - m_block) * v_j`` per block, before the
+    division by the block's exp-sum, so its magnitude is up to (rows walked
+    by the block) x max|v|. fp16 overflows that at 65504: 16 equal rows of
+    8192 store inf, and when another block's max is ~200 higher the
+    reducer's ``exp(m_block - m_global) * partial`` is ``0 * inf`` = NaN in
+    every output element (issue #526; tests/test_quant_partials_fp16_526.py
+    and tests/test_split_partials_fp16_526.py reproduce it on every kernel
+    that stores such partials). bfloat16 shares float32's exponent range, so
+    no walk over finite values can overflow it; its partials stay
+    bit-for-bit what they were, and so does their buffer. For fp16 queries
+    the buffer doubles: 27B verify at 32k is 24 heads x 4 rows x 512 blocks
+    x 256 dims, 25 MB in fp16 and 50 MB in float32, written and read back
+    once per layer call, against a 64 MB q8 KV walk. Both reducers
+    (``_reduce_kernel`` here and ``sdpa_2pass_paged._paged_reduce_kernel``)
+    accumulate in float32 and cast only the normalized output, so a float32
+    partial needs no change there: MLX types the ``partials`` pointer from
+    the input array. Every MTPLX split kernel that stores unnormalized
+    partials follows this (the two-pass, paged, packed, packed-quant, q8
+    and NAX flash kernels); MLX's own sdpa_vector is outside this package.
+    """
+
+    return mx.float32 if query_dtype == mx.float16 else query_dtype
+
+
 @lru_cache(maxsize=None)
 def _partials_kernel(*, has_mask: bool):
     if not mx.metal.is_available():
@@ -175,7 +202,7 @@ def _partials_kernel(*, has_mask: bool):
             maxs[0] = max_score;
         }}
         for (int i = 0; i < v_per_thread; ++i) {{
-            partials[i] = static_cast<InT>(o[i]);
+            partials[i] = static_cast<PartT>(o[i]);
         }}
     """
     return mx.fast.metal_kernel(
@@ -343,10 +370,12 @@ def sdpa_2pass_tail(
 
     partial_shape = (int(bsz) * int(hq), int(q_len), int(blocks), int(vdim))
     stats_shape = (int(bsz) * int(hq), int(q_len), int(blocks))
+    partial_dtype = unnormalized_partials_dtype(input_type)
     partials, sums, maxs = kernel(
         inputs=inputs,
         template=[
             ("InT", input_type),
+            ("PartT", partial_dtype),
             ("D", int(d)),
             ("V", int(vdim)),
             ("Hk", int(hk)),
@@ -355,7 +384,7 @@ def sdpa_2pass_tail(
         grid=(int(hq) * 32, int(bsz), int(blocks) * int(q_len)),
         threadgroup=(32, 1, int(q_len)),
         output_shapes=[partial_shape, stats_shape, stats_shape],
-        output_dtypes=[input_type, mx.float32, mx.float32],
+        output_dtypes=[partial_dtype, mx.float32, mx.float32],
     )
 
     (out,) = reduce_kernel(
