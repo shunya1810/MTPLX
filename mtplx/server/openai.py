@@ -25942,6 +25942,60 @@ PUBLIC_POSTCOMMIT_KEYS = (
 )
 
 
+def _log_large_cache_miss(state: Any, *, prompt_tokens: int, stats: Mapping[str, Any]) -> None:
+    """One console line naming why a long prompt was mostly prefilled again.
+
+    A follow-up turn of a long agent conversation that misses the session
+    cache costs minutes on an M1 (a 100K omp turn, 2026-10-03: 984 s TTFT)
+    and /health keeps only the last request's diagnostic, which the next
+    request overwrites. Printed when the prompt is at least 16K tokens and
+    more than half of it (and over 8K tokens) was not reused: the session
+    the request resolved to and how, the bank's prefix diagnostic, the
+    entries it held and its latest evictions.
+    """
+
+    try:
+        prompt_tokens = int(prompt_tokens)
+        cached = int(stats.get("cached_tokens") or 0)
+        missed = prompt_tokens - cached
+        if prompt_tokens < 16_384 or missed <= max(8_192, prompt_tokens // 2):
+            return
+        sessions = getattr(state, "sessions", None)
+        bank = getattr(sessions, "bank", None)
+        entries = []
+        for entry in list(getattr(bank, "_entries", {}).values())[:12] if bank is not None else []:
+            entries.append(
+                {
+                    "session": getattr(entry, "session_id", None),
+                    "prefix_len": getattr(entry, "prefix_len", None),
+                    "nbytes": getattr(entry, "nbytes", None),
+                }
+            )
+        evictions = list(getattr(bank, "eviction_log", None) or [])[-4:] if bank is not None else []
+        _safe_stdout_print(
+            "[mtplx] large cache miss "
+            + json.dumps(
+                {
+                    "prompt_tokens": prompt_tokens,
+                    "cached_tokens": cached,
+                    "cache_miss_reason": stats.get("cache_miss_reason"),
+                    "cache_source": stats.get("cache_source"),
+                    "session_resolution": getattr(sessions, "last_prefix_diagnostic", None),
+                    "bank_diagnostic": getattr(bank, "last_prefix_diagnostic", None),
+                    "bank_entries": entries,
+                    "recent_evictions": [
+                        {k: e.get(k) for k in ("reason", "session_id", "prefix_len", "nbytes")}
+                        for e in evictions
+                        if isinstance(e, Mapping)
+                    ],
+                },
+                default=str,
+            )
+        )
+    except Exception:
+        pass
+
+
 def _memory_stop_message(memory_stop: Mapping[str, Any]) -> str:
     """What an answer the memory ended says to the person reading it."""
 
@@ -29344,6 +29398,7 @@ def _finalize_batched_ar_generation(
     generated["completion_tokens"] = completion_tokens
     generated["tok_s"] = stats.get("decode_tok_s") or generated.get("tok_s") or 0.0
     generated["end_to_end_tok_s"] = stats["server_tok_s"]
+    _log_large_cache_miss(state, prompt_tokens=len(prompt_ids), stats=stats)
     if not bool(
         (request_observability or {}).get("warmup")
     ) and not _server_console_enabled(state):
@@ -29548,6 +29603,7 @@ def _finalize_mtp_batch_generation(
     generated["completion_tokens"] = completion_tokens
     generated["tok_s"] = stats.get("decode_tok_s") or generated.get("tok_s") or 0.0
     generated["end_to_end_tok_s"] = stats["server_tok_s"]
+    _log_large_cache_miss(state, prompt_tokens=len(prompt_ids), stats=stats)
     if not bool(
         (request_observability or {}).get("warmup")
     ) and not _server_console_enabled(state):
@@ -32042,6 +32098,7 @@ def _run_generation(
         if seed_is_explicit or out.text.strip():
             break
     assert last is not None
+    _log_large_cache_miss(state, prompt_tokens=len(prompt_ids), stats=stats)
     if not bool(
         (request_observability or {}).get("warmup")
     ) and not _server_console_enabled(state):
