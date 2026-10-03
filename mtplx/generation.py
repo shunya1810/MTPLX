@@ -10431,7 +10431,6 @@ def generate_mtp1(
     )
 
 
-@_with_dense_mrope_request
 def _paged_round_reservation(cache: Any, *, depth: int, copy_window: int = 0) -> dict[str, Any] | None:
     """Reserve one decode round's widest window on the promoted paged KV.
 
@@ -10452,6 +10451,7 @@ def _paged_round_reservation(cache: Any, *, depth: int, copy_window: int = 0) ->
     return None
 
 
+@_with_dense_mrope_request
 def generate_mtpk(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
