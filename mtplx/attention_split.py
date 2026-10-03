@@ -842,8 +842,12 @@ def _install_split_attention_hook(attn: Any) -> bool:
             output = None
             if int(queries.shape[2]) >= 9 and _gqa_mma_prefill_enabled():
                 output = _mma_prefill_attention(self, queries, cache, mask)
+                if output is not None:
+                    route = "mma_prefill"
             if output is None and getattr(self, "_mtplx_mma_draft_enabled", False):
                 output = _mma_draft_attention(self, queries, cache, mask)
+                if output is not None:
+                    route = "mma_draft"
             if output is None:
                 output = scaled_dot_product_attention(
                     queries,

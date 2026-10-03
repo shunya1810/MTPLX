@@ -21679,6 +21679,42 @@ def _forward_row_bytes(args: Any) -> int | None:
     return max(rows)
 
 
+def _m1_mma_prefill_scratch_fraction() -> float | None:
+    """The share of the dense prefill bill an M1-family MMA prefill holds.
+
+    The dense bill was measured with fused SDPA prefill attention, which
+    builds the score tensor. The M1 family runs every prefill chunk on the
+    MMA kernel (attention_split._gqa_mma_prefill_attention, min prefix 0),
+    which does not: on an M1 Max 64 GB with Qwen3.8-27B (merge onto 2.12.2,
+    2026-10-03, MTPLX_PREFILL_GUARD_TRACE), a 118,499-token prompt with
+    18,993 restored held 2.05 GB between the engine line and MLX's peak at
+    2,048 rows against the 3.15 GB billed, and the whole request grew the
+    Mac's wired memory by 8.1 and 9.2 GB (two runs) against a 13.0 GB bill.
+    0.70 keeps about 0.15 GB of margin over that reading. ``None`` (the full
+    bill) off the M1 family, with the MMA prefill switched off, or when it
+    serves only long prefixes; ``MTPLX_M1_MMA_PREFILL_SCRATCH_FRACTION``
+    overrides (1 = the upstream bill).
+    """
+    try:
+        from mtplx.attention_split import (
+            _gqa_mma_prefill_enabled,
+            _gqa_mma_prefill_min_prefix,
+        )
+
+        if not _gqa_mma_prefill_enabled() or _gqa_mma_prefill_min_prefix() > 0:
+            return None
+    except Exception:
+        return None
+    raw = (os.environ.get("MTPLX_M1_MMA_PREFILL_SCRATCH_FRACTION") or "").strip()
+    try:
+        fraction = float(raw) if raw else 0.70
+    except ValueError:
+        fraction = 0.70
+    if not 0.0 < fraction <= 1.0:
+        return None
+    return fraction
+
+
 def _admission_scratch_bytes(
     state: Any, *, rows: int, prompt_tokens: int, geometry: _AdmissionGeometry
 ) -> tuple[int, str]:
@@ -21755,6 +21791,12 @@ def _admission_scratch_bytes(
     dense = _dense_prefill_bill(_runtime_text_args(runtime), rows)
     if dense:
         # Measured on this family (``_DENSE_PREFILL_FIXED_BYTES``).
+        fraction = _m1_mma_prefill_scratch_fraction()
+        if fraction is not None:
+            return (
+                max(_DENSE_PREFILL_FIXED_BYTES, int(dense * fraction)) + attention,
+                "geometry_measured_m1_mma" + suffix,
+            )
         return dense + attention, "geometry_measured" + suffix
     return max(fixed + per_row * rows, flat_share) + attention, "geometry" + suffix
 
@@ -23146,6 +23188,26 @@ def _run_prefill_admission(
     # probing the bank.
     cheap = growth(0, True, None, widths[0])
     if shed_deficit(now, cheap) <= 0:
+        if os.environ.get("MTPLX_ADMISSION_TRACE", "").strip() == "1":
+            _safe_stdout_print(
+                "[mtplx] admission bill "
+                + json.dumps(
+                    {
+                        "path": "cheap_worst_case",
+                        "prompt_tokens": int(prompt_tokens),
+                        "active_bytes": int(now["active"]),
+                        "engine_bytes": int(now["engine"]),
+                        "growth": dict(cheap),
+                    },
+                    default=str,
+                )
+            )
+            try:
+                import mlx.core as _mx
+
+                _mx.reset_peak_memory()
+            except Exception:
+                pass
         settle(cheap)
         return None
 
@@ -23349,6 +23411,30 @@ def _run_prefill_admission(
                 pass
             now = measure()
             chosen = widest_fit(now, models)
+    if os.environ.get("MTPLX_ADMISSION_TRACE", "").strip() == "1":
+        # Every admission's bill, admitted or not (calibration runs; the
+        # shed receipt below only prints when something had to give).
+        _safe_stdout_print(
+            "[mtplx] admission bill "
+            + json.dumps(
+                {
+                    "prompt_tokens": int(prompt_tokens),
+                    "reused_tokens": int(reused_tokens),
+                    "miss_tokens": int(miss_tokens),
+                    "active_bytes": int(now["active"]),
+                    "engine_bytes": int(now["engine"]),
+                    "chosen": None if chosen is _ADMISSION_NO_FIT else chosen,
+                    "growth": dict(models[widths[0]]),
+                },
+                default=str,
+            )
+        )
+        try:
+            import mlx.core as _mx
+
+            _mx.reset_peak_memory()
+        except Exception:
+            pass
     if chosen is not _ADMISSION_NO_FIT and chosen == widths[0]:
         settle(models[chosen])
         if early_pool_clear is not None or own_moved is not None:
