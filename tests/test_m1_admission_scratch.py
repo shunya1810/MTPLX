@@ -108,7 +108,10 @@ def test_a_compact_q8_restore_is_priced_at_page_width(monkeypatch):
     assert direct["repage_copy_bytes"] == 0 and direct["quant_working_bytes"] == 0
     # The restored prefix, the suffix and the answer's reserve, all at page width.
     assert direct["live_prefill_bytes"] == (112_318 + 16_384) * PAGED_W
-    assert direct["growth_bytes"] < upstream["growth_bytes"] / 2
+    # Plus the generation-final commit at the stored precision.
+    assert direct["publish_copy_bytes"] == (112_318 + 16_384) * PAGED_W
+    assert direct["growth_bytes"] == direct["decode_start_bytes"] == 2 * (112_318 + 16_384) * PAGED_W
+    assert direct["growth_bytes"] < upstream["growth_bytes"]
 
 
 @pytest.mark.parametrize(

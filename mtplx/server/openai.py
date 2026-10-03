@@ -22430,7 +22430,14 @@ def _admission_growth(
         # mirror that decode's first write copies: full width either way.
         # (The M1 build banks quantized pages at their stored precision.)
         live_total = P * live_w
-    if not publish:
+    if layout == "paged_compact_direct":
+        # The answer's generation-final commit banks the conversation at its
+        # stored precision beside the restored pages. Measured (M1 Max,
+        # 2026-10-04): a 20-token turn on a 110,016-token q8 conversation
+        # grew the Mac's wired memory by 7.38 GB; the restore alone is
+        # 4.42 GB at page width.
+        publish_copy = (P + out_rows) * paged_w
+    elif not publish:
         publish_copy = 0
     elif publish_bytes is not None:
         publish_copy = max(0, int(publish_bytes))
