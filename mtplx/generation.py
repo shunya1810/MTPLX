@@ -10432,6 +10432,26 @@ def generate_mtp1(
 
 
 @_with_dense_mrope_request
+def _paged_round_reservation(cache: Any, *, depth: int, copy_window: int = 0) -> dict[str, Any] | None:
+    """Reserve one decode round's widest window on the promoted paged KV.
+
+    ``None`` when it fits (or nothing is paged, or dynamic growth is off and
+    the forward keeps its own refusal); a receipt when the memory guard
+    refused the growth, before any row moved.
+    """
+
+    from .cache_state import PagedKVGrowthRefused, reserve_paged_window
+
+    window = max(1 + max(1, int(depth)), int(copy_window))
+    try:
+        reserve_paged_window(cache, window)
+    except PagedKVGrowthRefused as exc:
+        return {"reason": "paged_kv_growth_refused", "window_tokens": window, "detail": str(exc)}
+    except Exception:
+        return None
+    return None
+
+
 def generate_mtpk(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -12930,6 +12950,21 @@ def generate_mtpk(
                 memory_stop = {**exc.receipt, "completion_tokens": len(tokens)}
                 append_event({"step": step, "memory_stop": memory_stop})
                 break
+        # The paged KV (the 27B under --paged-kv-quantization) grows inside
+        # the forward that outruns it, where a refusal (PagedKVGrowthRefused,
+        # a MemoryError) failed the whole request and lost the streamed
+        # answer: an omp turn 16.5K tokens into writing a file (2026-10-03,
+        # 116,911 tokens of context, 5.55 GiB needed, 7.04 free). Reserve
+        # this round's widest window here, between rounds, so a refusal ends
+        # the answer with every committed token whole (finish_reason
+        # "length", memory_stop), as the fixed-M4 bank above does.
+        paged_round = _paged_round_reservation(
+            cache, depth=int(speculative_depth), copy_window=(1 + max(4, int(ccopy_k))) if ccopy_active else 0
+        )
+        if paged_round is not None:
+            memory_stop = {**paged_round, "completion_tokens": len(tokens)}
+            append_event({"step": step, "memory_stop": memory_stop})
+            break
         primary_already_emitted = pending_primary is not None
         if pending_primary is None:
             primary_row = logits[0]

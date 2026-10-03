@@ -815,6 +815,17 @@ def test_generation_commits_one_token_past_a_full_promoted_cache(mode, path, mon
         i for i, (rows, name, offset, capacity) in enumerate(model.calls)
         if rows == 1 and name == adapter_name and offset == capacity == 32
     ]
+    if lazy:
+        # generate_mtpk reserves each round's window between rounds (the M1
+        # build: a refused growth ends the answer instead of failing it), so
+        # the round that reaches row 32 runs on buffers already grown to 48.
+        assert not crossing, model.calls
+        reached = [
+            i for i, (rows, name, offset, capacity) in enumerate(model.calls)
+            if name == adapter_name and isinstance(offset, int) and offset >= 32
+        ]
+        assert reached and all(model.calls[i][3] == 48 for i in reached), model.calls
+        crossing = reached[:1]
     assert len(crossing) == 1, model.calls
     if lazy:
         lazy_rounds = [
@@ -903,22 +914,25 @@ def test_growth_refused_at_the_final_commit_keeps_the_response_and_banks_nothing
 
 
 @pytest.mark.parametrize("mode", MODES)
-def test_growth_refused_mid_generation_raises_the_memory_refusal_after_the_emitted_tokens(mode, monkeypatch):
-    """A refusal before the last token (here the lazy-bonus commit) leaves
-    generate_mtpk as PagedKVGrowthRefused, a MemoryError; the server answers
-    it with its 507 frame (next test). Every token streamed before it is
-    the exact count."""
+def test_growth_refused_mid_generation_ends_the_answer_after_the_emitted_tokens(mode, monkeypatch):
+    """A refusal before the last token ends the answer between rounds (the M1
+    build reserves each round's window before it runs): finish_reason
+    "length", a memory_stop receipt, every streamed token kept and exact.
+    Upstream raised PagedKVGrowthRefused here and the server sent a 507
+    frame (next test, which still covers a refusal raised from elsewhere)."""
 
     _install_available(monkeypatch, 1 * 1024**3)
     emitted: list[int] = []
-    with pytest.raises(PagedKVGrowthRefused, match="insufficient memory to grow the paged KV cache"):
-        _generate_counting(
-            mode, prompt_len=11, max_tokens=30, blocks=BLOCKS, lazy=True,
-            monkeypatch=monkeypatch, token_callback=emitted.extend,
-        )
-    prompt = _counting_prompt(11)
-    wanted = [(prompt[-1] + 1 + i) % _PagedCountingModel.V for i in range(30)]
-    assert 0 < len(emitted) < 30 and emitted == wanted[: len(emitted)]
+    _model, out, wanted = _generate_counting(
+        mode, prompt_len=11, max_tokens=30, blocks=BLOCKS, lazy=True,
+        monkeypatch=monkeypatch, token_callback=emitted.extend,
+    )
+    assert out.finish_reason == "length"
+    stop = out.stats.memory_stop
+    assert stop and stop["reason"] == "paged_kv_growth_refused"
+    assert "insufficient memory to grow the paged KV cache" in stop["detail"]
+    assert 0 < len(out.tokens) < 30 and out.tokens == wanted[: len(out.tokens)]
+    assert emitted == out.tokens[: len(emitted)]
 
 
 def test_a_growth_refusal_mid_stream_is_a_507_frame_banks_nothing_and_the_next_request_runs(monkeypatch):
