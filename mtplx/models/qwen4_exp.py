@@ -1114,6 +1114,9 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
             and getattr(proj, "group_size", None) in (32, 64)
             and getattr(proj, "weight", None) is not None
             and proj.weight.dtype == mx.uint32
+            # The kernel's output width is compiled in (gdn_out_fused DMODEL
+            # 2560): a 5120-wide trunk would get half its out_proj rows.
+            and tuple(proj.weight.shape) == (2560, 768)
         )
 
 

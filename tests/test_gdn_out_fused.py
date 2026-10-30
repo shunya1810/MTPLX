@@ -86,3 +86,16 @@ def test_gdn_module_fused_out_matches_stock(monkeypatch):
     assert not gdn._fused_out_applies(1, 3)
     out_multi = gdn(multi)
     assert out_multi.shape == (1, 3, 2560)
+
+
+def test_a_wider_trunk_keeps_the_stock_out_proj(monkeypatch):
+    """The kernel's output width (2560) is compiled in: a 5120-wide Qwen4 trunk
+    with the same 48x128 GDN values must not take it."""
+
+    from mtplx.models.qwen4_exp import GatedDeltaNet, TextArgs
+
+    gdn = GatedDeltaNet(TextArgs(hidden_size=5120))
+    gdn.out_proj = nn.QuantizedLinear.from_linear(gdn.out_proj, group_size=64, bits=4)
+    monkeypatch.setenv("MTPLX_FUSED_GDN_OUT", "1")
+    assert tuple(gdn.out_proj.weight.shape) == (5120, 768)
+    assert not gdn._fused_out_applies(1, 1)
