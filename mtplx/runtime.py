@@ -837,6 +837,8 @@ def load(
     router_report: dict[str, Any] = {}
     # Laguna skips the qwen3-next kernel stack entirely; its own env-gated
     # fused lanes install right before runtime construction below.
+    if _m1_fp16_cast_requested():
+        logger.info("[m1-fp16-cast] %s", _cast_bf16_parameters_to_fp16(model))
     if not _is_laguna_s_2_1_mlx_4bit_config(config):
         from .attention_split import (
             configure_mtp_draft_attention,
@@ -1234,6 +1236,64 @@ def _model_classes_for_config(config: dict[str, Any]) -> tuple[type, type] | Non
     from .models.laguna import Model, ModelArgs
 
     return Model, ModelArgs
+
+
+def _m1_fp16_cast_requested() -> bool:
+    """``MTPLX_M1_FP16_CAST=1``: run a bf16 pack in fp16 (opt-in).
+
+    The M1 GPU family has no bfloat16 arithmetic: on a dense qwen4_exp at
+    Qwen3.8-27B widths the raw 4-row forward ran 256 ms in bf16 against
+    208 ms in fp16, and the engine's depth-3 verify on the 8-layer synthetic
+    pack 22.7 -> 21.0 ms (2026-10-30). The Qwen3.8 FP16 packs are the same
+    conversion done offline. Opt-in because fp16's range is narrower: a
+    model whose activations pass 65,504 overflows (the non-finite logits
+    guard then stops the request).
+    """
+
+    raw = (os.environ.get("MTPLX_M1_FP16_CAST") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _cast_bf16_parameters_to_fp16(model: Any) -> dict[str, Any]:
+    """Cast every bfloat16 parameter (trunk and draft head, quantization
+    scales and biases included) to float16, except the ones the model's cast
+    predicate keeps (A_log, the n-gram table). Converts in batches of about
+    256 MB so the old and new copies never coexist for the whole model."""
+
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    keep = getattr(model, "cast_predicate", None)
+    casted, kept, nbytes = 0, 0, 0
+    batch: list[tuple[str, Any]] = []
+    batch_bytes = 0
+
+    def flush() -> None:
+        nonlocal batch, batch_bytes
+        if batch:
+            model.load_weights(batch, strict=False)
+            mx.eval([v for _, v in batch])
+        batch, batch_bytes = [], 0
+
+    # Popped one by one so a converted batch's bf16 originals are released
+    # once the model holds the fp16 copies.
+    params = tree_flatten(model.parameters())
+    params.reverse()
+    while params:
+        name, value = params.pop()
+        if value.dtype != mx.bfloat16:
+            continue
+        if name.endswith("A_log") or (callable(keep) and not keep(name)):
+            kept += 1
+            continue
+        batch.append((name, value.astype(mx.float16)))
+        casted += 1
+        nbytes += value.nbytes
+        batch_bytes += value.nbytes
+        if batch_bytes >= 256 << 20:
+            flush()
+    flush()
+    return {"casted": casted, "kept_bf16": kept, "bytes": nbytes}
 
 
 def _load_base_model(path: Path, config: dict[str, Any]) -> tuple[Any, Any]:
