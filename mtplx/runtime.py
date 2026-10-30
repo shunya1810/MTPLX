@@ -837,8 +837,14 @@ def load(
     router_report: dict[str, Any] = {}
     # Laguna skips the qwen3-next kernel stack entirely; its own env-gated
     # fused lanes install right before runtime construction below.
-    if _m1_fp16_cast_requested():
-        logger.info("[m1-fp16-cast] %s", _cast_bf16_parameters_to_fp16(model))
+    if _m1_fp16_cast_requested(config):
+        report = _cast_bf16_parameters_to_fp16(model)
+        if report["casted"]:
+            logger.info(
+                "[m1-fp16-cast] bf16 parameters run in fp16 on this GPU "
+                "(MTPLX_M1_FP16_CAST=0 keeps bf16): %s",
+                report,
+            )
     if not _is_laguna_s_2_1_mlx_4bit_config(config):
         from .attention_split import (
             configure_mtp_draft_attention,
@@ -1238,20 +1244,37 @@ def _model_classes_for_config(config: dict[str, Any]) -> tuple[type, type] | Non
     return Model, ModelArgs
 
 
-def _m1_fp16_cast_requested() -> bool:
-    """``MTPLX_M1_FP16_CAST=1``: run a bf16 pack in fp16 (opt-in).
+def _m1_fp16_cast_requested(config: dict[str, Any] | None = None) -> bool:
+    """Run a bf16 pack in fp16: ``MTPLX_M1_FP16_CAST`` 1/0 forces; unset, on
+    for the qwen4_exp family on the M1 GPU family.
 
-    The M1 GPU family has no bfloat16 arithmetic: on a dense qwen4_exp at
-    Qwen3.8-27B widths the raw 4-row forward ran 256 ms in bf16 against
-    208 ms in fp16, and the engine's depth-3 verify on the 8-layer synthetic
-    pack 22.7 -> 21.0 ms (2026-10-30). The Qwen3.8 FP16 packs are the same
-    conversion done offline. Opt-in because fp16's range is narrower: a
-    model whose activations pass 65,504 overflows (the non-finite logits
-    guard then stops the request).
+    M1 GPUs have no bfloat16 arithmetic. Synthetic qwen4_exp trunk at
+    Qwen3.8-27B widths, 64 layers, the same bf16 pack with and without the
+    cast (2026-10-30): prefill at 8K 122.8 -> 169.3 tok/s (MLP 129 -> 87 ms
+    and GDN 107 -> 76 ms per layer at 2,048 rows), depth-3 verify 139.1 ->
+    125.5 ms, 1-row decode 10.22 -> 10.53 tok/s: the fp16 pack's own numbers.
+    The Qwen3.8 FP16 packs are the same conversion done offline. Other
+    families stay opt-in: fp16's range is narrower, and a model whose
+    activations pass 65,504 overflows (some families do; the non-finite
+    logits guard then stops the request).
     """
 
     raw = (os.environ.get("MTPLX_M1_FP16_CAST") or "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    cfg = config or {}
+    text = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
+    types = {str(cfg.get("model_type") or "").lower(), str(text.get("model_type") or "").lower()}
+    if not types & {"qwen4_exp", "qwen4_exp_text"}:
+        return False
+    try:
+        from .cache_state import m1_long_context_defaults
+
+        return bool(m1_long_context_defaults())
+    except Exception:
+        return False
 
 
 def _cast_bf16_parameters_to_fp16(model: Any) -> dict[str, Any]:
