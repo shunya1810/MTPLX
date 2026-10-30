@@ -1128,6 +1128,18 @@ def _verify_inject(logits: mx.array, hc_count: int) -> mx.array:
     return 2.0 * mx.sigmoid(logits / hc_count)
 
 
+def _hc_rows_read_applies(module, hyper_input: mx.array) -> bool:
+    """mtplx.kernels.hc_read_rows serves this read: enabled (MTPLX_HC_READ_ROWS,
+    default on the M1 family), not the prefill phase, 1..4 rows, bf16/fp16
+    unquantized mixes."""
+
+    from mtplx.kernels import hc_read_rows as _rows
+
+    if current_attention_phase() == "prefill" or not _rows.enabled():
+        return False
+    return _rows.supports(module, hyper_input)
+
+
 class GatedResidual(nn.Module):
     """The Gated Residual read/write mixer (hyper-connections)."""
 
@@ -1259,6 +1271,12 @@ class GatedResidual(nn.Module):
 
         if self._verify_rows_read_applies(hyper_input, pending):
             return self._verify_rows_read(hyper_input, pending)
+        if _hc_rows_read_applies(self, hyper_input):
+            # Decode/verify rows at any width (M1 default): three dispatches
+            # over the whole GPU instead of the ~10-kernel eager chain.
+            from mtplx.kernels.hc_read_rows import hc_read_rows
+
+            return hc_read_rows(self, hyper_input, pending)
         if pending is not None:
             hyper_input = _hyper_residual_write(hyper_input, *pending)
         if self._v3_read_applies(hyper_input):

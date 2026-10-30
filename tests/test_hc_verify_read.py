@@ -30,6 +30,9 @@ def _clean_state(monkeypatch):
     monkeypatch.delenv(hc_verify_read.ENV, raising=False)
     monkeypatch.delenv("MTPLX_FUSED_HC", raising=False)
     monkeypatch.delenv("MTPLX_FUSED_HC_V3", raising=False)
+    # The M1 rows kernel (mtplx/kernels/hc_read_rows.py) replaces the stock
+    # chain these tests pin; tests/test_hc_read_rows.py covers it.
+    monkeypatch.setenv("MTPLX_HC_READ_ROWS", "0")
     hc_verify_read.reset_for_tests()
     yield
     hc_verify_read.reset_for_tests()
