@@ -11,13 +11,13 @@ works for any hidden size, low rank and stream count:
   1. norm      one threadgroup per (row, stream): optional pending residual write
                (``hyper + block_out * inject``), grouped RMS norm, x gamma.
   2. down      the down projection and the inject projection, split over the input
-               width: each threadgroup stages one chunk of every row's normed input
-               and its simdgroups take two output rows each, reading the weights 16
+               width: each simdgroup takes one chunk (4,096 elements) of four output
+               rows, reading the weights and every row's normed input (from cache) 16
                bytes per lane. Writes fp32 partial sums per chunk.
   3. finalize  one thread per (row, output): the chunk partials in a fixed order, then
                mix = silu(down / hc) and inject = 2 * sigmoid(inject_logits / hc).
-  4. up        one simdgroup per hidden position: each stream's up-projection row
-               (16 bytes per lane), sigmoid, x normed, then the mean over streams.
+  4. up        one simdgroup per four hidden positions: each stream's up-projection
+               row (16 bytes per lane), sigmoid, x normed, then the mean over streams.
 
 The mix projections are streamed once per read whatever the row count (2 x 13 MB at
 hidden 5120), so a 4-row verify read costs about what a 1-row read does.
@@ -39,22 +39,26 @@ from functools import lru_cache
 import mlx.core as mx
 
 # M1 Max, hidden 5120, fp16, 32 distinct modules read as a dependent chain (each read
-# folds the previous write), per read: eager 0.181 / 0.288 / 0.319 / 0.324 / 0.329 ms at
-# 1 / 2 / 4 / 6 / 8 rows, these kernels 0.180 / 0.183 / 0.252 / 0.373 / 0.453 ms. Past 4
-# rows the per-row work (register-held partial sums, the staged mix) outgrows the eager
-# chain's matmuls, so wider verify forwards keep the eager read. A two-dispatch variant
-# (norm folded into the down pass, finalize and the write into the up pass) re-reads
-# each row's input per simdgroup and measured slower: 0.186 / 0.352 ms at 1 / 4 rows at
-# best. In the engine (64-layer synthetic Qwen4 27B, fp16): verify 136.2 -> 128.4 ms at
-# 4 rows, 126.7 -> 115.4 ms at 2 rows; 1-row decode unchanged.
+# folds the previous write), per read: eager 0.175 / 0.291 / 0.317 ms at 1 / 2 / 4 rows,
+# these kernels 0.157 / 0.173 / 0.242 ms (a version that staged the normed chunk in
+# threadgroup memory, one position per up simdgroup: 0.179 / 0.188 / 0.252, and
+# 0.373 / 0.453 at 6 / 8 rows against eager's 0.324 / 0.329). Past 4 rows the per-row
+# work outgrows the eager chain's matmuls, so wider verify forwards keep the eager read.
+# A two-dispatch variant (norm folded into the down pass, finalize and the write into
+# the up pass) re-reads each row's input per simdgroup and measured slower. Chunk 2048
+# to 5120, 2 to 8 rows per down simdgroup, 1 to 8 positions per up simdgroup: within
+# ~5%. In the engine (64-layer synthetic Qwen4 27B, fp16): depth-3 verify 134.7 ->
+# 125.5 ms; 1-row decode unchanged.
 MAX_ROWS = 4
-_ROWS_PER_SIMDGROUP = 2  # down-projection output rows per simdgroup
+_ROWS_PER_SIMDGROUP = 4  # down-projection output rows per simdgroup
+_POSITIONS_PER_SIMDGROUP = 4  # up-projection hidden positions per simdgroup
+_CHUNK = 4096  # input elements per down-projection simdgroup
 
 
 def _chunk(hcd: int) -> int:
-    """Input-width chunk of the down kernel: 8 rows x 1024 fp16 = 16 KB staged."""
+    """Input-width chunk of the down kernel (one simdgroup's share of a weight row)."""
 
-    for ck in (1024, 512, 256, 128):
+    for ck in (_CHUNK, 2048, 1024, 512, 256, 128):
         if hcd % ck == 0:
             return ck
     raise ValueError(f"hc input width {hcd} is not a multiple of 128")
@@ -98,30 +102,23 @@ _NORM_SRC = r"""
 """
 
 _DOWN_SRC = r"""
-    // threadgroup = (input chunk c, block of NSG * NR output rows); output rows are
-    // [0, R) of wd, then [R, R + HC) of wi.
-    const uint tg = threadgroup_position_in_grid.x;
-    const uint c = tg % KS;
-    const uint blk = tg / KS;
+    // one simdgroup per (input chunk c, NR output rows); output rows are [0, R) of wd,
+    // then [R, R + HC) of wi. The normed chunk is read straight from device memory
+    // (it stays in cache: rows x 40 KB at hidden 5120).
     const uint lane = thread_index_in_simdgroup;
-    const uint sg = simdgroup_index_in_threadgroup;
-    const uint t = thread_index_in_threadgroup;
+    const uint gsg = threadgroup_position_in_grid.x * NSG + simdgroup_index_in_threadgroup;
     constexpr uint NOUT = R + HC;
     constexpr uint CV = CK / 8;  // 16-byte vectors per chunk row
-    threadgroup uint4 tile[S * CV];
-    for (uint i = t; i < S * CV; i += NSG * 32) {
-        const uint s = i / CV;
-        tile[i] = ((device const uint4*)(normed + (size_t)s * HCD + (size_t)c * CK))[i % CV];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const uint row0 = (blk * NSG + sg) * NR;
+    const uint c = gsg % KS;
+    const uint row0 = (gsg / KS) * NR;
     if (row0 >= NOUT) return;
     float acc[NR][S];
     for (int r = 0; r < NR; ++r)
         for (int s = 0; s < S; ++s) acc[r][s] = 0.0f;
     for (uint v = lane; v < CV; v += 32) {
         uint4 xv[S];
-        for (int s = 0; s < S; ++s) xv[s] = tile[s * CV + v];
+        for (int s = 0; s < S; ++s)
+            xv[s] = ((device const uint4*)(normed + (size_t)s * HCD + (size_t)c * CK))[v];
         for (int r = 0; r < NR; ++r) {
             const uint n = row0 + r;
             if (n >= NOUT) break;
@@ -166,41 +163,44 @@ _FINALIZE_SRC = r"""
 """
 
 _UP_SRC = r"""
-    // one simdgroup per hidden position d: HC up-projection rows (g * D + d), all rows
+    // one simdgroup per ND consecutive hidden positions d: HC up-projection rows (g * D + d)
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint t = thread_index_in_threadgroup;
-    const uint d = threadgroup_position_in_grid.x * NSG + sg;
+    const uint d0 = (threadgroup_position_in_grid.x * NSG + sg) * ND;
     constexpr uint RV = R / 8;
     threadgroup float mixs[S * R];
     for (uint i = t; i < (uint)(S * R); i += NSG * 32) mixs[i] = (float)mix[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (d >= (uint)D) return;
-    float out[S];
-    for (int s = 0; s < S; ++s) out[s] = 0.0f;
-    for (int g = 0; g < HC; ++g) {
-        device const uint4* urow = (device const uint4*)(wu + (size_t)(g * D + d) * R);
-        float acc[S];
-        for (int s = 0; s < S; ++s) acc[s] = 0.0f;
-        for (uint jv = lane; jv < RV; jv += 32) {
-            const uint4 uv = urow[jv];
-            const thread T* uh = (const thread T*)&uv;
+    for (int nd = 0; nd < ND; ++nd) {
+        const uint d = d0 + nd;
+        if (d >= (uint)D) return;
+        float out[S];
+        for (int s = 0; s < S; ++s) out[s] = 0.0f;
+        for (int g = 0; g < HC; ++g) {
+            device const uint4* urow = (device const uint4*)(wu + (size_t)(g * D + d) * R);
+            float acc[S];
+            for (int s = 0; s < S; ++s) acc[s] = 0.0f;
+            for (uint jv = lane; jv < RV; jv += 32) {
+                const uint4 uv = urow[jv];
+                const thread T* uh = (const thread T*)&uv;
+                for (int s = 0; s < S; ++s) {
+                    threadgroup const float* m = mixs + s * R + jv * 8;
+                    float a = acc[s];
+                    for (int e = 0; e < 8; ++e) a += m[e] * (float)uh[e];
+                    acc[s] = a;
+                }
+            }
             for (int s = 0; s < S; ++s) {
-                threadgroup const float* m = mixs + s * R + jv * 8;
-                float a = acc[s];
-                for (int e = 0; e < 8; ++e) a += m[e] * (float)uh[e];
-                acc[s] = a;
+                const float a = (float)((T)simd_sum(acc[s]));           // Linear out
+                const float w = (float)((T)(1.0f / (1.0f + metal::exp(-a))));  // sigmoid
+                const T prod = (T)(w * (float)normed[(size_t)s * HCD + g * D + d]);
+                out[s] += (float)prod;
             }
         }
-        for (int s = 0; s < S; ++s) {
-            const float a = (float)((T)simd_sum(acc[s]));           // Linear out
-            const float w = (float)((T)(1.0f / (1.0f + metal::exp(-a))));  // sigmoid
-            const T prod = (T)(w * (float)normed[(size_t)s * HCD + g * D + d]);
-            out[s] += (float)prod;
+        if (lane == 0) {
+            for (int s = 0; s < S; ++s) mixed[(size_t)s * D + d] = (T)(out[s] / (float)HC);
         }
-    }
-    if (lane == 0) {
-        for (int s = 0; s < S; ++s) mixed[(size_t)s * D + d] = (T)(out[s] / (float)HC);
     }
 """
 
@@ -329,12 +329,13 @@ def hc_read_rows(module, hyper_input: mx.array, pending=None):
     n_out = r + hc
     ck = _chunk(hcd)
     ks = hcd // ck
-    rows_per_tg = nsg * _ROWS_PER_SIMDGROUP
+    nr = _ROWS_PER_SIMDGROUP
+    simdgroups = ks * ((n_out + nr - 1) // nr)
     (partial,) = _down_kernel()(
         inputs=[normed, wd, wi],
         template=[("T", dt), ("HC", hc), ("R", r), ("HCD", hcd), ("S", rows), ("NSG", nsg),
-                  ("NR", _ROWS_PER_SIMDGROUP), ("CK", ck), ("KS", ks)],
-        grid=(32 * nsg * ks * ((n_out + rows_per_tg - 1) // rows_per_tg), 1, 1),
+                  ("NR", nr), ("CK", ck), ("KS", ks)],
+        grid=(32 * nsg * ((simdgroups + nsg - 1) // nsg), 1, 1),
         threadgroup=(32 * nsg, 1, 1),
         output_shapes=[(ks * rows * n_out,)],
         output_dtypes=[mx.float32],
@@ -347,11 +348,13 @@ def hc_read_rows(module, hyper_input: mx.array, pending=None):
         output_shapes=[(rows, r), (rows, hc)],
         output_dtypes=[dt, dt],
     )
+    nd = _POSITIONS_PER_SIMDGROUP
+    per_tg = nsg * nd
     (mixed,) = _up_kernel()(
         inputs=[mix, wu, normed],
         template=[("T", dt), ("HC", hc), ("R", r), ("D", d), ("HCD", hcd), ("S", rows),
-                  ("NSG", nsg)],
-        grid=(32 * nsg * ((d + nsg - 1) // nsg), 1, 1),
+                  ("NSG", nsg), ("ND", nd)],
+        grid=(32 * nsg * ((d + per_tg - 1) // per_tg), 1, 1),
         threadgroup=(32 * nsg, 1, 1),
         output_shapes=[(rows, d)],
         output_dtypes=[dt],
