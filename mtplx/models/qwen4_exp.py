@@ -59,6 +59,7 @@ from mtplx.attention_context import vision_rope_state
 from mtplx.demotions import note as _note_demotion
 from mlx_lm.models.qwen3_5 import GatedDeltaNet as _Qwen3_5GatedDeltaNet
 from mlx_lm.models.qwen3_next import (
+    Qwen3NextMLP as _Qwen3NextMLP,
     Qwen3NextSparseMoeBlock as _Qwen3NextSparseMoeBlock,
 )
 
@@ -102,6 +103,12 @@ class TextArgs(BaseModelArgs):
     shared_expert_intermediate_size: int = 640
     norm_topk_prob: bool = True
     decoder_sparse_step: int = 1
+    # Dense feed-forward (no experts): a qwen4 family member with
+    # num_experts == 0, or the layers listed in mlp_only_layers (zero-indexed,
+    # as in the qwen3_next config), runs a SwiGLU MLP of this width instead
+    # of the sparse MoE block.
+    intermediate_size: int = 0
+    mlp_only_layers: Optional[List[int]] = None
 
     # Gated Residual / hyper-connections
     hc_count: int = 4
@@ -1768,7 +1775,7 @@ def _fuse_gdn_in_proj_sanitize(model, out: dict) -> dict:
         if any(w.shape[-1] != k_words or s.shape[-1] != n_groups for w, s, _ in parts):
             continue  # mixed packing: stay stock
         gdn = model.layers[idx].linear_attn
-        k_in = 2560  # in_proj input dim = hidden (same contract as gate_up)
+        k_in = int(model.language_model.args.hidden_size)  # in_proj input dim = hidden (same contract as gate_up)
         group_size = k_in // n_groups
         bits = (k_words * 32) // k_in
         if bits not in (4, 8):
@@ -1858,7 +1865,7 @@ def _fuse_qsa_qkv_sanitize(model, out: dict) -> dict:
         attn = model.layers[idx].self_attn
         if getattr(attn, "indexer", None) is None:
             continue
-        k_in = 2560  # attention input dim = hidden (same contract as gate_up)
+        k_in = int(model.language_model.args.hidden_size)  # attention input dim = hidden (same contract as gate_up)
         group_size = k_in // n_groups
         bits = (k_words * 32) // k_in
         if bits not in (4, 8):
@@ -2628,7 +2635,7 @@ def _fuse_gate_up_sanitize(model, out: dict) -> dict:
                 continue  # bf16/tiny checkpoints: stock path
             if (gb is None) != (ub is None):
                 continue
-            k_in = 2560  # gate/up input dim = hidden for both blocks
+            k_in = int(model.language_model.args.hidden_size)  # gate/up input dim = hidden for both blocks
             group_size = k_in // gs.shape[-1]
             bits = (gw.shape[-1] * 32) // k_in
             if gb is None:
@@ -6253,7 +6260,10 @@ class DecoderLayer(nn.Module):
             self.linear_attn = GatedDeltaNet(args)
         else:
             self.self_attn = Attention(args)
-        self.mlp = SparseMoeBlock(args)
+        if args.num_experts and layer_idx not in (args.mlp_only_layers or ()):
+            self.mlp = SparseMoeBlock(args)
+        else:
+            self.mlp = _Qwen3NextMLP(args.hidden_size, args.intermediate_size)
         self.attn_hyper_connection = GatedResidual(args)
         self.mlp_hyper_connection = GatedResidual(args)
         if (layer_idx + 1) in args.ple_layer_ids:
