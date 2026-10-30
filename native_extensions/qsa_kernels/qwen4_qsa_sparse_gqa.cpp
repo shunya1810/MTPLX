@@ -12,7 +12,10 @@
 //   * the accepted (key_tile, dimension_tile) set is narrowed to the single
 //     shipped specialization (64, 64) so this check matches both the
 //     packaged .metal instantiations and the Python support check exactly;
-//   * a WM threadgroup static_assert for the M2/M3 896-thread ceiling.
+//   * a WM threadgroup static_assert for the M2/M3 896-thread ceiling;
+//   * any head layout whose GQA group is 1..16 query heads per KV head (oMLX
+//     accepts only Flash-Next's 24/2): 12 keeps the vendored specialization,
+//     other groups launch a runtime-GQA one of the same 16-row tile.
 
 #include "qwen4_qsa_sparse_gqa.h"
 
@@ -49,6 +52,17 @@ std::string current_binary_dir() {
 }
 
 bool last_dim_contiguous(const array &arr) { return arr.strides(-1) == 1; }
+
+// Every GQA group runs one 16-row tile (two 8-row MMA fragments, one
+// simdgroup each). Group 12 keeps the vendored compile-time specialization;
+// any other group of up to kMaxGQA heads runs the runtime-GQA one ("_gqa0").
+constexpr int kMaxGQA = 16;
+constexpr int kHeadPad = 16;
+constexpr int kSimdgroups = kHeadPad / 8;
+
+bool gqa_supported(int gqa) { return gqa >= 1 && gqa <= kMaxGQA; }
+
+int gqa_kernel_name(int gqa) { return gqa == 12 ? 12 : 0; }
 
 struct Qwen4QSASparseGQAParams {
   int B;
@@ -95,11 +109,16 @@ public:
       return true;
     }
     if (q.shape(0) != 1 || k.shape(0) != 1 || v.shape(0) != 1 ||
-        selected.shape(0) != 1 || q.shape(1) != 24 || k.shape(1) != 2 ||
-        v.shape(1) != 2 || q.shape(3) != 256 || k.shape(3) != 256 ||
+        selected.shape(0) != 1 || q.shape(3) != 256 || k.shape(3) != 256 ||
         v.shape(3) != 256 || k.shape(2) != v.shape(2) || q.shape(2) <= 0 ||
         selected.shape(1) != 1 || selected.shape(2) != q.shape(2) ||
         selected.shape(3) != 512) {
+      return true;
+    }
+    // Head layout: whole GQA groups that fit the 16-row tile.
+    if (k.shape(1) <= 0 || v.shape(1) != k.shape(1) ||
+        q.shape(1) % k.shape(1) != 0 ||
+        !gqa_supported(q.shape(1) / k.shape(1))) {
       return true;
     }
     // MTPLX narrowing: only the packaged (BK, DC) = (64, 64) specialization.
@@ -140,10 +159,10 @@ public:
     const auto &selected = inputs[3];
     auto &out = outputs[0];
 
-    constexpr int gqa = 12;
+    const int gqa = q.shape(1) / k.shape(1);
     constexpr int dim = 256;
-    constexpr int wm = 2;
-    constexpr int hpad = 16;
+    constexpr int wm = kSimdgroups;
+    constexpr int hpad = kHeadPad;
     // Mirrors the in-kernel assert: the launch below is (32, wm, 1) threads.
     static_assert(wm * 32 <= 896,
                   "Threadgroup exceeds the M2/M3 896-thread ceiling.");
@@ -151,8 +170,8 @@ public:
     out.set_data(allocator::malloc(out.nbytes()));
     Qwen4QSASparseGQAParams params{
         /* int B = */ 1,
-        /* int q_heads = */ 24,
-        /* int kv_heads = */ 2,
+        /* int q_heads = */ q.shape(1),
+        /* int kv_heads = */ k.shape(1),
         /* int qL = */ q.shape(2),
         /* int kL = */ k.shape(2),
         /* int topk = */ selected.shape(3),
@@ -169,8 +188,8 @@ public:
 
     std::string kernel_name;
     concatenate(kernel_name, "qwen4_qsa_sparse_gqa_", type_to_name(q), "_bk",
-                key_tile_, "_dc", dimension_tile_, "_gqa", gqa, "_hp", hpad,
-                "_d", dim, "_wm", wm);
+                key_tile_, "_dc", dimension_tile_, "_gqa",
+                gqa_kernel_name(gqa), "_hp", hpad, "_d", dim, "_wm", wm);
 
     auto library = device.get_library(kMetalLibrary, current_binary_dir());
     auto kernel = device.get_kernel(kernel_name, library);
@@ -218,13 +237,13 @@ array qwen4_qsa_sparse_gqa_attention(const array &queries, const array &keys,
           dimension_tile, stream)) {
     std::ostringstream msg;
     msg << "[mtplx_qsa_kernels.qwen4_qsa_sparse_gqa_attention] expected "
-        << "q=[1,24,M,256], k/v=[1,2,K,256], uint32 selected blocks="
-        << "[1,1,M,512], q_offset>=0 with q_offset+M==K (the logical cache "
-        << "prefix, so Q is the suffix ending at the frontier), "
-        << "scale==0.0625, (BK,DC)==(64,64); got " << queries.shape() << ", "
-        << keys.shape() << ", " << values.shape() << ", "
-        << selected_blocks.shape() << ", q_offset=" << q_offset
-        << ", scale=" << scale << ".";
+        << "q=[1,H,M,256], k/v=[1,Hkv,K,256] with H/Hkv a whole group of "
+        << "1.." << kMaxGQA << " heads, uint32 selected blocks=[1,1,M,512], "
+        << "q_offset>=0 with q_offset+M==K (the logical cache prefix, so Q is "
+        << "the suffix ending at the frontier), scale==0.0625, "
+        << "(BK,DC)==(64,64); got " << queries.shape() << ", " << keys.shape()
+        << ", " << values.shape() << ", " << selected_blocks.shape()
+        << ", q_offset=" << q_offset << ", scale=" << scale << ".";
     throw std::invalid_argument(msg.str());
   }
 

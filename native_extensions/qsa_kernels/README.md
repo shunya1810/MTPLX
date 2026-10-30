@@ -108,3 +108,13 @@ Only `(BK, DC) = (64, 64)` is instantiated, for fp16 and bf16 — the
 specialization oMLX's production glue uses and the one that was measured on
 M3. The C++ `unsupported()` was narrowed to match, so the Python support
 check, the C++ check, and the packaged metallib all describe the same set.
+
+Head layouts: Flash-Next's 24 query / 2 KV heads (GQA 12) run oMLX's kernel
+as vendored; any other layout with 1 to 16 query heads per KV head runs a
+runtime-GQA specialization of the same 16-row tile (`_gqa0_hp16_d256_wm2`),
+proved against the dense reference the first time the wrapper sees it. On an
+M1 Max, a 24/4 layout (Qwen3.8-27B's attention) at 36K of history with 4,096
+query rows takes about 200 ms per layer in the kernel, twice the 24/2 time
+(twice the K/V it gathers). An 8-row one-simdgroup tile took 45% longer
+there and a 32-row four-simdgroup tile 62% longer. A build without `MAX_GQA`
+serves 24/2 only, and the wrapper knows it.

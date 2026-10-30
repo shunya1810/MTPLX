@@ -2352,22 +2352,43 @@ def _qsa_prefill_flash_min_context() -> int:
 
 
 def _qsa_prefill_direct_min_context() -> int:
-    """Crossover for the vendored Steel sparse-GQA consumer (M3 lane).
+    """Crossover for the vendored Steel sparse-GQA consumer (M1 to M4 lane).
 
     Defaults to the flash consumer's 32768 so the two direct consumers share
-    one story until an operator turns the knob. oMLX measured +11.7% prefill
-    on M3 already at 16K; an M3 Ultra 256GB sequential A/B of this port
-    (2026-09-01) saw the 32k TTFT win with
+    one story until an operator turns the knob, except on the M1 family,
+    whose measured crossover is lower (``_qsa_m1_crossover``). oMLX measured
+    +11.7% prefill on M3 already at 16K; an M3 Ultra 256GB sequential A/B of
+    this port (2026-09-01) saw the 32k TTFT win with
     ``MTPLX_QSA_PREFILL_DIRECT_MIN_CONTEXT=2049``.
     """
 
+    default = _qsa_m1_crossover() or 32768
     try:
         return max(
             2049,
-            int(os.environ.get("MTPLX_QSA_PREFILL_DIRECT_MIN_CONTEXT") or 32768),
+            int(os.environ.get("MTPLX_QSA_PREFILL_DIRECT_MIN_CONTEXT") or default),
         )
     except ValueError:
-        return 32768
+        return default
+
+
+def _qsa_m1_crossover() -> int:
+    """M1-family history crossover for wide forwards and the Steel consumer.
+
+    M1 Max, 2026-10-30, one QSA attention layer at Qwen3.8-27B widths (5120
+    hidden, 24 query heads, 4096-row forward): the stock eager-indexer +
+    dense-mask path and the selector + Steel direct kernel tie at 16K of
+    history with 4 KV heads (457 vs 448 ms) and the direct lane wins from
+    there (24K: 614 vs 479 ms); with Flash-Next's 2 KV heads the tie is near
+    8K (24K: 672 vs 324 ms). 0 off the M1 family.
+    """
+
+    try:
+        from mtplx.cache_state import m1_long_context_defaults
+
+        return 16384 if m1_long_context_defaults() else 0
+    except Exception:
+        return 0
 
 
 def _qsa_prefill_score_workspace_bytes() -> int:
@@ -2405,14 +2426,19 @@ def _qsa_prefill_wide_min_context() -> int:
     a wide forward than over a warm turn's short suffix.  Flash-Next on an M5
     Max, 2026-09-18, 4,096-row chunks: the masked dense lane runs 1,132 tok/s
     at 16K of history, 817 at 20K and 695 at 28K, while the block-sparse lane
-    holds 1,125 from 16K up.  Narrow forwards keep the 32,768 crossover their
+    holds 1,125 from 16K up (the server stamps that on tensor-unit GPUs).
+    The M1 family defaults to its own measured crossover
+    (``_qsa_m1_crossover``). Narrow forwards keep the 32,768 crossover their
     own A/B chose.
     """
 
+    default = _qsa_m1_crossover()
     try:
-        return max(0, int(os.environ.get("MTPLX_QSA_PREFILL_WIDE_MIN_CONTEXT") or 0))
+        return max(
+            0, int(os.environ.get("MTPLX_QSA_PREFILL_WIDE_MIN_CONTEXT") or default)
+        )
     except ValueError:
-        return 0
+        return default
 
 
 def _qsa_prefill_crossover(rows: int, general: int) -> int:

@@ -22,3 +22,12 @@ __all__ = [
     "abi_probe",
     "qwen4_qsa_sparse_gqa_attention",
 ]
+
+try:
+    # Largest GQA group the packaged tiles serve. A build that predates it
+    # serves only Flash-Next's 24 query / 2 KV heads.
+    from ._ext import MAX_GQA  # noqa: F401
+
+    __all__.append("MAX_GQA")
+except ImportError:
+    pass

@@ -20,7 +20,8 @@ namespace mtplx::qsa_kernels {
 // blocks. ``selected_blocks`` is ``[1, 1, qL, 512]`` uint32 holding a
 // chronological VALID PREFIX of block ids; validity is positional, derived
 // in-kernel as ``min(512, (q_offset + row + 1) / 4)``. Callers own that
-// invariant (see mtplx/kernels/qsa_prefill_direct.py).
+// invariant (see mtplx/kernels/qsa_prefill_direct.py). Any head layout with
+// 1..16 query heads per KV head.
 mx::array qwen4_qsa_sparse_gqa_attention(
     const mx::array &queries, const mx::array &keys, const mx::array &values,
     const mx::array &selected_blocks, float scale, int q_offset,

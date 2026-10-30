@@ -3,6 +3,8 @@
 #   native_extensions/mfa_attn  metal-flash-attention prefill, command-buffer limits,
 #                               in-place MTP KV append for the sampled draft chain
 #   native_extensions/ane_ffn   Neural Engine prefill (FFN split between the GPU and the ANE)
+#   native_extensions/qsa_kernels  Steel sparse attention for Qwen4-family (QSA) prefill at any
+#                               head layout; the in-place build wins over the app runtime's copy
 # Without them the server still runs: each feature falls back to the stock GPU path.
 #
 # Needs: the MTPLX app's runtime (~/Library/Application Support/MTPLX/runtime-venv),
@@ -21,7 +23,7 @@ if [ ! -x "$VENV/bin/python" ]; then
   "$RUNTIME" -m venv "$VENV"
 fi
 "$VENV/bin/python" -m pip install -q "mlx==$MLX_VERSION" "nanobind==$NANOBIND" cmake setuptools
-for ext in mfa_attn ane_ffn; do
+for ext in mfa_attn ane_ffn qsa_kernels; do
   cd "$ROOT/native_extensions/$ext"
   rm -rf build
   echo "building $ext ..."
@@ -37,4 +39,6 @@ try:
     from mtplx import ane_prefill as ap
     r = ap._ext().unavailable(); print('ane_ffn:', 'ok' if not r else 'NOT AVAILABLE: ' + r)
 except Exception as exc:
-    print('ane_ffn: NOT LOADED', exc)"
+    print('ane_ffn: NOT LOADED', exc)
+from mtplx.kernels import qsa_prefill_direct as q
+print('qsa_kernels:', 'ok' if q._ext_max_gqa() else 'NOT LOADED (24/2-only or missing)', q.qsa_prefill_direct_build_info().get('built_against_mlx', ''))"

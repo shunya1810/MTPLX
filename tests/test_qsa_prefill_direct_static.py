@@ -156,7 +156,20 @@ def test_direct_tier_has_its_own_context_crossover():
         "int(total_tokens) - int(rows) >= _qsa_prefill_direct_min_context()" in source
     )
     floor = _function_source("_qsa_prefill_direct_min_context")
-    assert 'os.environ.get("MTPLX_QSA_PREFILL_DIRECT_MIN_CONTEXT") or 32768' in floor
+    assert "default = _qsa_m1_crossover() or 32768" in floor
+    assert 'os.environ.get("MTPLX_QSA_PREFILL_DIRECT_MIN_CONTEXT") or default' in floor
+
+
+def test_m1_family_defaults_to_its_measured_crossover():
+    """The 32K crossover was measured on M5 tensor units; the M1 family's
+    own A/B puts the stock/direct tie at 16K, so an unset env takes that on
+    M1 for wide forwards and the Steel consumer, and 0 (no change) elsewhere."""
+
+    m1 = _function_source("_qsa_m1_crossover")
+    assert "16384 if m1_long_context_defaults() else 0" in m1
+    wide = _function_source("_qsa_prefill_wide_min_context")
+    assert "default = _qsa_m1_crossover()" in wide
+    assert 'os.environ.get("MTPLX_QSA_PREFILL_WIDE_MIN_CONTEXT") or default' in wide
 
 
 def test_direct_knobs_are_registered_for_operator_overrides():
@@ -187,8 +200,9 @@ def test_wrapper_support_check_mirrors_the_cpp_unsupported_clauses():
         "queries.ndim != 4",
         "_SUPPORTED_DTYPES",
         "keys.dtype != queries.dtype",
-        "(_BATCH, _Q_HEADS, _HEAD_DIM)",
-        "(_BATCH, _KV_HEADS, _HEAD_DIM)",
+        "(batch, head_dim) != (_BATCH, _HEAD_DIM)",
+        "(key_batch, key_dim) != (_BATCH, _HEAD_DIM)",
+        "_head_layout_unsupported_reason(query_heads, kv_heads)",
         "_last_dim_contiguous",
         "pos_start_i < 0",
         "key_len != total_tokens_i",
@@ -301,7 +315,32 @@ def test_only_the_packaged_specialization_is_instantiated():
     assert instantiations == [
         "instantiate_qwen4_sparse_gqa(float16, half, 64, 64);",
         "instantiate_qwen4_sparse_gqa(bfloat16, bfloat16_t, 64, 64);",
+        "instantiate_qwen4_sparse_gqa_any(float16, half, 64, 64);",
+        "instantiate_qwen4_sparse_gqa_any(bfloat16, bfloat16_t, 64, 64);",
     ]
+
+
+def test_head_layouts_mirror_between_cpp_and_wrapper():
+    """GQA 12 keeps the vendored kernel; every other group of 1..16 heads runs
+    the runtime-GQA specialization of the same 16-row tile. The wrapper only
+    admits such layouts when the loaded build says it has them (MAX_GQA)."""
+
+    metal = (EXT_DIR / "qwen4_qsa_sparse_gqa.metal").read_text(encoding="utf-8")
+    assert '"_gqa0_hp16_d256_wm2"' in metal
+    header = (EXT_DIR / "kernels" / "steel_qwen4_qsa_sparse_gqa.h").read_text(
+        encoding="utf-8"
+    )
+    assert "const int gqa = GQA > 0 ? GQA : params->gqa_factor;" in header
+    cpp = (EXT_DIR / "qwen4_qsa_sparse_gqa.cpp").read_text(encoding="utf-8")
+    assert "constexpr int kMaxGQA = 16;" in cpp
+    assert "q.shape(1) % k.shape(1) != 0" in cpp
+    assert "int gqa_kernel_name(int gqa) { return gqa == 12 ? 12 : 0; }" in cpp
+    bindings = (EXT_DIR / "bindings.cpp").read_text(encoding="utf-8")
+    assert 'm.attr("MAX_GQA") = 16;' in bindings
+    layout = _wrapper_function_source("_head_layout_unsupported_reason")
+    assert "_ext_max_gqa()" in layout
+    assert "query_heads % kv_heads" in layout
+    assert "query_heads // kv_heads > max_gqa" in layout
 
 
 def test_threadgroup_ceiling_is_asserted_at_compile_time():
@@ -315,7 +354,8 @@ def test_threadgroup_ceiling_is_asserted_at_compile_time():
     cpp = (EXT_DIR / "qwen4_qsa_sparse_gqa.cpp").read_text(encoding="utf-8")
     assert "static_assert(WM * 32 <= 896" in header
     assert "static_assert(wm * 32 <= 896" in cpp
-    assert "constexpr int wm = 2;" in cpp
+    assert "constexpr int kHeadPad = 16;" in cpp
+    assert "constexpr int wm = kSimdgroups;" in cpp
     # WM must not become a Python tuning knob: it is part of the compiled
     # kernel name and its MMA layout.
     assert "WM" not in WRAPPER_TEXT
@@ -478,8 +518,17 @@ def test_a_failed_pipeline_proof_disables_the_lane_process_wide():
     assert "_PIPELINE_STATE == _PIPELINE_FAILED" in reason
     # The per-call support check answers from the same state, so a failed
     # proof also makes qsa_prefill_direct() raise instead of dispatching.
-    assert "_lane_unavailable_reason()" in _wrapper_function_source(
+    assert "_static_unsupported_reason(" in _wrapper_function_body(
         "qsa_prefill_direct_unsupported_reason"
+    )
+    assert "_lane_unavailable_reason()" in _wrapper_function_source(
+        "_static_unsupported_reason"
+    )
+    # The dispatch checks the static contract only: the per-layout proof
+    # dispatches through it, and must not recurse into itself.
+    assert "_static_unsupported_reason(" in _wrapper_function_body("_dispatch")
+    assert "qsa_prefill_direct_unsupported_reason" not in _wrapper_function_body(
+        "_dispatch"
     )
     ready = _wrapper_function_source("qsa_prefill_direct_ready")
     assert "_lane_eligible()" in ready
@@ -500,10 +549,16 @@ def test_the_pipeline_proof_is_tracked_per_query_dtype():
     assert "_prove_all_pipelines()" in ready
     prove_all = _wrapper_function_body("_prove_all_pipelines")
     assert "_SUPPORTED_DTYPES" in prove_all
-    # The first-dispatch proof takes the dtype it is proving, so a float16
-    # first call cannot ride a bfloat16 PROVEN flag.
-    assert "def _prove_first_dispatch(out: mx.array, *, dtype: mx.Dtype)" in WRAPPER_TEXT
-    assert "_prove_first_dispatch(out, dtype=queries.dtype)" in WRAPPER_TEXT
+    # The first-dispatch proof takes the dtype and head layout it is proving,
+    # so a float16 first call cannot ride a bfloat16 PROVEN flag, nor a 24/4
+    # call ride the 24/2 one.
+    first = _wrapper_function_source("_prove_first_dispatch")
+    assert "dtype: mx.Dtype," in first
+    assert "_dtype_proven(dtype, q_heads, kv_heads)" in first
+    direct = _wrapper_function_body("qsa_prefill_direct")
+    assert "dtype=queries.dtype," in direct
+    assert "q_heads=int(queries.shape[1])," in direct
+    assert "kv_heads=int(keys.shape[1])," in direct
 
 
 def test_failed_is_terminal_and_the_first_proof_is_serialized():

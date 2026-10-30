@@ -49,6 +49,9 @@ NB_MODULE(_ext, m) {
   m.attr("BUILT_AGAINST_MLX") = MTPLX_QSA_BUILD_MLX_VERSION;
   m.attr("BUILT_AGAINST_NANOBIND") = MTPLX_QSA_BUILD_NANOBIND_VERSION;
   m.attr("METAL_LIBRARY") = MTPLX_QSA_METAL_LIBRARY;
+  // Largest GQA group (query heads per KV head) the packaged tiles serve.
+  // Builds without this attribute serve only Flash-Next's 24/2 layout.
+  m.attr("MAX_GQA") = 16;
 
   m.def(
       "qwen4_qsa_sparse_gqa_attention",

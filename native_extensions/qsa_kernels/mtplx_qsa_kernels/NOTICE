@@ -28,7 +28,12 @@ MTPLX MODIFICATIONS
     specialization (64, 64), for both fp16 and bf16;
   * only the (64, 64) kernels are instantiated in the .metal file;
   * static_assert(WM * 32 <= 896) added for the M2/M3 threadgroup ceiling;
-  * bindings reduced to abi_probe, build receipts, and this one kernel.
+  * bindings reduced to abi_probe, build receipts, and this one kernel;
+  * any head layout with 1..16 query heads per KV head: the kernel template
+    reads the group size from params->gqa_factor when its GQA argument is 0,
+    the .metal file adds that runtime-GQA specialization of the same 16-row
+    tile, the host derives the head counts from the tensor shapes, and the
+    bindings export MAX_GQA (oMLX serves only 24 query / 2 KV heads).
 
   The Metal include order in qwen4_qsa_sparse_gqa.metal is unchanged and is
   load-bearing (Steel's attention header provides Limits).

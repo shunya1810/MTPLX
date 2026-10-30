@@ -34,6 +34,9 @@ Three properties make this module safe to have installed:
   Metal kernel name embeds it (``qwen4_qsa_sparse_gqa_<type>_bk64_dc64_...``)
   and a metallib can carry a good bfloat16 specialization beside a missing
   float16 one; ``qsa_prefill_direct_ready`` proves both before it says True.
+  It is also per head layout: the name embeds the padded GQA tile, so a
+  layout other than Flash-Next's 24/2 is proved the first time the support
+  check sees it (one small synchronizing call per dtype and layout).
   Any such failure — a receipt mismatch, a failed preflight, a failed first
   evaluation of either dtype — disables the whole lane for the whole process,
   so ``qsa_prefill_direct_ready`` goes False, the M3 producer auto-gate
@@ -83,9 +86,11 @@ from mtplx.demotions import note as _note_demotion
 logger = logging.getLogger(__name__)
 
 _BATCH = 1
+# Flash-Next's head layout, the one every build serves and the one the
+# readiness preflight proves. Builds that export MAX_GQA also serve any whole
+# GQA group up to it (a Qwen3.8-27B-style 24 query / 4 KV heads is 6).
 _Q_HEADS = 24
 _KV_HEADS = 2
-_GQA = 12
 _HEAD_DIM = 256
 _MAX_CONTEXT = 1_048_576
 _COMPRESS_RATIO = 4
@@ -234,8 +239,21 @@ def _dtype_key(dtype: mx.Dtype) -> str:
     return str(dtype)
 
 
-def _dtype_proven(dtype: mx.Dtype) -> bool:
-    return _dtype_key(dtype) in _PIPELINE_PROVEN_DTYPES
+def _proof_key(
+    dtype: mx.Dtype, q_heads: int = _Q_HEADS, kv_heads: int = _KV_HEADS
+) -> str:
+    """Proof identity: the dtype, plus the head layout when it is not 24/2."""
+
+    key = _dtype_key(dtype)
+    if (int(q_heads), int(kv_heads)) != (_Q_HEADS, _KV_HEADS):
+        key += f"/{int(q_heads)}x{int(kv_heads)}"
+    return key
+
+
+def _dtype_proven(
+    dtype: mx.Dtype, q_heads: int = _Q_HEADS, kv_heads: int = _KV_HEADS
+) -> bool:
+    return _proof_key(dtype, q_heads, kv_heads) in _PIPELINE_PROVEN_DTYPES
 
 
 def _record_pipeline_failure(reason: str) -> None:
@@ -251,14 +269,18 @@ def _record_pipeline_failure(reason: str) -> None:
     _note_demotion(_DEMOTION_KIND, reason)
 
 
-def _record_pipeline_success(dtype: mx.Dtype) -> None:
+def _record_pipeline_success(
+    dtype: mx.Dtype, q_heads: int = _Q_HEADS, kv_heads: int = _KV_HEADS
+) -> None:
     """Bank one dtype proof; never reopen a lane that already FAILED."""
 
     global _PIPELINE_STATE, _PIPELINE_PROVEN_DTYPES
 
     if _PIPELINE_STATE == _PIPELINE_FAILED:
         return
-    _PIPELINE_PROVEN_DTYPES = _PIPELINE_PROVEN_DTYPES | {_dtype_key(dtype)}
+    _PIPELINE_PROVEN_DTYPES = _PIPELINE_PROVEN_DTYPES | {
+        _proof_key(dtype, q_heads, kv_heads)
+    }
     if all(_dtype_key(known) in _PIPELINE_PROVEN_DTYPES for known in _SUPPORTED_DTYPES):
         _PIPELINE_STATE = _PIPELINE_PROVEN
 
@@ -293,6 +315,31 @@ def qsa_prefill_direct_module_ready() -> bool:
     """Whether the native symbol is importable and ABI-compatible."""
 
     return _EXT is not None and hasattr(_EXT, "qwen4_qsa_sparse_gqa_attention")
+
+
+def _ext_max_gqa() -> int | None:
+    """Largest GQA group the loaded build serves; None for 24/2-only builds."""
+
+    raw = getattr(_EXT, "MAX_GQA", None)
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _head_layout_unsupported_reason(query_heads: int, kv_heads: int) -> str | None:
+    """Mirror of the C++ head-layout clause (whole groups that fit a tile)."""
+
+    if (query_heads, kv_heads) == (_Q_HEADS, _KV_HEADS):
+        return None
+    max_gqa = _ext_max_gqa()
+    if max_gqa is None:
+        return "this build of the native kernel serves only 24 query / 2 KV heads"
+    if kv_heads <= 0 or query_heads <= 0 or query_heads % kv_heads:
+        return "query heads must be a whole multiple of KV heads"
+    if query_heads // kv_heads > max_gqa:
+        return f"the GQA group exceeds the {max_gqa} query heads a tile holds"
+    return None
 
 
 def _env_flag(name: str, *, default: bool) -> bool:
@@ -454,6 +501,54 @@ def qsa_prefill_direct_unsupported_reason(
 ) -> str | None:
     """Return why this call cannot use the direct kernel, or ``None``.
 
+    The static contract below, plus: a head layout other than 24/2 must have
+    passed its readiness proof, which runs here (synchronizing, once per
+    dtype and layout) the first time a supported call of that layout is seen.
+    """
+
+    reason = _static_unsupported_reason(
+        queries,
+        keys,
+        values,
+        block_ids,
+        block_valid,
+        pos_start=pos_start,
+        total_tokens=total_tokens,
+        scale=scale,
+        compress_ratio=compress_ratio,
+        block_topk=block_topk,
+        key_tile=key_tile,
+        dimension_tile=dimension_tile,
+    )
+    if reason is not None:
+        return reason
+    q_heads, kv_heads = int(queries.shape[1]), int(keys.shape[1])
+    if (q_heads, kv_heads) != (_Q_HEADS, _KV_HEADS) and _EXT is not None:
+        if not _prove_pipeline(dtype=queries.dtype, q_heads=q_heads, kv_heads=kv_heads):
+            return (
+                f"the direct kernel failed its readiness proof for "
+                f"{q_heads} query / {kv_heads} KV heads"
+            )
+    return None
+
+
+def _static_unsupported_reason(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    block_ids: mx.array,
+    block_valid: mx.array,
+    *,
+    pos_start: int,
+    total_tokens: int,
+    scale: float,
+    compress_ratio: int = _COMPRESS_RATIO,
+    block_topk: int = _TOP_K_BLOCKS,
+    key_tile: int = _KEY_TILE,
+    dimension_tile: int = _DIMENSION_TILE,
+) -> str | None:
+    """The contract the native call checks, without any proof.
+
     Every clause here has a counterpart in the vendored C++ ``unsupported()``
     (``native_extensions/qsa_kernels/qwen4_qsa_sparse_gqa.cpp``) or in the
     MTPLX block contract the C++ cannot see (model ratio/top-k, the suffix
@@ -476,16 +571,19 @@ def qsa_prefill_direct_unsupported_reason(
         return "block ids and validity must be rank two"
 
     batch, query_heads, rows, head_dim = (int(x) for x in queries.shape)
-    if (batch, query_heads, head_dim) != (_BATCH, _Q_HEADS, _HEAD_DIM):
-        return "Q must have production shape [1, 24, S, 256]"
+    if (batch, head_dim) != (_BATCH, _HEAD_DIM):
+        return "Q must have shape [1, H, S, 256]"
     if rows <= 0:
         return "the prefill kernel requires at least one query row"
 
     key_batch, kv_heads, key_len, key_dim = (int(x) for x in keys.shape)
-    if (key_batch, kv_heads, key_dim) != (_BATCH, _KV_HEADS, _HEAD_DIM):
-        return "K must have production shape [1, 2, kL, 256]"
+    if (key_batch, key_dim) != (_BATCH, _HEAD_DIM):
+        return "K must have shape [1, Hkv, kL, 256]"
     if tuple(int(x) for x in values.shape) != tuple(int(x) for x in keys.shape):
         return "V must have the same shape as K"
+    layout = _head_layout_unsupported_reason(query_heads, kv_heads)
+    if layout is not None:
+        return layout
 
     if queries.dtype not in _SUPPORTED_DTYPES:
         return "Q must be float16 or bfloat16"
@@ -689,11 +787,12 @@ def qsa_prefill_direct(
 ) -> mx.array:
     """Compute sparse-plus-tail QSA prefill attention as one Metal dispatch.
 
-    ``queries`` is ``[1,24,S,256]``.  ``keys``/``values`` are the LOGICAL
-    cache views returned by ``update_and_fetch`` (``kL == total_tokens``), not
-    the capacity backings — the native ABI has no separate logical-K length.
-    Selection arrays are ``[S,512]`` per query row.  The output is
-    ``[1,24,S,256]`` in the Q/K/V dtype.
+    ``queries`` is ``[1,H,S,256]`` (``H = 24`` for Flash-Next).
+    ``keys``/``values`` are the LOGICAL cache views returned by
+    ``update_and_fetch`` (``kL == total_tokens``), not the capacity backings —
+    the native ABI has no separate logical-K length.  Selection arrays are
+    ``[S,512]`` per query row.  The output is ``[1,H,S,256]`` in the Q/K/V
+    dtype.
 
     Unsupported calls raise.  There is no dense fallback here: once this
     function dispatches, later Metal failures propagate to the caller.
@@ -711,7 +810,12 @@ def qsa_prefill_direct(
         compress_ratio=compress_ratio,
         block_topk=block_topk,
     )
-    return _prove_first_dispatch(out, dtype=queries.dtype)
+    return _prove_first_dispatch(
+        out,
+        dtype=queries.dtype,
+        q_heads=int(queries.shape[1]),
+        kv_heads=int(keys.shape[1]),
+    )
 
 
 def _dispatch(
@@ -729,7 +833,7 @@ def _dispatch(
 ) -> mx.array:
     """The contract check and the lazy native call, with no proof."""
 
-    reason = qsa_prefill_direct_unsupported_reason(
+    reason = _static_unsupported_reason(
         queries,
         keys,
         values,
@@ -762,7 +866,13 @@ def _dispatch(
     )
 
 
-def _prove_first_dispatch(out: mx.array, *, dtype: mx.Dtype) -> mx.array:
+def _prove_first_dispatch(
+    out: mx.array,
+    *,
+    dtype: mx.Dtype,
+    q_heads: int = _Q_HEADS,
+    kv_heads: int = _KV_HEADS,
+) -> mx.array:
     """Force the first dispatch OF THIS DTYPE, then trust the kernel.
 
     MLX is lazy, so a missing or stale metallib (``get_library`` /
@@ -777,12 +887,14 @@ def _prove_first_dispatch(out: mx.array, *, dtype: mx.Dtype) -> mx.array:
     ride to an unattributed failure deep in the layer stack.
     """
 
-    if _PIPELINE_STATE == _PIPELINE_FAILED or _dtype_proven(dtype):
+    if _PIPELINE_STATE == _PIPELINE_FAILED or _dtype_proven(dtype, q_heads, kv_heads):
         return out
     with _PIPELINE_LOCK:
         # Re-read under the lock: a racing caller may have proved or retired
         # this dtype while we waited, and FAILED must stay terminal.
-        if _PIPELINE_STATE == _PIPELINE_FAILED or _dtype_proven(dtype):
+        if _PIPELINE_STATE == _PIPELINE_FAILED or _dtype_proven(
+            dtype, q_heads, kv_heads
+        ):
             return out
         try:
             mx.eval(out)
@@ -797,7 +909,7 @@ def _prove_first_dispatch(out: mx.array, *, dtype: mx.Dtype) -> mx.array:
                 _dtype_key(dtype),
             )
             raise
-        _record_pipeline_success(dtype)
+        _record_pipeline_success(dtype, q_heads, kv_heads)
     return out
 
 
@@ -834,8 +946,14 @@ def _prove_all_pipelines() -> bool:
     return True
 
 
-def _prove_pipeline(*, dtype: mx.Dtype = mx.bfloat16) -> bool:
-    """The proof itself, for ONE dtype.  Sets the process state; never raises.
+def _prove_pipeline(
+    *,
+    dtype: mx.Dtype = mx.bfloat16,
+    q_heads: int = _Q_HEADS,
+    kv_heads: int = _KV_HEADS,
+) -> bool:
+    """The proof itself, for ONE dtype and head layout.  Sets the process
+    state; never raises.
 
     Consults ``_lane_eligible`` rather than ``qsa_prefill_direct_ready``,
     which calls back into here.  Serialized so that two threads racing their
@@ -845,17 +963,20 @@ def _prove_pipeline(*, dtype: mx.Dtype = mx.bfloat16) -> bool:
 
     if _PIPELINE_STATE == _PIPELINE_FAILED:
         return False
-    if _dtype_proven(dtype):
+    if _dtype_proven(dtype, q_heads, kv_heads):
         return True
     with _PIPELINE_LOCK:
-        return _prove_pipeline_locked(dtype)
+        return _prove_pipeline_locked(dtype, q_heads, kv_heads)
 
 
-def _prove_pipeline_locked(dtype: mx.Dtype) -> bool:
+def _prove_pipeline_locked(
+    dtype: mx.Dtype, q_heads: int = _Q_HEADS, kv_heads: int = _KV_HEADS
+) -> bool:
     if _PIPELINE_STATE == _PIPELINE_FAILED:
         return False
-    if _dtype_proven(dtype):
+    if _dtype_proven(dtype, q_heads, kv_heads):
         return True
+    layout = _proof_key(dtype, q_heads, kv_heads)
     rows = 8
     # Smallest shape that still crosses the dense/sparse boundary the
     # production gate requires (total // 4 > 512).
@@ -864,13 +985,13 @@ def _prove_pipeline_locked(dtype: mx.Dtype) -> bool:
     # Random inputs: all-zero ones give zero attention whatever the kernel
     # computes, so they prove the dispatch and not the numbers.
     queries = mx.random.normal(
-        (_BATCH, _Q_HEADS, rows, _HEAD_DIM), key=mx.random.key(1)
+        (_BATCH, q_heads, rows, _HEAD_DIM), key=mx.random.key(1)
     ).astype(dtype)
     keys = mx.random.normal(
-        (_BATCH, _KV_HEADS, total, _HEAD_DIM), key=mx.random.key(2)
+        (_BATCH, kv_heads, total, _HEAD_DIM), key=mx.random.key(2)
     ).astype(dtype)
     values = mx.random.normal(
-        (_BATCH, _KV_HEADS, total, _HEAD_DIM), key=mx.random.key(3)
+        (_BATCH, kv_heads, total, _HEAD_DIM), key=mx.random.key(3)
     ).astype(dtype)
     # Each row selects its newest 512 complete blocks, as the selectors do.
     complete = (mx.arange(pos_start, total, dtype=mx.int32) + 1) // _COMPRESS_RATIO
@@ -901,16 +1022,16 @@ def _prove_pipeline_locked(dtype: mx.Dtype) -> bool:
                 f"(bound {_PROOF_MAX_ERROR:g})"
             )
     except Exception as exc:
-        _record_pipeline_failure(f"{_dtype_key(dtype)} readiness proof failed: {exc}")
+        _record_pipeline_failure(f"{layout} readiness proof failed: {exc}")
         logger.warning(
             "%s: QSA direct-kernel %s preflight failed; the lane is disabled "
             "for this process: %s",
             __name__,
-            _dtype_key(dtype),
+            layout,
             exc,
         )
         return False
-    _record_pipeline_success(dtype)
+    _record_pipeline_success(dtype, q_heads, kv_heads)
     return True
 
 

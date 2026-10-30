@@ -4,8 +4,10 @@
 // Vendored into MTPLX from oMLX (https://github.com/jundot/omlx), PR #3244,
 // revision dc312e6e905e03d21ef0c4a86289cbfa2cf857cc, file
 // omlx/custom_kernels/glm_moe_dsa/csrc/kernels/steel_qwen4_qsa_sparse_gqa.h.
-// The kernel body is unmodified; MTPLX adds only the WM threadgroup
-// static_assert below (M2/M3 cap 896 threads for some kernels, issue #400).
+// MTPLX changes to the kernel body: the WM threadgroup static_assert below
+// (M2/M3 cap 896 threads for some kernels, issue #400), and GQA == 0, which
+// reads the query-head group size from params->gqa_factor (1..H_PAD) so one
+// specialization of the tile serves any head layout.
 
 #pragma once
 
@@ -111,6 +113,10 @@ qwen4_qsa_sparse_gqa_attention(
   static_assert(DC % kFragSize == 0, "DC must be a multiple of eight.");
   static_assert(D % DC == 0, "Head dimension must divide DC.");
 
+  // GQA == 0: the group size is a launch parameter (the host checks it fits
+  // the H_PAD-row tile).
+  const int gqa = GQA > 0 ? GQA : params->gqa_factor;
+
   constexpr int tgp_size = WM * 32;
   const int lane = int(simd_group_id * 32 + simd_lane_id);
   const int q_pos = int(tid.x);
@@ -146,7 +152,7 @@ qwen4_qsa_sparse_gqa_attention(
     max_score[i] = Limits<AccumType>::finite_min;
   }
 
-  const int query_head_base = kv_head * GQA;
+  const int query_head_base = kv_head * gqa;
   const device T *q_base = Q + size_t(b) * params->Q_strides[0] +
                            size_t(query_head_base) * params->Q_strides[1] +
                            size_t(q_pos) * params->Q_strides[2];
@@ -199,7 +205,7 @@ qwen4_qsa_sparse_gqa_attention(
         const int h = elem / (DC / 8);
         const int d8 = elem - h * (DC / 8);
         uint4 word = uint4(0);
-        if (h < GQA) {
+        if (h < gqa) {
           word = *((const device uint4 *)(q_base +
                                           size_t(h) * params->Q_strides[1] +
                                           dbase) +
@@ -327,7 +333,7 @@ qwen4_qsa_sparse_gqa_attention(
   device T *out = O + size_t(b) * params->O_strides[0] +
                   size_t(query_head_base + tm + sm) * params->O_strides[1] +
                   size_t(q_pos) * params->O_strides[2] + sn;
-  const short rows_left = short(GQA - (tm + sm));
+  const short rows_left = short(gqa - (tm + sm));
   if (rows_left > 0) {
     Otile.template store_safe<T, 1, 1>(out, params->O_strides[1],
                                        short2(D - sn, rows_left));

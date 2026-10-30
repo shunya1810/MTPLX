@@ -318,6 +318,82 @@ def test_float16_is_supported_alongside_bfloat16(ext):
 
 
 # --------------------------------------------------------------------------
+# Head layouts: builds that export MAX_GQA serve any whole group up to it
+# --------------------------------------------------------------------------
+
+
+class _FakeAnyLayoutExt(_FakeExt):
+    MAX_GQA = 16
+
+
+@pytest.fixture()
+def any_layout_ext(ext, monkeypatch):
+    fake = _FakeAnyLayoutExt()
+    monkeypatch.setattr(direct, "_EXT", fake)
+    return fake
+
+
+def _layout_inputs(q_heads, kv_heads, dtype=mx.bfloat16):
+    q, k, v, ids, valid = _inputs(dtype=dtype)
+    q = mx.zeros((1, q_heads, _ROWS, 256), dtype=dtype)
+    k = mx.zeros((1, kv_heads, _TOTAL, 256), dtype=dtype)
+    v = mx.zeros((1, kv_heads, _TOTAL, 256), dtype=dtype)
+    return q, k, v, ids, valid
+
+
+def test_a_24_2_only_build_refuses_other_layouts(ext):
+    q, k, v, ids, valid = _layout_inputs(24, 4)
+    reason = direct.qsa_prefill_direct_unsupported_reason(q, k, v, ids, valid, **_kwargs())
+    assert reason == "this build of the native kernel serves only 24 query / 2 KV heads"
+    assert ext.calls == []
+
+
+@pytest.mark.parametrize("q_heads,kv_heads", [(24, 4), (16, 2), (40, 8), (64, 4), (8, 8)])
+def test_whole_groups_up_to_max_gqa_dispatch_after_their_own_proof(
+    any_layout_ext, q_heads, kv_heads
+):
+    q, k, v, ids, valid = _layout_inputs(q_heads, kv_heads)
+    assert direct.qsa_prefill_direct_supported(q, k, v, ids, valid, **_kwargs()) is True
+    # The support check proved this layout with one small call of its own.
+    assert len(any_layout_ext.calls) == 1
+    assert direct._dtype_proven(mx.bfloat16, q_heads, kv_heads)
+    assert not direct._dtype_proven(mx.float16, q_heads, kv_heads)
+    out = direct.qsa_prefill_direct(q, k, v, ids, valid, **_kwargs())
+    assert tuple(out.shape) == (1, q_heads, _ROWS, 256)
+    assert len(any_layout_ext.calls) == 2
+    # A second support check does not prove again.
+    assert direct.qsa_prefill_direct_supported(q, k, v, ids, valid, **_kwargs()) is True
+    assert len(any_layout_ext.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "q_heads,kv_heads,reason",
+    [
+        (24, 5, "query heads must be a whole multiple of KV heads"),
+        (48, 2, "the GQA group exceeds the 16 query heads a tile holds"),
+    ],
+)
+def test_layouts_without_a_tile_fail_closed(any_layout_ext, q_heads, kv_heads, reason):
+    q, k, v, ids, valid = _layout_inputs(q_heads, kv_heads)
+    assert direct.qsa_prefill_direct_unsupported_reason(q, k, v, ids, valid, **_kwargs()) == reason
+    with pytest.raises(ValueError):
+        direct.qsa_prefill_direct(q, k, v, ids, valid, **_kwargs())
+    assert any_layout_ext.calls == []
+
+
+def test_a_failed_layout_proof_retires_the_lane(any_layout_ext, monkeypatch):
+    def broken(q, k, v, selected, scale, q_offset, key_tile=64, dimension_tile=64):
+        return mx.full(q.shape, 7.0, dtype=q.dtype)
+
+    monkeypatch.setattr(any_layout_ext, "qwen4_qsa_sparse_gqa_attention", broken)
+    q, k, v, ids, valid = _layout_inputs(24, 4)
+    reason = direct.qsa_prefill_direct_unsupported_reason(q, k, v, ids, valid, **_kwargs())
+    assert reason == "the direct kernel failed its readiness proof for 24 query / 4 KV heads"
+    assert direct._PIPELINE_STATE == direct._PIPELINE_FAILED
+    assert direct.qsa_prefill_direct_ready() is False
+
+
+# --------------------------------------------------------------------------
 # Topk adapter: the seam where block_valid is dropped
 # --------------------------------------------------------------------------
 
