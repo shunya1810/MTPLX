@@ -213,6 +213,7 @@ def test_the_lowered_crossover_applies_to_wide_forwards_only(monkeypatch):
         "MTPLX_QSA_PREFILL_WIDE_MIN_CONTEXT",
     ):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "0")
     assert qwen4_exp._qsa_prefill_crossover(4096, 32768) == 32768
     monkeypatch.setenv("MTPLX_QSA_PREFILL_WIDE_MIN_CONTEXT", "16384")
     assert qwen4_exp._qsa_prefill_crossover(4096, 32768) == 16384
@@ -223,6 +224,22 @@ def test_the_lowered_crossover_applies_to_wide_forwards_only(monkeypatch):
     assert qwen4_exp._qsa_prefill_crossover(4096, 8192) == 8192
     monkeypatch.setenv("MTPLX_QSA_PREFILL_WIDE_MIN_CONTEXT", "0")
     assert qwen4_exp._qsa_prefill_crossover(4096, 32768) == 32768
+
+
+def test_the_m1_family_defaults_wide_forwards_to_its_16k_crossover(monkeypatch):
+    for key in ("MTPLX_QSA_PREFILL_WIDE_MIN_CONTEXT", "MTPLX_QSA_PREFILL_DIRECT_MIN_CONTEXT"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "1")
+    assert qwen4_exp._qsa_prefill_crossover(4096, 32768) == 16384
+    assert qwen4_exp._qsa_prefill_crossover(2048, 32768) == 16384
+    assert qwen4_exp._qsa_prefill_crossover(2047, 32768) == 32768
+    assert qwen4_exp._qsa_prefill_direct_min_context() == 16384
+    # An operator's export still wins.
+    monkeypatch.setenv("MTPLX_QSA_PREFILL_WIDE_MIN_CONTEXT", "0")
+    assert qwen4_exp._qsa_prefill_crossover(4096, 32768) == 32768
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "0")
+    monkeypatch.delenv("MTPLX_QSA_PREFILL_WIDE_MIN_CONTEXT")
+    assert qwen4_exp._qsa_prefill_direct_min_context() == 32768
 
 
 def test_the_measured_128_gb_seat(monkeypatch):

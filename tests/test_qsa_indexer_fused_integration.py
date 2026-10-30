@@ -888,6 +888,8 @@ def test_prefill_dense_equals_sparse_boundary_stays_off_update_only_graph(
 
 
 def test_prefill_crossovers_use_earliest_query_history(monkeypatch):
+    # The M1 family lowers the wide-forward crossover to 16K by default.
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "0")
     monkeypatch.setenv("MTPLX_QSA_PREFILL", "1")
     monkeypatch.setenv("MTPLX_QSA_PREFILL_MIN_ROWS", "2")
     monkeypatch.setenv("MTPLX_QSA_PREFILL_MIN_CONTEXT", "32768")

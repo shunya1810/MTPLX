@@ -87,7 +87,11 @@ def test_tune_uses_serve_contract_without_manual_family_exports(tmp_path, monkey
         assert value == expected.get(key), key
     assert resolved["MTPLX_FAMILY_CAPTURE_COMMIT"] == "1"
     assert resolved["MTPLX_SKIP_VERIFY_SNAPSHOT"] == "0"
-    assert resolved["MTPLX_NAX_VERIFY"] == "0"
+    from mtplx.cache_state import m1_long_context_defaults
+
+    # The M1 family keeps the profile's NAX/vk verify lanes for this family;
+    # elsewhere the server neutralizes them.
+    assert resolved["MTPLX_NAX_VERIFY"] == ("1" if m1_long_context_defaults() else "0")
     assert resolved["MTPLX_QSA_GATHER_MAX_ROWS"] == "24"
     if not exports:
         assert resolved["MTPLX_QWEN4_FIXED_M4_VERIFY"] == "1"
