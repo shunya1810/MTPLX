@@ -1262,7 +1262,9 @@ def _server_runtime_env_overrides(
         for key in _QWEN4_LANE_KEYS:
             if str(os.environ.get(key) or "").strip():
                 overrides.pop(key, None)
-        if os.environ.get("MTPLX_NAX_VERIFY") is None:
+        from mtplx.cache_state import m1_long_context_defaults
+
+        if os.environ.get("MTPLX_NAX_VERIFY") is None and not m1_long_context_defaults():
             # The turbo profile arms the 27B NAX verify patch
             # (MTPLX_NAX_VERIFY=1); on this family it is unmeasured and
             # mostly bypassed — the fused family modules call
@@ -1272,6 +1274,11 @@ def _server_runtime_env_overrides(
             # verify widths. An explicit operator export still wins via the
             # env gate above, and runtime_env_overrides are applied AFTER
             # the profile env (apply_profile_env), so this beats turbo's 1.
+            # M1 family: keep it. The fused family modules now route through
+            # the same lanes (qwen4_exp._verify_lane_qmm), and on a dense
+            # 5120-wide qwen4_exp the 4-row verify forward drops from 208 to
+            # 148 ms (fp16, 4K context; the stock qmm re-reads the weights
+            # for every row, 2.3x a 1-row MLP).
             overrides["MTPLX_NAX_VERIFY"] = "0"
     # Model-tuned settings the served family owns (PX.0): prefill chunk and
     # compiled width, score workspace, cleanup and clear cadences, copy-lane

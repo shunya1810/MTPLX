@@ -735,6 +735,209 @@ def _count_qlinear_fallback(bits: int, m: int) -> None:
     nax_qlinear_fallback_counts[key] = nax_qlinear_fallback_counts.get(key, 0) + 1
 
 
+def verify_shaped_qmm(x, w_q_in, scales, biases, *, bits, group_size):
+    """Verify-shaped (decode/verify, not prefill) affine quantized ``x @ W.T`` on the M1/NAX
+    lanes, or None when no lane takes the shape. No bias; the caller adds it.
+
+    Shared by the ``nn.QuantizedLinear`` patch and by model code that calls
+    ``mx.quantized_matmul`` directly on fused weights (qwen4_exp ``_projection``)."""
+    from .attention_context import current_attention_phase
+    from .kernel_selfcheck import lane_disabled
+
+    bits = int(bits or 0)
+    group_size = int(group_size or 0)
+    if (
+        bits in (4, 8)
+        and x.ndim >= 2
+        and current_attention_phase() != "prefill"
+        and _m1_mma8_enabled()
+    ):
+        m8 = 1
+        for d in x.shape[:-1]:
+            m8 *= int(d)
+        k8 = int(x.shape[-1])
+        n8 = int(w_q_in.shape[0])
+        if (
+            _m1_mma8_min_rows() <= m8 <= 8
+            and x.dtype == mx.float16
+            and k8 % 128 == 0
+            and n8 % 16 == 0
+            and group_size in (32, 64, 128)
+        ):
+            # Depth 6-7 verify on M1 (no NAX): the stock qmm runs 8 rows
+            # one by one (2.8-3.3x the 4-row kernels' time); the MMA lane
+            # dequantizes in registers and costs 1.02-1.12x the 4-row
+            # kernels on the 27B shapes, 4- and 8-bit
+            # (mtplx/kernels/mma8_qmm.py).
+            from .kernels.mma8_qmm import mma8v2_qmm
+
+            y = mma8v2_qmm(
+                x.reshape(m8, k8), w_q_in, scales, biases,
+                nt=2, kp=4, group_size=group_size, bits=bits,
+            )
+            y = y.reshape(*x.shape[:-1], n8)
+            return y
+    if bits == 8 and x.ndim >= 2 and current_attention_phase() != "prefill":
+        # 8-bit affine (Optimized-Quality): MTPLX verify_kernels family.
+        from .verify_kernels import (
+            vk_eligible_ksplit,
+            vk_eligible_m4,
+            vk_eligible_m6,
+            vk_qmm_m4,
+            vk_qmm_m4_ksplit,
+            vk_qmm_m6,
+            vk_qmm_m6_ksplit,
+        )
+
+        m = 1
+        for d in x.shape[:-1]:
+            m *= int(d)
+        if 4 <= m <= 6:
+            w_q = w_q_in
+            k = int(x.shape[-1])
+            n = int(w_q.shape[0])
+            y = None
+            huge_n = n >= 100000
+            if (
+                m == 4
+                and huge_n
+                and not lane_disabled("qmm_m4_wide")
+                and vk_eligible_m4(m, k, n, bits, group_size, x.dtype)
+            ):
+                # lm_head-class shapes: the wide msg tile (few big TGs)
+                # wins isolated 1.34x while split-K thrashes (0.66x) in
+                # the 62k-tiny-threadgroup regime.
+                y = vk_qmm_m4(
+                    x.reshape(m, k), w_q, scales, biases,
+                    bits=8, group_size=group_size,
+                )
+            elif (
+                m == 4
+                and not lane_disabled("qmm_m4")
+                and vk_eligible_ksplit(m, k, n, bits, group_size, x.dtype)
+            ):
+                # Split-K morphology: the in-context winner (msg geometry
+                # loses its isolated 1.3-1.5x to co-residency on the
+                # layer shapes).
+                y = vk_qmm_m4_ksplit(
+                    x.reshape(m, k), w_q, scales, biases,
+                    bits=8, group_size=group_size,
+                )
+            elif (
+                huge_n
+                and not lane_disabled("qmm_m6_wide")
+                and vk_eligible_m6(m, k, n, bits, group_size, x.dtype)
+            ):
+                y = vk_qmm_m6(
+                    x.reshape(m, k), w_q, scales, biases,
+                    bits=8, group_size=group_size,
+                )
+            elif (
+                not lane_disabled("qmm_m6")
+                and vk_eligible_ksplit(m, k, n, bits, group_size, x.dtype)
+            ):
+                y = vk_qmm_m6_ksplit(
+                    x.reshape(m, k), w_q, scales, biases,
+                    bits=8, group_size=group_size,
+                )
+            if y is not None:
+                y = y.reshape(*x.shape[:-1], n)
+                return y
+            _count_qlinear_fallback(bits, m)
+    if bits == 6 and x.ndim >= 2 and current_attention_phase() != "prefill":
+        # 6-bit affine (9B tier), added 2026-07-07: split-K hexpack
+        # kernels, exactness-gated vs stock across {bf16,fp16} x
+        # gs{32,64,128} (54 cases, dmax <= 0.027 bf16 / 0.003 fp16).
+        # Microbench on the 9B hot shapes: 1.1-2.4x vs stock; the tiny
+        # kv projection (N=1024) measured 0.92x at m4/bf16, so small-N
+        # stays stock via the floor below.
+        from .verify_kernels import (
+            vk_eligible_ksplit,
+            vk_qmm_m4_ksplit,
+            vk_qmm_m6_ksplit,
+        )
+
+        m = 1
+        for d in x.shape[:-1]:
+            m *= int(d)
+        if 4 <= m <= 6:
+            w_q = w_q_in
+            k = int(x.shape[-1])
+            n = int(w_q.shape[0])
+            y = None
+            if (
+                m == 4
+                and n >= 2048
+                and not lane_disabled("qmm_m4")
+                and vk_eligible_ksplit(m, k, n, bits, group_size, x.dtype)
+            ):
+                y = vk_qmm_m4_ksplit(
+                    x.reshape(m, k), w_q, scales, biases,
+                    bits=6, group_size=group_size,
+                )
+            elif (
+                5 <= m <= 6
+                and n >= 2048
+                and not lane_disabled("qmm_m6")
+                and vk_eligible_ksplit(m, k, n, bits, group_size, x.dtype)
+            ):
+                y = vk_qmm_m6_ksplit(
+                    x.reshape(m, k), w_q, scales, biases,
+                    bits=6, group_size=group_size,
+                )
+            if y is not None:
+                y = y.reshape(*x.shape[:-1], n)
+                return y
+            _count_qlinear_fallback(bits, m)
+    if bits == 4 and x.ndim >= 2 and current_attention_phase() != "prefill":
+        m = 1
+        for d in x.shape[:-1]:
+            m *= int(d)
+        if 4 <= m <= 16:
+            w_q = w_q_in
+            k = int(x.shape[-1])
+            n = int(w_q.shape[0])
+            y = None
+            if (
+                m == 4
+                and not lane_disabled("qmm_m4")
+                and m4_ksplit_eligible(m, k, n, bits, group_size, x.dtype)
+            ):
+                # Plain SIMD K-split kernel: no NAX hardware requirement.
+                y = nax_qmm_m4(
+                    x.reshape(m, k), w_q, scales, biases,
+                    group_size=group_size,
+                )
+            elif (
+                # M=5 falls through to stock by default: three same-
+                # process micro sessions (2026-08-22, MEASUREMENTS 22:0x)
+                # put the padded-m6 lane +3..13% and the m16 tile worst
+                # at every M=5 4-bit shape, while stock ~ties the best.
+                # MTPLX_M5_PADDED_LANE=1 restores the old routing.
+                (m == 6 or (m == 5 and _m5_padded_lane()))
+                and not lane_disabled("qmm_m6")
+                and m6_ksplit_eligible(m, k, n, bits, group_size, x.dtype)
+            ):
+                y = nax_qmm_m6(
+                    x.reshape(m, k), w_q, scales, biases,
+                    group_size=group_size,
+                )
+            elif (
+                (m != 5 or _m5_padded_lane())
+                and not lane_disabled("qmm_m16_nax")
+                and m16_nax_eligible(m, k, n, bits, group_size, x.dtype)
+            ):
+                y = nax_qmm_m16(
+                    x.reshape(m, k), w_q, scales, biases,
+                    group_size=group_size,
+                )
+            if y is not None:
+                y = y.reshape(*x.shape[:-1], n)
+                return y
+            _count_qlinear_fallback(bits, m)
+    return None
+
+
 def install_nax_qlinear_patch() -> dict[str, object]:
     """Route verify-shaped (M in 4..16) 4-bit QuantizedLinear calls through the
     NAX/m4 verify kernels. Decode (M=1..3) and prefill (M>16) stay stock.
@@ -761,206 +964,15 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                 nax_qlinear_fallback_counts.get("exact_t0", 0) + 1
             )
             return original(self, x)
-        bits = int(getattr(self, "bits", 0) or 0)
-        group_size = int(getattr(self, "group_size", 0) or 0)
-        if (
-            bits in (4, 8)
-            and x.ndim >= 2
-            and current_attention_phase() != "prefill"
-            and _m1_mma8_enabled()
-        ):
-            m8 = 1
-            for d in x.shape[:-1]:
-                m8 *= int(d)
-            k8 = int(x.shape[-1])
-            n8 = int(self["weight"].shape[0])
-            if (
-                _m1_mma8_min_rows() <= m8 <= 8
-                and x.dtype == mx.float16
-                and k8 % 128 == 0
-                and n8 % 16 == 0
-                and group_size in (32, 64, 128)
-            ):
-                # Depth 6-7 verify on M1 (no NAX): the stock qmm runs 8 rows
-                # one by one (2.8-3.3x the 4-row kernels' time); the MMA lane
-                # dequantizes in registers and costs 1.02-1.12x the 4-row
-                # kernels on the 27B shapes, 4- and 8-bit
-                # (mtplx/kernels/mma8_qmm.py).
-                from .kernels.mma8_qmm import mma8v2_qmm
-
-                y = mma8v2_qmm(
-                    x.reshape(m8, k8), self["weight"], self["scales"], self["biases"],
-                    nt=2, kp=4, group_size=group_size, bits=bits,
-                )
-                y = y.reshape(*x.shape[:-1], n8)
-                if "bias" in self:
-                    y = y + self["bias"]
-                return y
-        if bits == 8 and x.ndim >= 2 and current_attention_phase() != "prefill":
-            # 8-bit affine (Optimized-Quality): MTPLX verify_kernels family.
-            from .verify_kernels import (
-                vk_eligible_ksplit,
-                vk_eligible_m4,
-                vk_eligible_m6,
-                vk_qmm_m4,
-                vk_qmm_m4_ksplit,
-                vk_qmm_m6,
-                vk_qmm_m6_ksplit,
-            )
-
-            m = 1
-            for d in x.shape[:-1]:
-                m *= int(d)
-            if 4 <= m <= 6:
-                w_q = self["weight"]
-                k = int(x.shape[-1])
-                n = int(w_q.shape[0])
-                y = None
-                huge_n = n >= 100000
-                if (
-                    m == 4
-                    and huge_n
-                    and not lane_disabled("qmm_m4_wide")
-                    and vk_eligible_m4(m, k, n, bits, group_size, x.dtype)
-                ):
-                    # lm_head-class shapes: the wide msg tile (few big TGs)
-                    # wins isolated 1.34x while split-K thrashes (0.66x) in
-                    # the 62k-tiny-threadgroup regime.
-                    y = vk_qmm_m4(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
-                        bits=8, group_size=group_size,
-                    )
-                elif (
-                    m == 4
-                    and not lane_disabled("qmm_m4")
-                    and vk_eligible_ksplit(m, k, n, bits, group_size, x.dtype)
-                ):
-                    # Split-K morphology: the in-context winner (msg geometry
-                    # loses its isolated 1.3-1.5x to co-residency on the
-                    # layer shapes).
-                    y = vk_qmm_m4_ksplit(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
-                        bits=8, group_size=group_size,
-                    )
-                elif (
-                    huge_n
-                    and not lane_disabled("qmm_m6_wide")
-                    and vk_eligible_m6(m, k, n, bits, group_size, x.dtype)
-                ):
-                    y = vk_qmm_m6(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
-                        bits=8, group_size=group_size,
-                    )
-                elif (
-                    not lane_disabled("qmm_m6")
-                    and vk_eligible_ksplit(m, k, n, bits, group_size, x.dtype)
-                ):
-                    y = vk_qmm_m6_ksplit(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
-                        bits=8, group_size=group_size,
-                    )
-                if y is not None:
-                    y = y.reshape(*x.shape[:-1], n)
-                    if "bias" in self:
-                        y = y + self["bias"]
-                    return y
-                _count_qlinear_fallback(bits, m)
-        if bits == 6 and x.ndim >= 2 and current_attention_phase() != "prefill":
-            # 6-bit affine (9B tier), added 2026-07-07: split-K hexpack
-            # kernels, exactness-gated vs stock across {bf16,fp16} x
-            # gs{32,64,128} (54 cases, dmax <= 0.027 bf16 / 0.003 fp16).
-            # Microbench on the 9B hot shapes: 1.1-2.4x vs stock; the tiny
-            # kv projection (N=1024) measured 0.92x at m4/bf16, so small-N
-            # stays stock via the floor below.
-            from .verify_kernels import (
-                vk_eligible_ksplit,
-                vk_qmm_m4_ksplit,
-                vk_qmm_m6_ksplit,
-            )
-
-            m = 1
-            for d in x.shape[:-1]:
-                m *= int(d)
-            if 4 <= m <= 6:
-                w_q = self["weight"]
-                k = int(x.shape[-1])
-                n = int(w_q.shape[0])
-                y = None
-                if (
-                    m == 4
-                    and n >= 2048
-                    and not lane_disabled("qmm_m4")
-                    and vk_eligible_ksplit(m, k, n, bits, group_size, x.dtype)
-                ):
-                    y = vk_qmm_m4_ksplit(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
-                        bits=6, group_size=group_size,
-                    )
-                elif (
-                    5 <= m <= 6
-                    and n >= 2048
-                    and not lane_disabled("qmm_m6")
-                    and vk_eligible_ksplit(m, k, n, bits, group_size, x.dtype)
-                ):
-                    y = vk_qmm_m6_ksplit(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
-                        bits=6, group_size=group_size,
-                    )
-                if y is not None:
-                    y = y.reshape(*x.shape[:-1], n)
-                    if "bias" in self:
-                        y = y + self["bias"]
-                    return y
-                _count_qlinear_fallback(bits, m)
-        if bits == 4 and x.ndim >= 2 and current_attention_phase() != "prefill":
-            m = 1
-            for d in x.shape[:-1]:
-                m *= int(d)
-            if 4 <= m <= 16:
-                w_q = self["weight"]
-                k = int(x.shape[-1])
-                n = int(w_q.shape[0])
-                y = None
-                if (
-                    m == 4
-                    and not lane_disabled("qmm_m4")
-                    and m4_ksplit_eligible(m, k, n, bits, group_size, x.dtype)
-                ):
-                    # Plain SIMD K-split kernel: no NAX hardware requirement.
-                    y = nax_qmm_m4(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
-                        group_size=group_size,
-                    )
-                elif (
-                    # M=5 falls through to stock by default: three same-
-                    # process micro sessions (2026-08-22, MEASUREMENTS 22:0x)
-                    # put the padded-m6 lane +3..13% and the m16 tile worst
-                    # at every M=5 4-bit shape, while stock ~ties the best.
-                    # MTPLX_M5_PADDED_LANE=1 restores the old routing.
-                    (m == 6 or (m == 5 and _m5_padded_lane()))
-                    and not lane_disabled("qmm_m6")
-                    and m6_ksplit_eligible(m, k, n, bits, group_size, x.dtype)
-                ):
-                    y = nax_qmm_m6(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
-                        group_size=group_size,
-                    )
-                elif (
-                    (m != 5 or _m5_padded_lane())
-                    and not lane_disabled("qmm_m16_nax")
-                    and m16_nax_eligible(m, k, n, bits, group_size, x.dtype)
-                ):
-                    y = nax_qmm_m16(
-                        x.reshape(m, k), w_q, self["scales"], self["biases"],
-                        group_size=group_size,
-                    )
-                if y is not None:
-                    y = y.reshape(*x.shape[:-1], n)
-                    if "bias" in self:
-                        y = y + self["bias"]
-                    return y
-                _count_qlinear_fallback(bits, m)
-        return original(self, x)
+        y = verify_shaped_qmm(
+            x, self["weight"], self["scales"], self["biases"],
+            bits=getattr(self, "bits", 0), group_size=getattr(self, "group_size", 0),
+        )
+        if y is None:
+            return original(self, x)
+        if "bias" in self:
+            y = y + self["bias"]
+        return y
 
     nn.QuantizedLinear.__call__ = patched
     _QLINEAR_PATCH["installed"] = True

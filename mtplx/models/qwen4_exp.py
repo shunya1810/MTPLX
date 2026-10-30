@@ -1634,6 +1634,28 @@ def _prefill_dq_gemm_applies(x: mx.array) -> bool:
     return nax_detect.nax_available()
 
 
+def _verify_lane_qmm(x, weight, scales, biases, *, group_size, bits, mode):
+    """The verify-shaped quantized matmul lanes (mtplx.nax_verify) for weights this
+    module multiplies directly — fused GDN in_proj, QSA qkv, gate+up — which the
+    ``nn.QuantizedLinear`` patch never sees. Engaged exactly when that patch is
+    installed (MTPLX_NAX_VERIFY), with the same exact-verify fallback; None means
+    stock."""
+
+    if mode != "affine" or biases is None:
+        return None
+    from mtplx import nax_verify
+
+    if not nax_verify._QLINEAR_PATCH["installed"]:
+        return None
+    from mtplx.attention_context import exact_verify_required
+
+    if exact_verify_required():
+        return None
+    return nax_verify.verify_shaped_qmm(
+        x, weight, scales, biases, bits=bits, group_size=group_size
+    )
+
+
 def _projection(x, weight, scales, biases, *, group_size, bits, mode):
     """``x @ W.T`` for a quantized W, through the prefill lane when it applies."""
 
@@ -1642,6 +1664,11 @@ def _projection(x, weight, scales, biases, *, group_size, bits, mode):
             weight, scales, biases, group_size=group_size, bits=bits, mode=mode
         )
         return mx.matmul(x, dense.T)
+    y = _verify_lane_qmm(
+        x, weight, scales, biases, group_size=group_size, bits=bits, mode=mode
+    )
+    if y is not None:
+        return y
     return mx.quantized_matmul(
         x,
         weight,
