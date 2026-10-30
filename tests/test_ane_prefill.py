@@ -20,13 +20,14 @@ def _available() -> bool:
 pytestmark = pytest.mark.skipif(not _available(), reason="no ANE / extension not built")
 
 
-def _mlp(hidden=5120, inter=17408, bits=4, gs=32):
+def _mlp(hidden=5120, inter=17408, bits=4, gs=32, dtype=None):
     from mlx_lm.models.qwen3_next import Qwen3NextMLP
 
+    dtype = dtype or mx.float16
     mlp = Qwen3NextMLP(hidden, inter)
     mx.random.seed(3)
     for lin in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
-        lin.weight = (mx.random.normal(lin.weight.shape) * 0.02).astype(mx.float16)
+        lin.weight = (mx.random.normal(lin.weight.shape) * 0.02).astype(dtype)
     nn.quantize(mlp, group_size=gs, bits=bits)
     return mlp
 
@@ -53,6 +54,21 @@ def test_split_is_close_to_the_gpu(installed):
     err = float(mx.sqrt(mx.mean((out - ref) ** 2)) / mx.sqrt(mx.mean(ref ** 2)))
     assert err < 0.03, err
     assert ap.stats()["calls"] >= 1
+
+
+def test_a_bf16_model_splits_as_closely(installed):
+    """bf16 scales and biases are cast for the ANE staging kernels, which read
+    them as fp16: read as fp16 bits they turned every logit NaN."""
+
+    mlp = _mlp(dtype=mx.bfloat16)
+    x = mx.random.normal((1, 1024, 5120)).astype(mx.bfloat16)
+    ref = _exact(mlp, x).astype(mx.float32)
+    out = mlp(x)
+    assert out.dtype == mx.bfloat16
+    out = out.astype(mx.float32)
+    assert bool(mx.all(mx.isfinite(out)).item())
+    err = float(mx.sqrt(mx.mean((out - ref) ** 2)) / mx.sqrt(mx.mean(ref ** 2)))
+    assert err < 0.03, err
 
 
 def test_short_chunks_stay_exact(installed):

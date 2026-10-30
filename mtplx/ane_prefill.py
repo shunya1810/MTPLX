@@ -71,6 +71,19 @@ def _qparams(lin: Any) -> tuple[mx.array, mx.array, mx.array | None, int, int]:
     return lin.weight, lin.scales, getattr(lin, "biases", None), int(lin.group_size), int(lin.bits)
 
 
+def _f16(a: mx.array | None) -> mx.array | None:
+    """The ANE staging kernels read quantization scales and biases as fp16: a bf16 model's are
+    cast per call (a no-op for fp16 packs). Read as fp16 bits, bf16 scales turned every logit NaN."""
+
+    return None if a is None else a.astype(mx.float16)
+
+
+def _ane_q(p: tuple) -> list[mx.array | None]:
+    """(weight, scales, biases) of one quantized matrix as the ANE staging kernels read them."""
+
+    return [p[0], _f16(p[1]), _f16(p[2])]
+
+
 def _layer(self: Any, cut: int) -> dict[str, Any]:
     cached = getattr(self, "_mtplx_ane_split", None)
     if cached is not None and cached["cut"] == cut:
@@ -210,7 +223,7 @@ def install_gdn(model: Any) -> dict[str, Any]:
             t1 = _time.perf_counter()
         x2 = x.reshape(rows, H)
         xq, tx = _prep_x(x2)
-        ws = [self.weight[cut:], self.scales[cut:], self.biases[cut:], z.weight, z.scales, z.biases]
+        ws = [self.weight[cut:], _f16(self.scales[cut:]), _f16(self.biases[cut:]), z.weight, _f16(z.scales), _f16(z.biases)]
         st = lin.stage(xq, tx, ws, [0, n_qkv - cut], self.bits, self.group_size)
         mx.eval(st)
         gpu = mx.quantized_matmul(x2, self.weight[:cut], self.scales[:cut], self.biases[:cut], transpose=True,
@@ -322,7 +335,7 @@ def install(model: Any = None) -> dict[str, Any]:
             stage = [ffn.stage(xq, tx, _had(_deq(ga)), _had(_deq(ua)), _had(_deq(da)))]
         else:
             scales = _row_scales(self, L) if _w8() else []
-            stage = [_stage_x(ffn, x2), ffn.stage_weights_q(list(ga[:3]), list(ua[:3]), list(da[:3]), ga[4], ga[3], scales)]
+            stage = [_stage_x(ffn, x2), ffn.stage_weights_q(_ane_q(ga), _ane_q(ua), _ane_q(da), ga[4], ga[3], scales)]
         mx.eval(*stage)
         if trace:
             t2 = _time.perf_counter()
@@ -421,7 +434,7 @@ def _ffn_begin(ffn: Any, layer: Any, h2: mx.array, channels: int):
     inter = mlp.gate_proj.weight.shape[0]
     L = _layer(mlp, inter - channels)
     ga, ua, da = L["ga"], L["ua"], L["da"]
-    st = [_stage_x(ffn, x2), ffn.stage_weights_q(list(ga[:3]), list(ua[:3]), list(da[:3]), ga[4], ga[3])]
+    st = [_stage_x(ffn, x2), ffn.stage_weights_q(_ane_q(ga), _ane_q(ua), _ane_q(da), ga[4], ga[3])]
     mx.eval(*st)
     h = nn.silu(_qmm(x2, L["g"])) * _qmm(x2, L["u"])
     y_gpu = _qmm(h, L["d"])
