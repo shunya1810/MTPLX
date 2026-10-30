@@ -1361,6 +1361,8 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
         if (
             x.shape[-2] == 1
             and x.size == x.shape[-1]  # B*S == 1
+            # moe_glu_decode compiles Flash-Next's hidden width in (K 2560).
+            and x.shape[-1] == 2560
             and _fused_moe_decode_enabled()
             and isinstance(sw, _FusedGateUpSwitchGLU)
             and sw.bits == 4
@@ -1404,6 +1406,7 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
             x.ndim >= 2
             and 2 <= x.shape[-2] <= 4
             and x.size == x.shape[-2] * x.shape[-1]  # B == 1
+            and x.shape[-1] == 2560  # moe_glu_verify's compiled K
             and _fused_moe_verify_enabled()
             and isinstance(sw, _FusedGateUpSwitchGLU)
             and sw.bits == 4
