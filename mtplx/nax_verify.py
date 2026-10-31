@@ -735,14 +735,24 @@ def _count_qlinear_fallback(bits: int, m: int) -> None:
     nax_qlinear_fallback_counts[key] = nax_qlinear_fallback_counts.get(key, 0) + 1
 
 
+# (current_attention_phase, lane_disabled), bound on the first call: importing them inside
+# verify_shaped_qmm added ~0.7 us of host time to every QuantizedLinear call (M1, 2026-10-31).
+_LANE_HELPERS: tuple = ()
+
+
 def verify_shaped_qmm(x, w_q_in, scales, biases, *, bits, group_size):
     """Verify-shaped (decode/verify, not prefill) affine quantized ``x @ W.T`` on the M1/NAX
     lanes, or None when no lane takes the shape. No bias; the caller adds it.
 
     Shared by the ``nn.QuantizedLinear`` patch and by model code that calls
     ``mx.quantized_matmul`` directly on fused weights (qwen4_exp ``_projection``)."""
-    from .attention_context import current_attention_phase
-    from .kernel_selfcheck import lane_disabled
+    global _LANE_HELPERS
+    if not _LANE_HELPERS:
+        from .attention_context import current_attention_phase as _phase
+        from .kernel_selfcheck import lane_disabled as _disabled
+
+        _LANE_HELPERS = (_phase, _disabled)
+    current_attention_phase, lane_disabled = _LANE_HELPERS
 
     bits = int(bits or 0)
     group_size = int(group_size or 0)
