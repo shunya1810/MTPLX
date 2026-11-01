@@ -142,3 +142,14 @@ def test_ane_prefill_skips_moe_models():
     moe = NS(named_modules=lambda: [("layers.0.mlp", Qwen3NextSparseMoeBlock())])
     dense = NS(named_modules=lambda: [("layers.0.mlp", object())])
     assert ap._is_moe(moe) and not ap._is_moe(dense) and not ap._is_moe(None)
+
+
+def test_qwen4_moe_keeps_the_2048_chunk_and_a_wide_rung(_private_environ, monkeypatch):
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "1")
+    env = p._m1_moe_lane_env(moe=True, gdn=False, a3b_capture_commit=False, qwen4=True)
+    assert "MTPLX_PREFILL_CHUNK_SIZE_DENSE" not in env
+    assert "MTPLX_PREFILL_CHUNK_SIZE_REPAGE" not in env
+    assert env["MTPLX_QWEN4_PREFILL_WIDE_CHUNK"] == "4096"
+    assert env["MTPLX_GDN_BLOCKED_PREFILL"] == "1"
+    other = p._m1_moe_lane_env(moe=True, gdn=False, a3b_capture_commit=False)
+    assert other["MTPLX_PREFILL_CHUNK_SIZE_DENSE"] == "4096"

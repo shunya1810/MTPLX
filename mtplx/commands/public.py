@@ -1518,7 +1518,14 @@ _M1_A3B_ENV = {
 # 11.7 s.
 _M1_QWEN4_MOE_ENV = {
     "MTPLX_GDN_BLOCKED_PREFILL": "1",
+    # The 4,096-row chunk as the family's wide rung, not the profile chunk:
+    # the admission prices it and falls back to 2,048 rows when it does not
+    # fit. Pinned at 4,096 (the any-MoE keys) the ladder had no narrower
+    # width and a cold 32K prompt with the 47 GB ISTA pack was refused at
+    # ~28K (engine 49.7 GB + a 6.4 GB chunk past the 52 GiB line).
+    "MTPLX_QWEN4_PREFILL_WIDE_CHUNK": "4096",
 }
+_M1_QWEN4_MOE_DROP = ("MTPLX_PREFILL_CHUNK_SIZE_DENSE", "MTPLX_PREFILL_CHUNK_SIZE_REPAGE")
 _MOE_EXPERT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
 
 
@@ -1565,6 +1572,8 @@ def _m1_moe_lane_env(
     if gdn:
         env.update(_M1_MOE_GDN_ENV)
     if qwen4:
+        for key in _M1_QWEN4_MOE_DROP:
+            env.pop(key, None)
         env.update(_M1_QWEN4_MOE_ENV)
     if a3b_capture_commit:
         env.update(_M1_A3B_ENV)
