@@ -1143,6 +1143,18 @@ def _hc_rows_read_applies(module, hyper_input: mx.array) -> bool:
     return _rows.supports(module, hyper_input)
 
 
+def _hc_q8_read_applies(module, hyper_input: mx.array) -> bool:
+    """mtplx.kernels.hc_read_q8 serves this read: the hc_read_rows gate (M1
+    family by default, not prefill) plus MTPLX_HC_READ_Q8 (default on)."""
+
+    from mtplx.kernels import hc_read_q8 as _q8
+    from mtplx.kernels import hc_read_rows as _rows
+
+    if current_attention_phase() == "prefill" or not _rows.enabled() or not _q8.enabled():
+        return False
+    return _q8.supports(module, hyper_input)
+
+
 class GatedResidual(nn.Module):
     """The Gated Residual read/write mixer (hyper-connections)."""
 
@@ -1272,6 +1284,13 @@ class GatedResidual(nn.Module):
         comes back as the second output is the written one.
         """
 
+        if _hc_q8_read_applies(self, hyper_input):
+            # Decode/verify rows on the M1 family: two dispatches over a
+            # kernel-private 8-bit pack of the mixes; a row's result does not
+            # depend on how many rows the call carries.
+            from mtplx.kernels.hc_read_q8 import hc_read_q8
+
+            return hc_read_q8(self, hyper_input, pending)
         if self._verify_rows_read_applies(hyper_input, pending):
             return self._verify_rows_read(hyper_input, pending)
         if _hc_rows_read_applies(self, hyper_input):
@@ -1358,6 +1377,8 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
         # (32 or 64 — the 2026-08-27 01:35 reforge moved the pack to g64);
         # anything else runs the stock chain.
         sw = self.switch_mlp
+        if _q2_moe_glu_applies(sw, x):
+            return self._q2_glu_call(x, sw)
         if (
             x.shape[-2] == 1
             and x.size == x.shape[-1]  # B*S == 1
@@ -1446,6 +1467,33 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
         ):
             return self._verify_call(x)
         return super().__call__(x)
+
+    def _q2_glu_call(self, x: mx.array, sw: "_FusedGateUpSwitchGLU") -> mx.array:
+        """2-bit g64 experts (the ISTA Q2_0 pack) at decode and verify widths:
+        routing as the parent's, the routed GLU in two dispatches
+        (mtplx.kernels.moe_q2_glu)."""
+        from mtplx.kernels.moe_q2_glu import moe_q2_glu
+
+        gates = mx.softmax(self.gate(x), axis=-1, precise=True)
+        k = self.top_k
+        idx = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        w = mx.take_along_axis(gates, idx, axis=-1)
+        if self.norm_topk_prob:
+            w = w / w.sum(axis=-1, keepdims=True)
+        dn = sw.down_proj
+        y = moe_q2_glu(
+            x.reshape(-1, x.shape[-1]),
+            sw.gu_weight,
+            sw.gu_scales,
+            sw.gu_biases,
+            dn.weight,
+            dn.scales,
+            dn.biases,
+            idx.reshape(-1).astype(mx.uint32),
+            w.reshape(-1).astype(mx.float32),
+        ).reshape(x.shape)
+        shared = attention_gate(self.shared_expert(x), self.shared_expert_gate(x))
+        return (y + shared).astype(x.dtype)
 
     def _verify_call(self, x: mx.array) -> mx.array:
         """The parent's forward with the shared-expert gate under the verify
@@ -2669,6 +2717,25 @@ def _fused_hc_v3_enabled() -> bool:
 def _fused_moe_decode_enabled() -> bool:
     raw = (os.environ.get("MTPLX_FUSED_MOE_DECODE") or "0").strip().lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+#: Token rows the 2-bit routed-GLU kernels take (decode and MTP/copy verify
+#: widths); prefill keeps the gather chain.
+_Q2_MOE_GLU_MAX_ROWS = 8
+
+
+def _q2_moe_glu_applies(sw, x: mx.array) -> bool:
+    """2-bit g64 fused experts at 1-8 rows of one sequence
+    (MTPLX_Q2_MOE_GLU=0 keeps the gather chain)."""
+    if (os.environ.get("MTPLX_Q2_MOE_GLU") or "1").strip() == "0":
+        return False
+    if not isinstance(sw, _FusedGateUpSwitchGLU) or sw.bits != 2 or sw.group_size != 64:
+        return False
+    dn = sw.down_proj
+    if getattr(dn, "bits", None) != 2 or getattr(dn, "group_size", None) != 64:
+        return False
+    rows = x.size // x.shape[-1]
+    return x.ndim >= 2 and rows == x.shape[-2] and 1 <= rows <= _Q2_MOE_GLU_MAX_ROWS
 
 
 def _fused_moe_verify_enabled() -> bool:

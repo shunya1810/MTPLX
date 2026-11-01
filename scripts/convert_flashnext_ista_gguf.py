@@ -305,13 +305,27 @@ class Writer:
         self.cur = {}
 
 
+HC_BITS = 0  # 0 keeps the hyper-connection mixers fp16 (--hc-bits)
+
+
+def write_hc(w: Writer, prefix: str, down, up, inject=None):
+    """Hyper-connection mixer projections: fp16, or affine HC_BITS g64."""
+    mats = {"input_mix_weight_down": down, "input_mix_weight_up": up}
+    if inject is not None:
+        mats["block_inject_weight"] = inject
+    for name, a in mats.items():
+        if HC_BITS:
+            w.q(f"{prefix}.{name}", affine(a, bits=HC_BITS, group=DENSE_GROUP))
+        else:
+            w.f(f"{prefix}.{name}.weight", a)
+
+
 def write_block(w: Writer, g: Gguf, il: int, prefix: str):
     B = f"blk.{il}."
     for part, hc in (("attn_hyper_connection", "hc_attn"), ("mlp_hyper_connection", "hc_ffn")):
         w.f(f"{prefix}.{part}.hc_norm.weight", g.float(B + f"{hc}_norm.weight"))
-        w.f(f"{prefix}.{part}.input_mix_weight_down.weight", g.float(B + f"{hc}_down.weight"))
-        w.f(f"{prefix}.{part}.input_mix_weight_up.weight", g.float(B + f"{hc}_up.weight"))
-        w.f(f"{prefix}.{part}.block_inject_weight.weight", g.float(B + f"{hc}_inject.weight"))
+        write_hc(w, f"{prefix}.{part}", g.float(B + f"{hc}_down.weight"),
+                 g.float(B + f"{hc}_up.weight"), g.float(B + f"{hc}_inject.weight"))
 
     if B + "attn_qkv.weight" in g.tensors:  # GatedDeltaNet
         L = f"{prefix}.linear_attn"
@@ -383,7 +397,11 @@ def main():
                          "tokenizer and chat template")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--layers", type=int, default=N_LAYER, help="debug: convert only the first N trunk layers")
+    ap.add_argument("--hc-bits", type=int, choices=(0, 8), default=0,
+                    help="hyper-connection mixers: 0 = fp16, 8 = affine 8-bit g64")
     args = ap.parse_args()
+    global HC_BITS
+    HC_BITS = args.hc_bits
 
     import mlx.core as mx
 
@@ -397,8 +415,8 @@ def main():
     w.q(f"{LM}.model.embed_tokens", affine(g.float("token_embd.weight")))
     w.q(f"{LM}.lm_head", affine(g.float("output.weight")))
     w.f(f"{LM}.model.hyper_connection_mixer.hc_norm.weight", g.float("output_hc_norm.weight"))
-    w.f(f"{LM}.model.hyper_connection_mixer.input_mix_weight_down.weight", g.float("output_hc_down.weight"))
-    w.f(f"{LM}.model.hyper_connection_mixer.input_mix_weight_up.weight", g.float("output_hc_up.weight"))
+    write_hc(w, f"{LM}.model.hyper_connection_mixer", g.float("output_hc_down.weight"),
+             g.float("output_hc_up.weight"))
     w.flush()
     experts = {}
     for il in range(args.layers):
@@ -425,7 +443,8 @@ def main():
         tc.pop("layer_types", None)
     # Unquantized modules keep the reference pack's False entries (hc mixers,
     # conv, PLE projections); routed experts are 2-bit g64; the rest 8-bit g64.
-    quant = {k: v for k, v in cfg["quantization"].items() if v is False}
+    quant = {k: v for k, v in cfg["quantization"].items()
+             if v is False and not (HC_BITS and "hyper_connection" in k)}
     quant.update({"group_size": DENSE_GROUP, "bits": DENSE_BITS, "mode": "affine"})
     for il in range(args.layers):
         for proj in ("gate_proj", "up_proj", "down_proj"):

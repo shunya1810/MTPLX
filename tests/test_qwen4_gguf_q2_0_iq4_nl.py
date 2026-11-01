@@ -98,3 +98,64 @@ def test_memory_plan_counts_gguf_experts_and_table(tmp_path):
     weights = 512 * 640 * 2560
     assert model_weights_bytes(tmp_path) == 1000 + weights // 4 + weights // 64 * 4
     assert ngram_table_bytes(tmp_path) == 1000 * 90
+
+
+def test_q2_moe_glu_matches_float_reference():
+    from mtplx.kernels.moe_q2_glu import moe_q2_glu
+
+    mx.random.seed(3)
+    E, H, F, K, M = 16, 256, 128, 4, 3
+    gu = (mx.random.normal((E, 2 * F, H)) * 0.05).astype(mx.float16)
+    dn = (mx.random.normal((E, H, F)) * 0.05).astype(mx.float16)
+    gw, gs, gb = mx.quantize(gu, group_size=64, bits=2)
+    dw, ds, db = mx.quantize(dn, group_size=64, bits=2)
+    rng = np.random.default_rng(3)
+    idx = np.stack([rng.choice(E, K, replace=False) for _ in range(M)]).astype(np.uint32)
+    w = rng.dirichlet(np.ones(K), size=M).astype(np.float32)
+    x = mx.random.normal((M, H)).astype(mx.float16)
+    got = np.array(moe_q2_glu(x, gw, gs, gb, dw, ds, db, mx.array(idx.reshape(-1)),
+                              mx.array(w.reshape(-1))).astype(mx.float32))
+    G = np.array(mx.dequantize(gw, gs, gb, group_size=64, bits=2).astype(mx.float32))
+    D = np.array(mx.dequantize(dw, ds, db, group_size=64, bits=2).astype(mx.float32))
+    xf = np.array(x.astype(mx.float32))
+    want = np.zeros((M, H), np.float32)
+    for t in range(M):
+        for s in range(K):
+            g = G[idx[t, s]] @ xf[t]
+            h = g[:F] / (1 + np.exp(-g[:F])) * g[F:]
+            want[t] += w[t, s] * (D[idx[t, s]] @ h)
+    assert np.abs(got - want).max() <= 2e-3 * np.abs(want).max()
+    # a row's output does not depend on the other rows of the call
+    one = np.array(moe_q2_glu(x[1:2], gw, gs, gb, dw, ds, db, mx.array(idx[1]),
+                              mx.array(w[1])).astype(mx.float32))
+    np.testing.assert_array_equal(one[0], got[1])
+
+
+def test_hc_read_q8_matches_hc_read_rows():
+    import types
+
+    from mtplx.kernels.hc_read_q8 import hc_read_q8, supports
+    from mtplx.kernels.hc_read_rows import hc_read_rows
+    from mtplx.models.qwen4_exp import GatedResidual
+
+    args = types.SimpleNamespace(hc_count=4, hidden_size=512, rms_norm_eps=1e-6, hc_lowrank=128)
+    m = GatedResidual(args)
+    m.input_mix_weight_down.weight = (mx.random.normal((128, 2048)) * 0.03).astype(mx.float16)
+    m.input_mix_weight_up.weight = (mx.random.normal((2048, 128)) * 0.1).astype(mx.float16)
+    m.block_inject_weight.weight = (mx.random.normal((4, 2048)) * 0.03).astype(mx.float16)
+    m.hc_norm.weight = (1 + mx.random.normal((2048,)) * 0.1).astype(mx.float16)
+    for rows in (1, 3):
+        x = mx.random.normal((1, rows, 2048)).astype(mx.float16)
+        pending = (mx.random.normal((1, rows, 512)).astype(mx.float16),
+                   mx.random.uniform(shape=(1, rows, 4)).astype(mx.float16))
+        assert supports(m, x)
+        for p in (None, pending):
+            ref = hc_read_rows(m, x, p)
+            got = hc_read_q8(m, x, p)
+            for a, b in zip(ref, got):
+                a = np.array(a.astype(mx.float32)); b = np.array(b.astype(mx.float32))
+                assert np.abs(a - b).max() <= 1e-2 * np.abs(a).max()
+    x3 = mx.random.normal((1, 3, 2048)).astype(mx.float16)
+    row = hc_read_q8(m, x3[:, 1:2])
+    full = hc_read_q8(m, x3)
+    np.testing.assert_array_equal(np.array(row[0][0, 0]), np.array(full[0][0, 1]))
