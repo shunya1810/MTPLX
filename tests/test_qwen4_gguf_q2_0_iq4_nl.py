@@ -159,3 +159,19 @@ def test_hc_read_q8_matches_hc_read_rows():
     row = hc_read_q8(m, x3[:, 1:2])
     full = hc_read_q8(m, x3)
     np.testing.assert_array_equal(np.array(row[0][0, 0]), np.array(full[0][0, 1]))
+
+
+def test_route_topk_matches_softmax_topk():
+    from mtplx.kernels.moe_q2_glu import moe_route_topk
+
+    rng = np.random.default_rng(5)
+    logits = rng.normal(size=(4, 512)).astype(np.float32) * 3
+    idx, w = moe_route_topk(mx.array(logits), 10, normalize=True)
+    idx = np.array(idx).reshape(4, 10)
+    w = np.array(w).reshape(4, 10)
+    p = np.exp(logits - logits.max(-1, keepdims=True))
+    p /= p.sum(-1, keepdims=True)
+    for t in range(4):
+        want = np.argsort(-p[t])[:10]
+        assert list(idx[t]) == list(want)
+        np.testing.assert_allclose(w[t], p[t][want] / p[t][want].sum(), rtol=1e-5)

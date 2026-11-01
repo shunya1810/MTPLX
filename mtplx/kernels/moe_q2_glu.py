@@ -175,7 +175,102 @@ _SRC_B = """
     acc += simd_shuffle_xor(acc, 2);
     acc += simd_shuffle_xor(acc, 4);
     if (l8 == 0) {
-        y[(size_t)t * dmodel + d] = (T)acc;
+        if (SHARED) {
+            // combine tail: routed sum + shared expert * sigmoid(shared gate)
+            const float sg_ = (float)sgate[t];
+            const float gate = (float)((T)(1.0f / (1.0f + metal::exp(-sg_))));
+            const float sh = (float)((T)((float)shared[(size_t)t * dmodel + d] * gate));
+            y[(size_t)t * dmodel + d] = (T)((float)((T)acc) + sh);
+        } else {
+            y[(size_t)t * dmodel + d] = (T)acc;
+        }
+    }
+"""
+
+# Router finalize. One threadgroup per token row: float32 softmax over the E
+# router logits, the TOPK largest probabilities picked by TOPK rounds of a
+# threadgroup argmax (ties go to the lower expert index), and their weights,
+# renormalized over the picks when NORM. Replaces softmax, argpartition, the
+# gather, the renormalization and two casts (six dependent dispatches).
+_SRC_ROUTE = """
+    constexpr int E = E_C;
+    constexpr int TOPK = TOPK_C;
+    constexpr int PER = (E + 255) / 256;
+    threadgroup float red_v[8];
+    threadgroup int red_i[8];
+    threadgroup float tg_max;
+    threadgroup float tg_sum;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint lane = tid % 32;
+    const uint sg = tid / 32;
+    const uint row = threadgroup_position_in_grid.y;
+    float v[PER];
+    float mx_ = -INFINITY;
+    for (int k = 0; k < PER; ++k) {
+        const int e = tid + 256 * k;
+        v[k] = e < E ? (float)logits[(size_t)row * E + e] : -INFINITY;
+        mx_ = max(mx_, v[k]);
+    }
+    mx_ = simd_max(mx_);
+    if (lane == 0) red_v[sg] = mx_;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float m = red_v[0];
+        for (int i = 1; i < 8; ++i) m = max(m, red_v[i]);
+        tg_max = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float m = tg_max;
+    float ssum = 0.0f;
+    for (int k = 0; k < PER; ++k) {
+        v[k] = (tid + 256 * k) < (uint)E ? metal::precise::exp(v[k] - m) : 0.0f;
+        ssum += v[k];
+    }
+    ssum = simd_sum(ssum);
+    if (lane == 0) red_v[sg] = ssum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float a = 0.0f;
+        for (int i = 0; i < 8; ++i) a += red_v[i];
+        tg_sum = a;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float denom = tg_sum;
+    float picked[TOPK];
+    int picked_i[TOPK];
+    for (int r = 0; r < TOPK; ++r) {
+        float bv = -1.0f;
+        int bi = E;
+        for (int k = 0; k < PER; ++k) {
+            const int e = tid + 256 * k;
+            if (e < E && (v[k] > bv || (v[k] == bv && e < bi))) { bv = v[k]; bi = e; }
+        }
+        for (int off = 16; off > 0; off /= 2) {
+            const float ov = simd_shuffle_down(bv, off);
+            const int oi = simd_shuffle_down(bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) { red_v[sg] = bv; red_i[sg] = bi; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float gv = red_v[0];
+        int gi = red_i[0];
+        for (int i = 1; i < 8; ++i) {
+            if (red_v[i] > gv || (red_v[i] == gv && red_i[i] < gi)) { gv = red_v[i]; gi = red_i[i]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        picked[r] = gv / denom;
+        picked_i[r] = gi;
+        for (int k = 0; k < PER; ++k) {
+            if ((int)(tid + 256 * k) == gi) v[k] = -2.0f;   // out of the next rounds
+        }
+    }
+    if (tid == 0) {
+        float tot = 0.0f;
+        for (int r = 0; r < TOPK; ++r) tot += picked[r];
+        for (int r = 0; r < TOPK; ++r) {
+            experts[row * TOPK + r] = (uint)picked_i[r];
+            weights[row * TOPK + r] = NORM ? picked[r] / tot : picked[r];
+        }
     }
 """
 
@@ -195,11 +290,37 @@ def _kernel_a():
 def _kernel_b():
     return mx.fast.metal_kernel(
         name="mtplx_moe_q2_down_y",
-        input_names=["h", "dw", "ds", "db", "experts", "rw"],
+        input_names=["h", "dw", "ds", "db", "experts", "rw", "shared", "sgate"],
         output_names=["y"],
         header=_HEADER,
         source=_SRC_B,
     )
+
+
+@lru_cache(maxsize=4)
+def _kernel_route():
+    return mx.fast.metal_kernel(
+        name="mtplx_moe_route_topk",
+        input_names=["logits"],
+        output_names=["experts", "weights"],
+        header=_HEADER,
+        source=_SRC_ROUTE,
+    )
+
+
+def moe_route_topk(logits: mx.array, top_k: int, *, normalize: bool):
+    """[M, E] router logits -> (experts uint32 [M * top_k], weights float32
+    [M * top_k]): softmax, top-k, optional renormalization over the picks."""
+    m_rows, n_exp = int(logits.shape[0]), int(logits.shape[1])
+    experts, weights = _kernel_route()(
+        inputs=[logits],
+        template=[("E_C", n_exp), ("TOPK_C", int(top_k)), ("NORM", int(bool(normalize)))],
+        grid=(256, m_rows, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(m_rows * top_k,), (m_rows * top_k,)],
+        output_dtypes=[mx.uint32, mx.float32],
+    )
+    return experts, weights
 
 
 def _chunk_a(k: int) -> int:
@@ -217,11 +338,12 @@ def _rows_a() -> int:
     return r if r > 0 and r % 32 == 0 else 32
 
 
-def moe_q2_glu(x2, gu_w, gu_s, gu_b, dn_w, dn_s, dn_b, experts, route_w):
+def moe_q2_glu(x2, gu_w, gu_s, gu_b, dn_w, dn_s, dn_b, experts, route_w, shared=None, shared_gate=None):
     """x2 [M, K]; gate+up pack [E, 2N, K/16] uint32 (2-bit g64) with scales and
     biases [E, 2N, K/64]; down pack [E, D, N/16] with [E, D, N/64];
     experts uint32 [M * topk] (token-major); route_w float32 [M * topk].
-    Returns y [M, D] in x2's dtype."""
+    With ``shared`` [M, D] and ``shared_gate`` [M] (logits) the down pass also
+    adds shared * sigmoid(shared_gate). Returns y [M, D] in x2's dtype."""
     m_rows, k = int(x2.shape[0]), int(x2.shape[1])
     n_inter = int(gu_w.shape[1]) // 2
     dmodel = int(dn_w.shape[1])
@@ -238,9 +360,13 @@ def moe_q2_glu(x2, gu_w, gu_s, gu_b, dn_w, dn_s, dn_b, experts, route_w):
         output_shapes=[(pairs, n_inter)],
         output_dtypes=[x2.dtype],
     )
+    with_shared = shared is not None
+    if not with_shared:
+        shared = shared_gate = x2  # unused
     (y,) = _kernel_b()(
-        inputs=[h, dn_w, dn_s, dn_b, experts, route_w],
-        template=[("T", x2.dtype), ("N_C", n_inter), ("TOPK_C", topk), ("dmodel_c", dmodel)],
+        inputs=[h, dn_w, dn_s, dn_b, experts, route_w, shared, shared_gate],
+        template=[("T", x2.dtype), ("N_C", n_inter), ("TOPK_C", topk), ("dmodel_c", dmodel),
+                  ("SHARED", int(with_shared))],
         grid=(((dmodel + 31) // 32) * 256, m_rows, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(m_rows, dmodel)],

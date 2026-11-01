@@ -472,7 +472,13 @@ def main():
     runtime["public_model_id"] = "mtplx-flash-next-ista-q2_0"
     runtime["artifact_role"] = "converted-local"
     runtime.pop("speed_evidence", None)
-    runtime["mtp_depth_default"] = 2
+    # M1 Max, greedy, eager verify with mid-forward evals (code/prose/ja tok/s):
+    # depth 3 46.4/31.4/22.9, depth 1 35.8/34.5/27.3; with an ~8K-token prompt
+    # 43.1/27.7/20.7 vs 31.4/29.9/24.9. The fixed-M4 compiled verifier is slower
+    # here (depth 3: 41.7/31.1/21.5, 8K 39.7/26.0/19.8): its traced replay takes
+    # no mid-forward evals, so the pack turns it off (an operator export wins).
+    runtime["mtp_depth_default"] = 3
+    runtime["runtime_env_overrides"] = {"MTPLX_QWEN4_FIXED_M4_VERIFY": "0"}
     json.dump(runtime, open(args.out / "mtplx_runtime.json", "w"), indent=2)
     if not (args.out / "mtp.safetensors").exists():
         print("NOTE: copy the Optimized-Speed pack's mtp.safetensors into the output dir")

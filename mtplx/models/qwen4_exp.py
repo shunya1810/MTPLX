@@ -1470,30 +1470,30 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
 
     def _q2_glu_call(self, x: mx.array, sw: "_FusedGateUpSwitchGLU") -> mx.array:
         """2-bit g64 experts (the ISTA Q2_0 pack) at decode and verify widths:
-        routing as the parent's, the routed GLU in two dispatches
+        router softmax/top-k in one kernel, the routed GLU in two, the shared
+        expert's gated add folded into the down pass
         (mtplx.kernels.moe_q2_glu)."""
-        from mtplx.kernels.moe_q2_glu import moe_q2_glu
+        from mtplx.kernels.moe_q2_glu import moe_q2_glu, moe_route_topk
 
-        gates = mx.softmax(self.gate(x), axis=-1, precise=True)
-        k = self.top_k
-        idx = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-        w = mx.take_along_axis(gates, idx, axis=-1)
-        if self.norm_topk_prob:
-            w = w / w.sum(axis=-1, keepdims=True)
+        rows = x.size // x.shape[-1]
+        idx, w = moe_route_topk(
+            self.gate(x).reshape(rows, -1), self.top_k, normalize=bool(self.norm_topk_prob)
+        )
         dn = sw.down_proj
         y = moe_q2_glu(
-            x.reshape(-1, x.shape[-1]),
+            x.reshape(rows, x.shape[-1]),
             sw.gu_weight,
             sw.gu_scales,
             sw.gu_biases,
             dn.weight,
             dn.scales,
             dn.biases,
-            idx.reshape(-1).astype(mx.uint32),
-            w.reshape(-1).astype(mx.float32),
-        ).reshape(x.shape)
-        shared = attention_gate(self.shared_expert(x), self.shared_expert_gate(x))
-        return (y + shared).astype(x.dtype)
+            idx,
+            w,
+            shared=self.shared_expert(x).reshape(rows, -1),
+            shared_gate=self.shared_expert_gate(x).reshape(rows),
+        )
+        return y.reshape(x.shape)
 
     def _verify_call(self, x: mx.array) -> mx.array:
         """The parent's forward with the shared-expert gate under the verify
@@ -3007,6 +3007,25 @@ def _record_boundary_capture(cache: Any, offset: int, kind: str, arrays: tuple) 
 # still building the last ones.
 _PREFILL_MIDLOOP_MIN_ROWS = 1024
 _PREFILL_MIDLOOP_DEFAULT_LAYERS = 4
+
+
+#: Default layers between mid-forward async evals of an eager decode/verify
+#: step. M1 Max, Flash-Next ISTA Q2_0, greedy depth 1 (code/prose/ja): one
+#: eval at the end 31.7/30.2/23.8 tok/s, every 12 layers 36.0/33.7/26.6,
+#: every 6 35.8/34.5/27.3 (the host builds a step in ~5-9 ms, which the GPU
+#: otherwise waits out before the first kernel).
+_DECODE_MIDLOOP_DEFAULT_LAYERS = 6
+
+
+def _decode_midloop_eval_layers() -> int:
+    """Layers between mid-forward async evals of a decode/verify step
+    (``MTPLX_QWEN4_DECODE_MIDLOOP_EVAL``; ``0`` restores one eval at the end)."""
+
+    raw = (os.environ.get("MTPLX_QWEN4_DECODE_MIDLOOP_EVAL") or "").strip()
+    try:
+        return max(0, int(raw)) if raw else _DECODE_MIDLOOP_DEFAULT_LAYERS
+    except ValueError:
+        return _DECODE_MIDLOOP_DEFAULT_LAYERS
 
 
 def _prefill_midloop_eval_layers(rows: int) -> int:
@@ -6792,7 +6811,17 @@ class Qwen4ExpTextModel(nn.Module):
         if self._decode_runs is None:
             self._decode_runs = self._build_decode_runs()
         capture = _VERIFY_CAPTURE.get()
+        # Hand the GPU the layers built so far every `kick` layers, so it runs
+        # them while the host builds the rest (the step is otherwise built in
+        # full before its single eval). Not inside a compiled body: there the
+        # arrays are tracers.
+        kick = 0 if in_compiled_step_body() else _decode_midloop_eval_layers()
+        built = 0
         for kind, payload in self._decode_runs:
+            if kick and built >= kick:
+                mx.async_eval(h)
+                built = 0
+            built += 1 if kind == "eager" else len(payload)
             if kind == "eager":
                 i = payload
                 if capture and getattr(self.layers[i], "ple", None) is not None:
