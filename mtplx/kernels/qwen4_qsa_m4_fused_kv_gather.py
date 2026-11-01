@@ -73,11 +73,12 @@ def bind_qwen4_qsa_m4_fused_kv_gather(
     ) -> tuple[mx.array, mx.array]:
         return kernel(
             inputs=[keys, values, token_idx],
-            template=[("T", mx.bfloat16)],
+            # A pure row copy: any 16-bit cache dtype (bf16 packs, fp16 M1 packs)
+            template=[("T", keys.dtype)],
             grid=(_ELEMENTS, 1, 1),
             threadgroup=(256, 1, 1),
             output_shapes=[_OUTPUT_SHAPE, _OUTPUT_SHAPE],
-            output_dtypes=[mx.bfloat16, mx.bfloat16],
+            output_dtypes=[keys.dtype, values.dtype],
         )
 
     return gather

@@ -8,6 +8,7 @@ state explicit before the generation loop accepts warm prompt state directly.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import os
@@ -231,9 +232,32 @@ def model_weights_bytes(model_path: Any) -> int | None:
                 total += shard.stat().st_size
             except OSError:
                 continue
+        total += gguf_routed_expert_bytes(root)
         return total if total > 0 else None
     except Exception:
         return None
+
+
+def _text_config(root: Path) -> dict:
+    try:
+        cfg = json.loads((root / "config.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return cfg.get("text_config") or cfg
+
+
+def gguf_routed_expert_bytes(model_path: Any) -> int:
+    """Bytes of the routed experts a converted GGUF pack builds at load
+    (text_config.routed_experts_gguf, scripts/convert_flashnext_ista_gguf.py).
+    They live in the GGUF, not in the pack's shards, but load as wired MLX
+    affine 2-bit g64 tensors: codes plus fp16 scale and bias per 64 weights."""
+    spec = _text_config(Path(str(model_path))).get("routed_experts_gguf") or {}
+    total = 0
+    for projs in (spec.get("layers") or {}).values():
+        for t in projs.values():
+            weights = int(t["experts"]) * int(t["rows"]) * int(t["cols"])
+            total += weights // 4 + weights // 64 * 4
+    return total
 
 
 def ngram_table_bytes(model_path: Any) -> int:
@@ -244,7 +268,12 @@ def ngram_table_bytes(model_path: Any) -> int:
 
     try:
         table = Path(str(model_path)) / NGRAM_TABLE_FILENAME
-        return table.stat().st_size if table.is_file() else 0
+        if table.is_file():
+            return table.stat().st_size
+        spec = _text_config(Path(str(model_path))).get("ngram_gguf") or {}
+        if spec:
+            return int(spec["rows"]) * int(spec["dim"]) // 32 * 18
+        return 0
     except Exception:
         return 0
 

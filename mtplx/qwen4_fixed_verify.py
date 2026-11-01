@@ -223,18 +223,23 @@ def _build_fixed_m4_compiled_verify_aux(self: Any, cache, prompt_ids):
             tuple(
                 (name, tuple(sidecar._maps[name][0].shape[1:]), sidecar._maps[name][1])
                 for name in ("weight", "scales", "biases")
+                if name in sidecar._maps
             ),
         )
         expected_storage = (
-            4,
-            32,
             (
-                ("weight", (20,), "U32"),
-                ("scales", (5,), "BF16"),
-                ("biases", (5,), "BF16"),
+                4,
+                32,
+                (
+                    ("weight", (20,), "U32"),
+                    ("scales", (5,), "BF16"),
+                    ("biases", (5,), "BF16"),
+                ),
             ),
+            # IQ4_NL rows read in place from the ISTA GGUF's table split.
+            (0, 32, (("weight", (90,), "U8"),)),
         )
-        if storage != expected_storage:
+        if storage not in expected_storage:
             raise ValueError(
                 f"qwen4 fixed-M4 sidecar auxiliary storage mismatch: {storage}"
             )

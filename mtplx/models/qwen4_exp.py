@@ -2679,6 +2679,50 @@ def _fused_moe_verify_enabled() -> bool:
 _LAYER_MLP_RE = re.compile(r"^(.*\.layers\.(\d+)\.mlp)\.switch_mlp\.gate_proj\.weight$")
 
 
+def _q2_0_affine_from_gguf(spec: dict) -> tuple[mx.array, mx.array, mx.array]:
+    """One routed-expert tensor stored as GGUF Q2_0 -> MLX affine 2-bit g64.
+
+    A Q2_0 block is fp16 d plus 16 bytes holding 64 2-bit codes, element l in
+    bits 2 (l % 4) of byte l / 4, worth d * (q - 1). That byte order is MLX's
+    2-bit packing (element j in bits 2 (j % 16) of little-endian word j / 16),
+    so the codes are copied as they are, with scale = d and bias = -d: exact."""
+    import numpy as np
+
+    n_exp, rows, cols = int(spec["experts"]), int(spec["rows"]), int(spec["cols"])
+    blocks = np.memmap(
+        spec["path"],
+        dtype=np.uint8,
+        mode="r",
+        offset=int(spec["offset"]),
+        shape=(n_exp, rows, cols // 64, 18),
+    )
+    codes = np.ascontiguousarray(blocks[..., 2:]).view(np.uint32).reshape(n_exp, rows, cols // 16)
+    d = np.ascontiguousarray(blocks[..., :2]).view(np.float16).reshape(n_exp, rows, cols // 64)
+    scales = mx.array(d)
+    return mx.array(codes), scales, -scales
+
+
+def _gguf_q2_0_experts_sanitize(model, out: dict) -> dict:
+    """Add the routed experts a converted ISTA GGUF pack leaves in the GGUF
+    (text_config.routed_experts_gguf, scripts/convert_flashnext_ista_gguf.py)
+    as switch_mlp affine 2-bit g64 tensors; the gate+up fusion that follows
+    treats them like any packed experts."""
+    spec = (model.args.text_config or {}).get("routed_experts_gguf")
+    if not spec:
+        return out
+    if spec.get("format") != "Q2_0":
+        raise ValueError(f"unsupported GGUF routed expert format {spec.get('format')}")
+    for layer, projs in spec["layers"].items():
+        base = f"language_model.model.layers.{int(layer)}.mlp.switch_mlp"
+        for proj, tensor in projs.items():
+            w, s, b = _q2_0_affine_from_gguf(tensor)
+            out[f"{base}.{proj}.weight"] = w
+            out[f"{base}.{proj}.scales"] = s
+            out[f"{base}.{proj}.biases"] = b
+    print(f"[qwen4_exp] GGUF Q2_0 routed experts: {len(spec['layers'])} layers", flush=True)
+    return out
+
+
 def _fuse_gate_up_sanitize(model, out: dict) -> dict:
     """Sanitize-time MoE gate+up fusion (MTPLX_FUSED_GATE_UP=1).
 
@@ -5308,6 +5352,22 @@ class NGramTable(nn.Module):
             group_size=int(meta.get("ngram_group_size", 32)),
         )
 
+    def attach_gguf(self, spec: dict):
+        """Gather rows straight from an IQ4_NL table inside a GGUF (split 2
+        of the ISTA GSQ-RCO Q2_0 GGUF, scripts/convert_flashnext_ista_gguf.py):
+        raw 18-byte blocks per row, decoded after the gather; no copy."""
+        self.pop("weight", None)
+        if spec.get("dtype") != "IQ4_NL":
+            raise ValueError(f"unsupported GGUF n-gram table type {spec.get('dtype')}")
+        rows, dim = int(spec["rows"]), int(spec["dim"])
+        row_bytes = dim // 32 * 18
+        info = {"dtype": "U8", "shape": [rows, row_bytes], "data_offsets": [0, rows * row_bytes]}
+        self._sidecar = _SidecarGather(
+            Path(spec["path"]), {"weight": (info, int(spec["offset"]))}, bits=0, group_size=32
+        )
+        self._sidecar.codec = "iq4_nl"
+        self._sidecar.out_dtype = getattr(mx, str(spec.get("out_dtype", "float16")))
+
     def __call__(self, ids: mx.array) -> mx.array:
         if self._sidecar is not None:
             return self._sidecar(ids, self.dim)
@@ -5346,6 +5406,9 @@ class _SidecarGather:
 
         self.bits = bits
         self.group_size = group_size
+        # Raw GGUF blocks gathered as bytes and decoded after the gather
+        # (NGramTable.attach_gguf); None for the safetensors layouts.
+        self.codec = None
         self._maps = {}
         self._row_meta = []
         self.vectorized_gathers = 0
@@ -5353,7 +5416,7 @@ class _SidecarGather:
         self.madvise_applied, _advice_value = madvise_choice()
         self._fd = os.open(str(path), os.O_RDONLY)
         for name, (info, data_start) in entries.items():
-            dtype = {"U32": np.uint32, "BF16": np.uint16, "F16": np.uint16}[info["dtype"]]
+            dtype = {"U32": np.uint32, "BF16": np.uint16, "F16": np.uint16, "U8": np.uint8}[info["dtype"]]
             shape = tuple(info["shape"])
             offset = data_start + info["data_offsets"][0]
             mm = np.memmap(path, mode="r", dtype=dtype, offset=offset, shape=shape)
@@ -5370,7 +5433,7 @@ class _SidecarGather:
             except (AttributeError, OSError, ValueError):
                 self.madvise_applied = "unavailable"
             self._maps[name] = (mm, info["dtype"])
-            itemsize = 4 if info["dtype"] == "U32" else 2
+            itemsize = {"U32": 4, "U8": 1}.get(info["dtype"], 2)
             self._row_meta.append((offset, int(shape[1]) * itemsize))
         self.row_layout = "planar"
         row_file = os.environ.get("MTPLX_NGRAM_ROW_FILE")
@@ -5721,12 +5784,14 @@ class _SidecarGather:
         :meth:`prepare_rows_np` for these exact ids (the prefill lookahead).
         Only the MLX array construction below then runs on this thread; the
         bytes are the same either way."""
-        if self.bits == 0:  # raw bf16 rows, no dequantize
+        if self.bits == 0:  # raw bf16 rows or raw GGUF blocks
             mats = (
                 self._rows_matrices(flat, ("weight",))
                 if prepared is None
                 else prepared
             )
+            if self.codec == "iq4_nl":
+                return _decode_iq4_nl_rows(mx.array(mats["weight"]), self.out_dtype)
             dt = self._maps["weight"][1]
             rows = mx.array(mats["weight"])
             return rows.view(mx.bfloat16 if dt == "BF16" else mx.float16)
@@ -5751,6 +5816,25 @@ class _SidecarGather:
 
         flat = np.asarray(ids.reshape(-1), dtype=np.int64)
         return self.gather_np(flat).reshape(*ids.shape, dim)
+
+
+#: GGML's kvalues_iq4nl: the 16 code points of IQ4_NL (value = d * table[q]).
+_IQ4_NL_VALUES = (-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113)
+
+
+def _decode_iq4_nl_rows(raw: mx.array, out_dtype) -> mx.array:
+    """[n, dim/32 * 18] uint8 IQ4_NL rows -> [n, dim] values.
+
+    A block is fp16 d then 16 bytes whose low nibbles hold elements 0-15 and
+    high nibbles 16-31 (llama.cpp's dequantize_row_iq4_nl); the product is
+    formed in float32 like the reference and rounded once to out_dtype."""
+    n = raw.shape[0]
+    blocks = raw.reshape(n, -1, 18)
+    d = mx.contiguous(blocks[..., :2]).view(mx.float16).astype(mx.float32)  # [n, nb, 1]
+    qs = blocks[..., 2:]
+    codes = mx.concatenate([qs & 15, qs >> 4], axis=-1).astype(mx.uint32)
+    values = mx.array(_IQ4_NL_VALUES, dtype=mx.float32)[codes]
+    return (values * d).reshape(n, -1).astype(out_dtype)
 
 
 def _read_safetensors_header(path: Path):
@@ -7218,13 +7302,20 @@ class Model(nn.Module):
         (Gate+up fusion happens earlier, at sanitize time — see
         _fuse_gate_up_sanitize.)"""
         path = Path(model_path) / "ngram-table.safetensors"
+        gguf_spec = None
         if not path.exists():
+            args = getattr(self, "args", None)
+            gguf_spec = (getattr(args, "text_config", None) or {}).get("ngram_gguf")
+        if not path.exists() and not gguf_spec:
             return
         sidecar = None
         for layer in self.layers:
             if "ple" in layer:
                 table = layer.ple.ple_embedding.ngram_embedding
-                table.attach_sidecar(path)
+                if path.exists():
+                    table.attach_sidecar(path)
+                else:
+                    table.attach_gguf(gguf_spec)
                 sidecar = table._sidecar
         if sidecar is not None:
             hot_mb = (sidecar._hot_cap_rows * sidecar._hot_row_bytes) // 2**20
@@ -7336,6 +7427,7 @@ class Model(nn.Module):
         for dest, parts in stacked.items():
             out[dest] = mx.stack([parts[i] for i in range(len(parts))])
 
+        out = _gguf_q2_0_experts_sanitize(self, out)
         out = _fuse_gate_up_sanitize(self, out)
         out = _fuse_gdn_in_proj_sanitize(self, out)
         out = _fuse_qsa_qkv_sanitize(self, out)
