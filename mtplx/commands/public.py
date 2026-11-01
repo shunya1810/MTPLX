@@ -1524,6 +1524,13 @@ _M1_QWEN4_MOE_ENV = {
     # width and a cold 32K prompt with the 47 GB ISTA pack was refused at
     # ~28K (engine 49.7 GB + a 6.4 GB chunk past the 52 GiB line).
     "MTPLX_QWEN4_PREFILL_WIDE_CHUNK": "4096",
+    # Selector + Steel sparse attention from 8K of history instead of the M1
+    # family's 16K (_qsa_m1_crossover, measured with the 27B's 4 KV heads):
+    # with Flash-Next's 2 KV heads the dense lane costs more from 8K. 12
+    # attention layers per 2,048-row chunk, dense -> sparse: 8K 1.40 -> 1.33 s,
+    # 12K 1.76 -> 1.40, 14K 1.95 -> 1.37 (6K stays dense: 1.18 vs ~1.3).
+    "MTPLX_QSA_PREFILL_WIDE_MIN_CONTEXT": "8192",
+    "MTPLX_QSA_PREFILL_DIRECT_MIN_CONTEXT": "8192",
 }
 _M1_QWEN4_MOE_DROP = ("MTPLX_PREFILL_CHUNK_SIZE_DENSE", "MTPLX_PREFILL_CHUNK_SIZE_REPAGE")
 _MOE_EXPERT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")

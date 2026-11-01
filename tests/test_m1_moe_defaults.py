@@ -151,5 +151,6 @@ def test_qwen4_moe_keeps_the_2048_chunk_and_a_wide_rung(_private_environ, monkey
     assert "MTPLX_PREFILL_CHUNK_SIZE_REPAGE" not in env
     assert env["MTPLX_QWEN4_PREFILL_WIDE_CHUNK"] == "4096"
     assert env["MTPLX_GDN_BLOCKED_PREFILL"] == "1"
+    assert env["MTPLX_QSA_PREFILL_DIRECT_MIN_CONTEXT"] == env["MTPLX_QSA_PREFILL_WIDE_MIN_CONTEXT"] == "8192"
     other = p._m1_moe_lane_env(moe=True, gdn=False, a3b_capture_commit=False)
     assert other["MTPLX_PREFILL_CHUNK_SIZE_DENSE"] == "4096"
