@@ -38,6 +38,10 @@ from typing import Any
 import mlx.core as mx
 
 BM = 32
+#: Bit widths the segmented tiles take (MLX's qmm_t_impl body serves all of
+#: them; the first-use canary still compares each shape with the stock op).
+#: 2-bit: the ISTA Q2_0 Flash-Next experts.
+_BITS = (2, 4, 8)
 #: Tile rows below this many routed rows: 16-row tiles waste less on the 1-3
 #: rows a verify or short prefill routes to an expert. A3B MoE layer, BM 16 vs
 #: 32 (M1 Max, 2026-10-16): 128 tokens 5.72 vs 7.15 ms, 256: 6.88 vs 7.97,
@@ -329,7 +333,7 @@ def applies(
         return False
     if mode != "affine" or biases is None or rhs_indices is None:
         return False
-    if group_size not in (32, 64, 128) or bits not in (4, 8):
+    if group_size not in (32, 64, 128) or bits not in _BITS:
         return False
     if x.dtype not in (mx.float16, mx.bfloat16) or scales.dtype != x.dtype:
         return False

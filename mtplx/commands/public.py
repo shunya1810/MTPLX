@@ -1511,6 +1511,14 @@ _M1_A3B_ENV = {
     # whole prefix per layer (cache_state._splitk_window_q8).
     "MTPLX_KV_QUANT_SPLITK_MAX_Q": "96",
 }
+# MoE on the qwen4_exp backend (Qwen3.8-Flash-Next): its Gated DeltaNet calls
+# mlx-lm's gated_delta_update, which the blocked-sequential prefill kernel
+# replaces from 16 rows (Dk 128, Dv 128, 48 v-heads over 16 k-heads qualify).
+# ISTA Q2_0 pack, M1 Max, 4,096-row chunk: GDN 4.3 -> 3.1 s, chunk 12.8 ->
+# 11.7 s.
+_M1_QWEN4_MOE_ENV = {
+    "MTPLX_GDN_BLOCKED_PREFILL": "1",
+}
 _MOE_EXPERT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
 
 
@@ -1536,7 +1544,7 @@ def _config_is_moe(model_path: Any) -> bool:
 
 
 def _m1_moe_lane_env(
-    *, moe: bool, gdn: bool, a3b_capture_commit: bool
+    *, moe: bool, gdn: bool, a3b_capture_commit: bool, qwen4: bool = False
 ) -> dict[str, str]:
     """The M1 MoE launch env for one daemon: empty for a dense model, off the
     M1 family or with ``MTPLX_M1_MOE_LANE=0``, and without any key the
@@ -1556,6 +1564,8 @@ def _m1_moe_lane_env(
     env = dict(_M1_MOE_ENV)
     if gdn:
         env.update(_M1_MOE_GDN_ENV)
+    if qwen4:
+        env.update(_M1_QWEN4_MOE_ENV)
     if a3b_capture_commit:
         env.update(_M1_A3B_ENV)
     return {key: value for key, value in env.items() if key not in os.environ}
@@ -1609,6 +1619,7 @@ def _apply_m1_moe_defaults(
         gdn=_inspection_backend_id(inspection) == "qwen3_next",
         a3b_capture_commit=a3b
         and getattr(args, "verify_strategy", None) == "capture_commit",
+        qwen4=_model_config_is_qwen4_exp(str(model_path)) if model_path is not None else False,
     )
 
 

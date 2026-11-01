@@ -3490,6 +3490,15 @@ class ServerState:
                 mtp_f = model_dir / "mtp.safetensors"
                 if mtp_f.exists():
                     floor += mtp_f.stat().st_size
+                # A converted GGUF pack builds its routed experts from the
+                # GGUF at load (38 GB for the ISTA Q2_0 Flash-Next): outside
+                # the pack's files, but wired like them. Left out, the 60%
+                # cap wired less than the weights and macOS compressed and
+                # decompressed expert pages through every prefill chunk
+                # (~2M page decompressions per 4,096 rows on a 64 GB M1 Max).
+                from mtplx.engine_session import gguf_routed_expert_bytes
+
+                floor += gguf_routed_expert_bytes(model_dir)
                 if floor:
                     ram_bytes, _ = _detect_total_ram_bytes_for_metal_caps()
                     minimum_resident_bytes = floor + _resident_floor_margin_bytes(
