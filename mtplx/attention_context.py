@@ -113,6 +113,12 @@ def exact_verify_required() -> bool:
     return bool(_EXACT_VERIFY_REQUIRED.get())
 
 
+def greedy_verify_scope() -> bool:
+    """True inside a verify forward whose request samples at t<=0, whatever
+    MTPLX_EXACT_T0_GUARD says (lanes with their own greedy rule read this)."""
+    return bool(_EXACT_VERIFY_REQUIRED.get())
+
+
 @contextmanager
 def exact_verify(required: bool) -> Iterator[None]:
     token = _EXACT_VERIFY_REQUIRED.set(bool(required))

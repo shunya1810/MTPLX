@@ -1467,6 +1467,12 @@ _M1_A3B_ENV = {
     # pick another token). A3B T=1.0: 2K 88.3 -> 102.7 tok/s, 30K 77.6 ->
     # 82.4, 115K 58.1 -> 59.7.
     "MTPLX_M1_RESIDENT_SAMPLED": "1",
+    # Sampled verifies run the 2-row int4 projections (GDN in/out, attention
+    # qkv/o, lm_head) on one nibble walk with half-held inputs instead of
+    # stock's once-per-row qmv (mtplx/kernels/qmv_rows.py; ~7e-4 max relative
+    # drift, float accumulation). Greedy verifies stay on stock. A3B 2K
+    # verify forward 16.5 -> 15.8 ms.
+    "MTPLX_M1_QMV_ROWS": "1",
     "MTPLX_QWEN_ROW_OWNED_ROUTER": "1",
     "MTPLX_QWEN_COMBINE_TAIL": "1",
     "MTPLX_QWEN_MOE_PACK_GATE_UP": "1",

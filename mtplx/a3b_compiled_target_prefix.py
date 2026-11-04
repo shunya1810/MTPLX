@@ -398,7 +398,10 @@ def _shared_m2_step(
     hidden_variant: str | None,
     postconv_implementations: tuple[Callable[..., Any], ...],
 ) -> Callable[..., Any]:
-    key = (id(runtime), str(hidden_variant or ""))
+    from .kernels.qmv_rows import sampled_route_active
+
+    # The sampled-only 2-row matmul route is baked into the trace.
+    key = (id(runtime), str(hidden_variant or ""), sampled_route_active())
     entry = _SHARED_M2_STEPS.get(key)
     if entry is not None:
         compiled, host, runtime_ref = entry
@@ -423,7 +426,10 @@ def _shared_m1_step(
     hidden_variant: str | None,
     postconv_implementations: tuple[Callable[..., Any], ...],
 ) -> Callable[..., Any]:
-    key = (id(runtime), str(hidden_variant or ""))
+    from .kernels.qmv_rows import sampled_route_active
+
+    # The sampled-only 2-row matmul route is baked into the trace.
+    key = (id(runtime), str(hidden_variant or ""), sampled_route_active())
     entry = _SHARED_M1_STEPS.get(key)
     if entry is not None:
         compiled, host, runtime_ref = entry
@@ -448,7 +454,10 @@ def _shared_m3_step(
     hidden_variant: str | None,
     postconv_implementations: tuple[Callable[..., Any], ...],
 ) -> Callable[..., Any]:
-    key = (id(runtime), str(hidden_variant or ""))
+    from .kernels.qmv_rows import sampled_route_active
+
+    # The sampled-only 2-row matmul route is baked into the trace.
+    key = (id(runtime), str(hidden_variant or ""), sampled_route_active())
     entry = _SHARED_M3_STEPS.get(key)
     if entry is not None:
         compiled, host, runtime_ref = entry

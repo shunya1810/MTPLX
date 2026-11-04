@@ -1626,6 +1626,15 @@ def _fused_quantized_pair(
         cached = (weight, scales, biases, int(left.weight.shape[0]))
         setattr(owner, cache_name, cached)
     weight, scales, biases, split_at = cached
+    from .kernels.qmv_rows import maybe_qmv_rows
+
+    out = maybe_qmv_rows(
+        inputs, weight, scales, biases,
+        group_size=int(left.group_size), bits=int(left.bits), mode=str(left.mode),
+    )
+    if out is not None:
+        left_out, right_out = mx.split(out, [int(split_at)], axis=-1)
+        return left_out, right_out
     out = mx.quantized_matmul(
         inputs,
         weight,
@@ -1668,6 +1677,14 @@ def _fused_quantized_many(
         cached = (weight, scales, biases, tuple(split_points))
         setattr(owner, cache_name, cached)
     weight, scales, biases, split_points = cached
+    from .kernels.qmv_rows import maybe_qmv_rows
+
+    out = maybe_qmv_rows(
+        inputs, weight, scales, biases,
+        group_size=int(first.group_size), bits=int(first.bits), mode=str(first.mode),
+    )
+    if out is not None:
+        return tuple(mx.split(out, list(split_points), axis=-1))
     out = mx.quantized_matmul(
         inputs,
         weight,

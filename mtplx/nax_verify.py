@@ -964,7 +964,16 @@ def install_nax_qlinear_patch() -> dict[str, object]:
     from .attention_context import current_attention_phase, exact_verify_required
     from .kernel_selfcheck import lane_disabled
 
+    from .kernels.qmv_rows import maybe_qmv_rows
+
     def patched(self, x: mx.array) -> mx.array:  # type: ignore[no-untyped-def]
+        y = maybe_qmv_rows(
+            x, self["weight"], self["scales"], self.get("biases"),
+            group_size=getattr(self, "group_size", 0), bits=getattr(self, "bits", 0),
+            mode=getattr(self, "mode", "affine"),
+        )
+        if y is not None:
+            return y + self["bias"] if "bias" in self else y
         if exact_verify_required():
             # Greedy (t<=0) verify forwards demand bit-exact stock matmuls:
             # the vk/nax lanes trade ~6e-3 accumulation-order drift for speed,

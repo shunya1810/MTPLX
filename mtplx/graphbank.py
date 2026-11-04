@@ -5547,6 +5547,7 @@ class CompiledVerifyBank:
             )
         spec_sig = tuple(self._spec or [])
         from .attention_context import exact_verify_required
+        from .kernels.qmv_rows import sampled_route_active as _qmv_rows_route
 
         global_key = (
             id(self.runtime),
@@ -5564,6 +5565,9 @@ class CompiledVerifyBank:
             # vice versa. Without this key a t=0.6 request's shared trace
             # would silently serve a t=0 request with non-exact kernels.
             bool(exact_verify_required()),
+            # The M1 2-row half-x matmul route (sampled verifies only) is
+            # baked into the trace the same way.
+            _qmv_rows_route(),
             # Input-signature dimension: an image request's step takes the
             # rotary delta as one more graph input. The VALUE never keys
             # anything, so every image request of the process shares one
