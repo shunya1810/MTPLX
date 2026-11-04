@@ -642,6 +642,10 @@ def _target_stage2_source() -> str:
 
 
 def _target_m2_stage2_source() -> str:
+    # Activations stay unscaled in 16-bit registers and take their 1/16,
+    # 1/256, 1/4096 nibble scale in fp32 at use: power-of-two scaling is
+    # exact, so every product equals the fp32 pre-scaled one, with half the
+    # registers (A3B verify forward -0.3 ms, outputs bit-identical).
     return """
         constexpr uint ROUTED_GROUP = 64;
         constexpr uint VALUES_PER_LANE = 16;
@@ -679,7 +683,7 @@ def _target_m2_stage2_source() -> str:
                 float up_result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
                 for (uint k_block = 0; k_block < HIDDEN; k_block += K_BLOCK) {
                     uint k_lane = k_block + lane * VALUES_PER_LANE;
-                    float input_values[VALUES_PER_LANE];
+                    bfloat input_values[VALUES_PER_LANE];
                     float input_sum = 0.0f;
                     for (uint item = 0; item < VALUES_PER_LANE; item += 4) {
                         float x0 = float(value[row * HIDDEN + k_lane + item]);
@@ -688,9 +692,9 @@ def _target_m2_stage2_source() -> str:
                         float x3 = float(value[row * HIDDEN + k_lane + item + 3]);
                         input_sum += x0 + x1 + x2 + x3;
                         input_values[item] = x0;
-                        input_values[item + 1] = x1 / 16.0f;
-                        input_values[item + 2] = x2 / 256.0f;
-                        input_values[item + 3] = x3 / 4096.0f;
+                        input_values[item + 1] = x1;
+                        input_values[item + 2] = x2;
+                        input_values[item + 3] = x3;
                     }
                     for (uint result_index = 0; result_index < 4; ++result_index) {
                         uint output_column = output_base + result_index;
@@ -712,15 +716,15 @@ def _target_m2_stage2_source() -> str:
                             ushort up_bits = up_packed[piece];
                             uint item = piece * 4;
                             gate_quantized_dot +=
-                                input_values[item] * float(gate_bits & 0x000f)
-                                + input_values[item + 1] * float(gate_bits & 0x00f0)
-                                + input_values[item + 2] * float(gate_bits & 0x0f00)
-                                + input_values[item + 3] * float(gate_bits & 0xf000);
+                                float(input_values[item]) * float(gate_bits & 0x000f)
+                                + (float(input_values[item + 1]) / 16.0f) * float(gate_bits & 0x00f0)
+                                + (float(input_values[item + 2]) / 256.0f) * float(gate_bits & 0x0f00)
+                                + (float(input_values[item + 3]) / 4096.0f) * float(gate_bits & 0xf000);
                             up_quantized_dot +=
-                                input_values[item] * float(up_bits & 0x000f)
-                                + input_values[item + 1] * float(up_bits & 0x00f0)
-                                + input_values[item + 2] * float(up_bits & 0x0f00)
-                                + input_values[item + 3] * float(up_bits & 0xf000);
+                                float(input_values[item]) * float(up_bits & 0x000f)
+                                + (float(input_values[item + 1]) / 16.0f) * float(up_bits & 0x00f0)
+                                + (float(input_values[item + 2]) / 256.0f) * float(up_bits & 0x0f00)
+                                + (float(input_values[item + 3]) / 4096.0f) * float(up_bits & 0xf000);
                         }
                         uint metadata_index =
                             output_column * (HIDDEN / ROUTED_GROUP)
@@ -780,7 +784,7 @@ def _target_m2_stage2_source() -> str:
 
             for (uint k_block = 0; k_block < HIDDEN; k_block += K_BLOCK) {
                 uint k_lane = k_block + lane * VALUES_PER_LANE;
-                float input_values[ROWS][VALUES_PER_LANE];
+                bfloat input_values[ROWS][VALUES_PER_LANE];
                 float input_sum[ROWS] = {};
                 for (uint row = 0; row < ROWS; ++row) {
                     for (uint item = 0; item < VALUES_PER_LANE; item += 4) {
@@ -790,9 +794,9 @@ def _target_m2_stage2_source() -> str:
                         float x3 = float(value[row * HIDDEN + k_lane + item + 3]);
                         input_sum[row] += x0 + x1 + x2 + x3;
                         input_values[row][item] = x0;
-                        input_values[row][item + 1] = x1 / 16.0f;
-                        input_values[row][item + 2] = x2 / 256.0f;
-                        input_values[row][item + 3] = x3 / 4096.0f;
+                        input_values[row][item + 1] = x1;
+                        input_values[row][item + 2] = x2;
+                        input_values[row][item + 3] = x3;
                     }
                 }
                 for (uint result_index = 0; result_index < 4; ++result_index) {
@@ -818,21 +822,15 @@ def _target_m2_stage2_source() -> str:
                             gate_quantized_dot[row] +=
                                 input_values[row][item]
                                     * float(shared_gate_bits & 0x000f)
-                                + input_values[row][item + 1]
-                                    * float(shared_gate_bits & 0x00f0)
-                                + input_values[row][item + 2]
-                                    * float(shared_gate_bits & 0x0f00)
-                                + input_values[row][item + 3]
-                                    * float(shared_gate_bits & 0xf000);
+                                + (float(input_values[row][item + 1]) / 16.0f) * float(shared_gate_bits & 0x00f0)
+                                + (float(input_values[row][item + 2]) / 256.0f) * float(shared_gate_bits & 0x0f00)
+                                + (float(input_values[row][item + 3]) / 4096.0f) * float(shared_gate_bits & 0xf000);
                             up_quantized_dot[row] +=
                                 input_values[row][item]
                                     * float(shared_up_bits & 0x000f)
-                                + input_values[row][item + 1]
-                                    * float(shared_up_bits & 0x00f0)
-                                + input_values[row][item + 2]
-                                    * float(shared_up_bits & 0x0f00)
-                                + input_values[row][item + 3]
-                                    * float(shared_up_bits & 0xf000);
+                                + (float(input_values[row][item + 1]) / 16.0f) * float(shared_up_bits & 0x00f0)
+                                + (float(input_values[row][item + 2]) / 256.0f) * float(shared_up_bits & 0x0f00)
+                                + (float(input_values[row][item + 3]) / 4096.0f) * float(shared_up_bits & 0xf000);
                         }
                     }
                     uint metadata_index =
