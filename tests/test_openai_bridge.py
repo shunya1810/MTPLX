@@ -875,6 +875,80 @@ def test_anthropic_request_translates_claude_code_tools_and_history():
     assert chat.enable_thinking is True
 
 
+def _parallel_reads_request(results):
+    return AnthropicMessagesRequest(
+        model="m",
+        max_tokens=64,
+        messages=[
+            AnthropicMessage(role="user", content="Read a.txt and b.txt"),
+            AnthropicMessage(
+                role="assistant",
+                content=[
+                    {"type": "tool_use", "id": "toolu_a", "name": "Read", "input": {"path": "a.txt"}},
+                    {"type": "tool_use", "id": "toolu_b", "name": "Read", "input": {"path": "b.txt"}},
+                ],
+            ),
+            AnthropicMessage(
+                role="user",
+                content=[
+                    {"type": "tool_result", "tool_use_id": call_id, "content": text}
+                    for call_id, text in results
+                ],
+            ),
+        ],
+    )
+
+
+def test_anthropic_parallel_tool_results_follow_call_order():
+    # Claude Code returns parallel results in completion order; the Qwen
+    # templates drop the id, so position is the only pairing the model sees.
+    chat = _anthropic_to_chat_request(
+        _parallel_reads_request([("toolu_b", "B"), ("toolu_a", "A")])
+    )
+
+    assert [(m.role, m.tool_call_id, m.content) for m in chat.messages[2:]] == [
+        ("tool", "toolu_a", "A"),
+        ("tool", "toolu_b", "B"),
+    ]
+
+
+def test_tool_results_unknown_ids_keep_their_order_after_matched_ones():
+    chat = _anthropic_to_chat_request(
+        _parallel_reads_request(
+            [("toolu_x", "X"), ("toolu_b", "B"), ("toolu_y", "Y"), ("toolu_a", "A")]
+        )
+    )
+
+    assert [m.content for m in chat.messages[2:]] == ["A", "B", "X", "Y"]
+
+
+def test_openai_tool_results_follow_call_order_and_ordered_runs_are_untouched():
+    from mtplx.server.openai import ChatCompletionRequest
+
+    calls = [
+        {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+        {"id": "c2", "type": "function", "function": {"name": "g", "arguments": "{}"}},
+    ]
+    swapped = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": calls},
+        {"role": "tool", "tool_call_id": "c2", "content": "two"},
+        {"role": "tool", "tool_call_id": "c1", "content": "one"},
+        {"role": "assistant", "content": "next"},
+        {"role": "tool", "tool_call_id": "c2", "content": "stray"},
+        {"role": "tool", "tool_call_id": "c1", "content": "stray"},
+    ]
+    request = ChatCompletionRequest.model_validate({"messages": swapped})
+
+    assert [m.content for m in request.messages] == [
+        "go", "", "one", "two", "next", "stray", "stray"
+    ]
+    assert [m.tool_call_id for m in request.messages[5:]] == ["c2", "c1"]
+
+    ordered = ChatCompletionRequest.model_validate({"messages": swapped[:2] + swapped[3:1:-1]})
+    assert [m.content for m in ordered.messages[2:]] == ["one", "two"]
+
+
 def test_anthropic_request_keeps_broader_claude_code_client_tools():
     tool_names = [
         "Bash",

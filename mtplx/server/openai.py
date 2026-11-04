@@ -69,7 +69,7 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 from mtplx import progress_heartbeat
 from mtplx.a3b_mtp_batch import (
@@ -1834,6 +1834,46 @@ class ChatMessage(BaseModel):
     tool_calls: list[dict[str, Any]] | None = None
 
 
+def _order_tool_results_by_calls(messages: list[ChatMessage]) -> list[ChatMessage]:
+    """Put each run of tool results in the order of the calls they answer.
+
+    Agent clients run parallel tool calls and send the results back in
+    completion order, each with its own call id. The Qwen templates render a
+    result as a bare ``<tool_response>`` without the id, so the model pairs
+    results with calls by position and a swapped pair reads each file's
+    content as the other's (oMLX #4999). A run of ``role="tool"`` messages is
+    sorted by the position of its id in the nearest preceding assistant's
+    ``tool_calls``; unknown ids keep their relative order after the matched
+    ones. The same history always sorts the same way, so prefix reuse holds.
+    """
+
+    ordered = list(messages)
+    call_order: dict[str, int] = {}
+    start: int | None = None
+    for index in range(len(ordered) + 1):
+        message = ordered[index] if index < len(ordered) else None
+        if message is not None and str(message.role).lower() == "tool":
+            if start is None:
+                start = index
+            continue
+        if start is not None and index - start > 1 and call_order:
+            run = ordered[start:index]
+            ordered[start:index] = sorted(
+                run,
+                key=lambda tool: call_order.get(
+                    str(_message_extra(tool, "tool_call_id") or ""), len(call_order)
+                ),
+            )
+        start = None
+        if message is not None and str(message.role).lower() == "assistant":
+            call_order = {}
+            for call in message.tool_calls or []:
+                call_id = str(call.get("id") or "") if isinstance(call, dict) else ""
+                if call_id and call_id not in call_order:
+                    call_order[call_id] = len(call_order)
+    return ordered
+
+
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -1874,6 +1914,13 @@ class ChatCompletionRequest(BaseModel):
     # Internal adapter control: Responses clients must never receive the
     # browser-facing MTPLX TPS footer as model output.
     suppress_stats_footer: bool = False
+
+    @model_validator(mode="after")
+    def _tool_results_in_call_order(self) -> "ChatCompletionRequest":
+        ordered = _order_tool_results_by_calls(self.messages)
+        if any(a is not b for a, b in zip(ordered, self.messages)):
+            self.messages = ordered
+        return self
 
 
 @dataclass
