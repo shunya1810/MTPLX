@@ -884,6 +884,36 @@ def _target_m2_stage2_source() -> str:
     """
 
 
+def _target_m2_stage3_rowsplit_source() -> str:
+    """M2 stage3 with one threadgroup per (output tile, row).
+
+    The paired kernel walks both rows' 16 routed experts in one threadgroup;
+    here the row comes from the grid's y index and each threadgroup runs the
+    M2R1 per-row chain (textually the paired kernel's row-0 arithmetic), so
+    the output is bit-identical with twice the threadgroups in flight. M1 Max
+    A3B verify forward: 16.09 -> 15.81 ms.
+    """
+
+    src = _target_m2r1_stage3_source()
+    src = src.replace(
+        "uint tile = threadgroup_position_in_grid.x;",
+        "uint tile = threadgroup_position_in_grid.x;\n"
+        "        uint split_row = threadgroup_position_in_grid.y;",
+        1,
+    )
+    for old, new in (
+        ("expert_ids[0 * TOP_K + slot]", "expert_ids[split_row * TOP_K + slot]"),
+        ("route_scores[0 * TOP_K + slot]", "route_scores[split_row * TOP_K + slot]"),
+        ("(0 * ACTIVATION_SLOTS + slot)", "(split_row * ACTIVATION_SLOTS + slot)"),
+        ("(0 * ACTIVATION_SLOTS + TOP_K)", "(split_row * ACTIVATION_SLOTS + TOP_K)"),
+        ("bfloat gate_value0 = shared_gate[0];", "bfloat gate_value0 = shared_gate[split_row];"),
+        ("output[output_column] = bfloat(", "output[split_row * HIDDEN + output_column] = bfloat("),
+    ):
+        assert old in src, old
+        src = src.replace(old, new)
+    return src
+
+
 def _mtp_stage2_source() -> str:
     return """
         constexpr uint ROUTED_GROUP = 32;
@@ -1843,6 +1873,8 @@ def all_whole_moe_sources() -> dict[str, str]:
         + _target_m2_stage1_finalizer_source(),
         "target_m3_stage2": _fixed_source(stage=2, rows=3, variant="target_q4g64"),
         "target_m3_stage3": _fixed_source(stage=3, rows=3, variant="target_q4g64"),
+        "target_m2_stage3_rowsplit": _source_preamble(rows=1)
+        + _target_m2_stage3_rowsplit_source(),
     }
 
 
@@ -2013,6 +2045,45 @@ def _build_target_m2_stage2_kernel():
         input_names=_TARGET_STAGE2_INPUT_NAMES,
         output_names=_STAGE2_OUTPUT_NAMES,
     )
+
+
+def _build_target_m2_stage3_rowsplit_kernel():
+    return _build_kernel(
+        "target_m2_stage3_rowsplit",
+        input_names=_TARGET_STAGE3_INPUT_NAMES,
+        output_names=_STAGE3_OUTPUT_NAMES,
+    )
+
+
+def _launch_target_m2_stage3_rowsplit(
+    kernel: Any,
+    activations: Any,
+    expert_ids: Any,
+    route_scores: Any,
+    shared_gate: Any,
+    binding: Any,
+):
+    routed_down = binding.routed_down
+    shared_down = binding.shared_down
+    (output,) = kernel(
+        inputs=[
+            activations,
+            expert_ids,
+            route_scores,
+            shared_gate,
+            routed_down.weight,
+            routed_down.scales,
+            routed_down.biases,
+            shared_down.weight,
+            shared_down.scales,
+            shared_down.biases,
+        ],
+        grid=(STAGE3_THREADGROUPS * TILED_THREADS, 2, 1),
+        threadgroup=(TILED_THREADS, 1, 1),
+        output_shapes=[(2, HIDDEN)],
+        output_dtypes=[_scalar_dtype()],
+    )
+    return output
 
 
 def _build_target_m2r1_stage2_kernel():
@@ -2588,7 +2659,7 @@ def bind_target_m2(binding: Any):
     stage1_projection_kernel = _build_target_m2_stage1_projection_kernel()
     stage1_finalizer_kernel = _build_target_m2_stage1_finalizer_kernel()
     stage2_kernel = _build_target_m2_stage2_kernel()
-    stage3_kernel = _build_target_m2_stage3_kernel()
+    stage3_kernel = _build_target_m2_stage3_rowsplit_kernel()
 
     def call(value: Any):
         expert_ids, route_scores, shared_gate = _launch_target_m2_stage1(
@@ -2600,14 +2671,13 @@ def bind_target_m2(binding: Any):
         activations = _launch_target_stage2(
             stage2_kernel, value, expert_ids, binding, rows=2
         )
-        output = _launch_target_stage3(
+        output = _launch_target_m2_stage3_rowsplit(
             stage3_kernel,
             activations,
             expert_ids,
             route_scores,
             shared_gate,
             binding,
-            rows=2,
         )
         return output.reshape(1, 2, 2048)
 

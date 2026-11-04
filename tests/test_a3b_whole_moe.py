@@ -430,8 +430,8 @@ def test_external_contract_mismatch_fails_before_install(
 def test_fixed_kernel_sources_encode_exact_geometry_without_hot_validation():
     sources = kernel_module.all_whole_moe_sources()
     # 12 shipped K1 kernels + 4 k=2 (m3) kernels: stage1 projection/finalizer,
-    # stage2, stage3 recompiled at ROWS=3.
-    assert len(sources) == 16
+    # stage2, stage3 recompiled at ROWS=3; + the row-split M2 stage3.
+    assert len(sources) == 17
     for source in sources.values():
         assert "constexpr uint HIDDEN = 2048" in source
         assert "constexpr uint EXPERTS = 256" in source
@@ -695,6 +695,18 @@ def test_target_m2_stage2_reuses_fixed_shared_expert_weights_across_rows():
     )
     assert weight_load < both_row_consumers
     assert "activations[output_index] = bfloat(silu * up_value)" in source
+
+
+def test_m2_stage3_rowsplit_source_is_the_m2r1_chain_with_the_grid_row():
+    source = kernel_module.all_whole_moe_sources()["target_m2_stage3_rowsplit"]
+    assert "uint split_row = threadgroup_position_in_grid.y;" in source
+    assert "expert_ids[split_row * TOP_K + slot]" in source
+    assert "route_scores[split_row * TOP_K + slot]" in source
+    assert "shared_gate[split_row]" in source
+    assert "output[split_row * HIDDEN + output_column] = bfloat(" in source
+    assert "routed_accumulator1" not in source
+    for needle in ("expert_ids[0 *", "route_scores[0 *", "(0 * ACTIVATION_SLOTS", "shared_gate[0]"):
+        assert needle not in source
 
 
 def test_stage3_sources_encode_down_reduction_shared_gate_and_only_final_store():
@@ -1075,13 +1087,15 @@ def test_installed_partition_prebinds_all_four_exact_target_m2_kernels():
     assert "_build_target_m2_stage1_projection_kernel()" in fixed_source
     assert "_build_target_m2_stage1_finalizer_kernel()" in fixed_source
     assert "_build_target_m2_stage2_kernel()" in fixed_source
-    assert "_build_target_m2_stage3_kernel()" in fixed_source
+    # Stage 3 runs row-split (one threadgroup per row, bit-identical to the
+    # paired kernel; the install self-check's M1/M2 row parity holds it at 0).
+    assert "_build_target_m2_stage3_rowsplit_kernel()" in fixed_source
     assert "_launch_target_m2_stage1(" in fixed_source
     assert "_launch_target_stage1(" not in fixed_source
     assert "_row_owned_stage1_unchecked" not in fixed_source
     assert "_packed_stage12_unchecked" not in fixed_source
     assert "_launch_target_stage2(" in fixed_source
-    assert "_launch_target_stage3(" in fixed_source
+    assert "_launch_target_m2_stage3_rowsplit(" in fixed_source
     assert "output.reshape(1, 2, 2048)" in fixed_source
     call_start = fixed_source.index("def call(")
     for forbidden in (

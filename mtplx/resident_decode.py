@@ -31,6 +31,7 @@ from typing import Any, Callable
 
 import mlx.core as mx
 
+from .kernels.chunk_topk import chunk_topk_supported, topk_candidates
 from .progress_heartbeat import tick as _owner_progress_tick
 
 
@@ -473,6 +474,15 @@ def run_resident_rounds(
 # --------------------------------------------------------------------------
 
 
+def chunk_topk_enabled() -> bool:
+    """MTPLX_M1_CHUNK_TOPK: sampled rounds take their top-k candidates from
+    per-chunk winners (mtplx/kernels/chunk_topk.py) instead of an
+    argpartition that sorts the whole 248K-wide row (~0.4 ms of GPU per
+    round on M1 Max for the two verify rows)."""
+
+    return (os.environ.get("MTPLX_M1_CHUNK_TOPK") or "").strip().lower() in {"1", "true", "on", "yes"}
+
+
 def target_candidates(rows: mx.array, config: Any) -> tuple:
     """Lazy ``_device_serial_candidates`` (same expressions, no eval).
 
@@ -484,8 +494,12 @@ def target_candidates(rows: mx.array, config: Any) -> tuple:
     k = min(int(config.top_k), vocab)
     m = min(max(4 * k, k), vocab)
     scaled = rows * (1.0 / float(config.temperature))
-    cand_idx = mx.argpartition(-scaled, kth=m - 1, axis=-1)[:, :m]
-    cand_vals = mx.take_along_axis(scaled, cand_idx, axis=-1)
+    if chunk_topk_enabled() and chunk_topk_supported(k, vocab, m):
+        # Same top-k (the m candidates only pad it); no full-row sort.
+        cand_idx, cand_vals = topk_candidates(scaled, k, m)
+    else:
+        cand_idx = mx.argpartition(-scaled, kth=m - 1, axis=-1)[:, :m]
+        cand_vals = mx.take_along_axis(scaled, cand_idx, axis=-1)
     cand_probs = None
     if 0.0 < float(config.top_p) < 1.0:
         log_total = mx.logsumexp(scaled, axis=-1, keepdims=True)

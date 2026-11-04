@@ -1473,6 +1473,11 @@ _M1_A3B_ENV = {
     # drift, float accumulation). Greedy verifies stay on stock. A3B 2K
     # verify forward 16.5 -> 15.8 ms.
     "MTPLX_M1_QMV_ROWS": "1",
+    # Sampled rounds take the verify rows' top-k candidates from per-chunk
+    # winners instead of an argpartition sorting the 248K-wide rows (same
+    # top-k, ~0.4 ms of GPU per round; mtplx/kernels/chunk_topk.py). A3B
+    # T=1.0 2K 92.1 -> 94.8 tok/s, same-seed text identical.
+    "MTPLX_M1_CHUNK_TOPK": "1",
     "MTPLX_QWEN_ROW_OWNED_ROUTER": "1",
     "MTPLX_QWEN_COMBINE_TAIL": "1",
     "MTPLX_QWEN_MOE_PACK_GATE_UP": "1",

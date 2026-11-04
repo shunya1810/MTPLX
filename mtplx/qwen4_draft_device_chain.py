@@ -364,8 +364,15 @@ def device_support(plan: SampledChainPlan, draft_logits: Any) -> tuple[Any, Any,
     row = _compact_row(plan, draft_logits)
     scaled = row.astype(mx.float32) * (1.0 / float(plan.temperature))
     k = int(plan.top_k)
-    cand_local = mx.argpartition(-scaled, kth=k - 1, axis=-1)[:k]
-    cand_vals = mx.take(scaled, cand_local)
+    from .kernels.chunk_topk import chunk_topk_supported, topk_candidates
+    from .resident_decode import chunk_topk_enabled
+
+    if scaled.ndim == 1 and chunk_topk_enabled() and chunk_topk_supported(k, int(scaled.shape[0])):
+        cand_local, cand_vals = topk_candidates(scaled.reshape(1, -1), k, k)
+        cand_local, cand_vals = cand_local.reshape(-1), cand_vals.reshape(-1)
+    else:
+        cand_local = mx.argpartition(-scaled, kth=k - 1, axis=-1)[:k]
+        cand_vals = mx.take(scaled, cand_local)
     log_total = mx.logsumexp(scaled, axis=-1, keepdims=True)
     cand_probs = mx.exp(cand_vals - log_total)
     return cand_local, cand_vals, cand_probs
