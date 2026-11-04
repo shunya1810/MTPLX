@@ -30,7 +30,7 @@ def test_half_x_kernel_stays_within_its_drift():
     assert (mx.abs(out - ref).max() / mx.abs(ref).max()).item() < 3e-3
 
 
-def test_route_serves_sampled_verifies_only(monkeypatch):
+def test_route_serves_sampled_half_x_and_greedy_exact(monkeypatch):
     monkeypatch.setenv("MTPLX_M1_QMV_ROWS", "1")
     wq, scales, biases = _weights(2048, 1024, mx.float16)
     x = (mx.random.normal((1, 2, 1024), key=mx.random.key(1)) * 0.7).astype(mx.float16)
@@ -41,7 +41,9 @@ def test_route_serves_sampled_verifies_only(monkeypatch):
         assert y is not None and y.shape == (1, 2, 2048)
     with attention_phase("decode_verify"), exact_verify(True):
         assert not Q.sampled_route_active()
-        assert Q.maybe_qmv_rows(x, wq, scales, biases, **kw) is None
+        y = Q.maybe_qmv_rows(x, wq, scales, biases, **kw)  # greedy: the exact kernel
+        ref = mx.quantized_matmul(x, wq, scales, biases, transpose=True, group_size=64, bits=4)
+        assert y is not None and mx.array_equal(y, ref).item()
     with attention_phase("prefill"), exact_verify(False):
         assert Q.maybe_qmv_rows(x, wq, scales, biases, **kw) is None
     monkeypatch.setenv("MTPLX_M1_QMV_ROWS", "0")

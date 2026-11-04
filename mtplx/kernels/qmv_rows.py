@@ -9,8 +9,10 @@ simdgroups per threadgroup (stock uses two).
 ``exact=True`` keeps each row's arithmetic identical to ``qmv_fast_impl`` (the
 pre-scaled float ``x_thread``, the half partial ``sum``, ``scale * accum +
 sum * bias`` per 512-value block, ``simd_sum``), so the output is bit-identical
-to stock. ``exact=False`` holds the pre-scaled ``x`` in half registers
-(accumulation stays float): ~7e-4 max relative drift, for sampled verifies.
+to stock; greedy verifies take it. ``exact=False`` holds the pre-scaled ``x``
+in half registers (accumulation stays float): ~7e-4 max relative drift, a
+little faster, for sampled verifies. A3B 2K verify forward: stock 16.36,
+exact 15.39, half-x 15.19 ms.
 """
 
 from __future__ import annotations
@@ -33,7 +35,12 @@ _MIN_N = 2048
 @lru_cache(maxsize=None)
 def _kernel(group_size: int, dtype: mx.Dtype, exact: bool):
     dtype_tag = {mx.float16: "fp16", mx.bfloat16: "bf16"}[dtype]
-    xreg = "float" if exact else "half"
+    # Both variants hold the inputs in 16-bit registers of x's dtype (fp32 copies cost the
+    # occupancy that made a float-held exact kernel lose inside the verify
+    # forward). exact: unscaled x, scaled by 1/16, 1/256, 1/4096 in fp32 at
+    # use -- power-of-two scaling is exact, so every product equals stock's
+    # pre-scaled x_thread one. half-x: pre-scaled values rounded to half.
+    pre = "" if exact else "1"
     source = f"""
         constexpr int GS = {group_size};
         constexpr int VPT = 16;
@@ -66,21 +73,30 @@ def _kernel(group_size: int, dtype: mx.Dtype, exact: bool):
             result1[r] = 0.0f;
         }}
         for (int k = 0; k < K; k += BLOCK) {{
-            {xreg} a[VPT];
-            {xreg} b[VPT];
+            T a[VPT];
+            T b[VPT];
             float sum0 = 0.0f;
             float sum1 = 0.0f;
             for (int i = 0; i < VPT; i += 4) {{
                 sum0 += x0[i] + x0[i + 1] + x0[i + 2] + x0[i + 3];
                 sum1 += x1[i] + x1[i + 1] + x1[i + 2] + x1[i + 3];
                 a[i] = x0[i];
+                b[i] = x1[i];
+#if {pre or 0}
                 a[i + 1] = x0[i + 1] / 16.0f;
                 a[i + 2] = x0[i + 2] / 256.0f;
                 a[i + 3] = x0[i + 3] / 4096.0f;
-                b[i] = x1[i];
                 b[i + 1] = x1[i + 1] / 16.0f;
                 b[i + 2] = x1[i + 2] / 256.0f;
                 b[i + 3] = x1[i + 3] / 4096.0f;
+#else
+                a[i + 1] = x0[i + 1];
+                a[i + 2] = x0[i + 2];
+                a[i + 3] = x0[i + 3];
+                b[i + 1] = x1[i + 1];
+                b[i + 2] = x1[i + 2];
+                b[i + 3] = x1[i + 3];
+#endif
             }}
             for (int r = 0; r < RPS; ++r) {{
                 const device uint16_t* wl =
@@ -96,10 +112,19 @@ def _kernel(group_size: int, dtype: mx.Dtype, exact: bool):
                     const float w1 = float(w & 0x00f0);
                     const float w2 = float(w & 0x0f00);
                     const float w3 = float(w & 0xf000);
-                    accum0 += (float(a[4 * i]) * w0 + float(a[4 * i + 1]) * w1
-                        + float(a[4 * i + 2]) * w2 + float(a[4 * i + 3]) * w3);
-                    accum1 += (float(b[4 * i]) * w0 + float(b[4 * i + 1]) * w1
-                        + float(b[4 * i + 2]) * w2 + float(b[4 * i + 3]) * w3);
+#if {pre or 0}
+                    const float a0 = float(a[4 * i]), a1 = float(a[4 * i + 1]);
+                    const float a2 = float(a[4 * i + 2]), a3 = float(a[4 * i + 3]);
+                    const float b0 = float(b[4 * i]), b1 = float(b[4 * i + 1]);
+                    const float b2 = float(b[4 * i + 2]), b3 = float(b[4 * i + 3]);
+#else
+                    const float a0 = float(a[4 * i]), a1 = float(a[4 * i + 1]) / 16.0f;
+                    const float a2 = float(a[4 * i + 2]) / 256.0f, a3 = float(a[4 * i + 3]) / 4096.0f;
+                    const float b0 = float(b[4 * i]), b1 = float(b[4 * i + 1]) / 16.0f;
+                    const float b2 = float(b[4 * i + 2]) / 256.0f, b3 = float(b[4 * i + 3]) / 4096.0f;
+#endif
+                    accum0 += (a0 * w0 + a1 * w1 + a2 * w2 + a3 * w3);
+                    accum1 += (b0 * w0 + b1 * w1 + b2 * w2 + b3 * w3);
                 }}
                 result0[r] += s * accum0 + sum0 * bias;
                 result1[r] += s * accum1 + sum1 * bias;
@@ -170,14 +195,27 @@ def _lane_enabled() -> bool:
 
 def sampled_route_active() -> bool:
     """Whether a 2-row verify traced now takes the half-x kernel: the lane is
-    on and the request samples (t > 0). Greedy verifies keep stock so MTP
-    argmax matches AR argmax; compiled-step caches key on this value."""
+    on and the request samples (t > 0). Greedy verifies take the exact kernel
+    so MTP argmax still matches AR argmax; compiled-step caches key on this
+    value."""
 
     if not _lane_enabled():
         return False
     from ..attention_context import current_attention_phase, greedy_verify_scope
 
     return current_attention_phase() != "prefill" and not greedy_verify_scope()
+
+
+def _route_exact() -> bool | None:
+    """None off the lane (stock), else whether the exact kernel serves."""
+
+    if not _lane_enabled():
+        return None
+    from ..attention_context import current_attention_phase, greedy_verify_scope
+
+    if current_attention_phase() == "prefill":
+        return None
+    return bool(greedy_verify_scope())
 
 
 def maybe_qmv_rows(
@@ -190,7 +228,8 @@ def maybe_qmv_rows(
     bits: int,
     mode: str = "affine",
 ) -> mx.array | None:
-    """The half-x 2-row kernel for an eligible sampled verify matmul, else None."""
+    """The 2-row kernel for an eligible verify matmul (exact for greedy,
+    half-x for sampled), else None."""
 
     if biases is None or str(mode) != "affine" or x.ndim < 2:
         return None
@@ -201,7 +240,8 @@ def maybe_qmv_rows(
     n = int(w_q.shape[0])
     if n < _MIN_N or not qmv_rows_eligible(m, k, n, bits, group_size, x.dtype):
         return None
-    if not sampled_route_active():
+    exact = _route_exact()
+    if exact is None:
         return None
-    y = qmv_rows(x.reshape(2, k), w_q, scales, biases, group_size=int(group_size), exact=False)
+    y = qmv_rows(x.reshape(2, k), w_q, scales, biases, group_size=int(group_size), exact=exact)
     return y.reshape(*x.shape[:-1], n)
