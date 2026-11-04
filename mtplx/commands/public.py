@@ -1478,6 +1478,10 @@ _M1_A3B_ENV = {
     # top-k, ~0.4 ms of GPU per round; mtplx/kernels/chunk_topk.py). A3B
     # T=1.0 2K 92.1 -> 94.8 tok/s, same-seed text identical.
     "MTPLX_M1_CHUNK_TOPK": "1",
+    # The verify trace adds each residual inside the following RMSNorm's
+    # kernel (gdn_capture.forward_with_a3b_gdn_postconv_capture): 80 fewer
+    # dependent dispatches, outputs bit-identical. 15.92 -> 15.84 ms.
+    "MTPLX_A3B_FUSED_ADD_NORM": "1",
     "MTPLX_QWEN_ROW_OWNED_ROUTER": "1",
     "MTPLX_QWEN_COMBINE_TAIL": "1",
     "MTPLX_QWEN_MOE_PACK_GATE_UP": "1",

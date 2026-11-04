@@ -2993,6 +2993,16 @@ def _a3b_gdn_forward_with_fixed_postconv_bound_projections(
     return out, {"conv_states": conv_states, "states": states}
 
 
+def _a3b_fused_add_norm_enabled() -> bool:
+    """MTPLX_A3B_FUSED_ADD_NORM: the A3B verify trace adds each residual
+    inside the following RMSNorm's kernel (post-attention and next-layer
+    input norms)."""
+
+    return (os.environ.get("MTPLX_A3B_FUSED_ADD_NORM") or "").strip().lower() in {
+        "1", "true", "on", "yes",
+    }
+
+
 def forward_with_a3b_gdn_postconv_capture(
     model: Any,
     inputs: mx.array,
@@ -3011,10 +3021,22 @@ def forward_with_a3b_gdn_postconv_capture(
     attention_mask = create_attention_mask(hidden_states, cache[3])
     captures: dict[int, dict[str, mx.array]] = {}
     implementation_iter = iter(postconv_implementations)
+    fused = _a3b_fused_add_norm_enabled()
+    if fused:
+        from .kernels.fused_norm import fused_add_rmsnorm
+    normed = None
+    pending = None  # (h, mlp_out) of the previous layer, added inside the next norm
     for layer_idx, (layer, layer_cache, kind) in enumerate(
         zip(inner.layers, cache, _A3B_GDN_POSTCONV_LAYER_TYPES)
     ):
-        normed = layer.input_layernorm(hidden_states)
+        if pending is None:
+            normed = layer.input_layernorm(hidden_states)
+        else:
+            hidden_states, normed = fused_add_rmsnorm(
+                pending[0], pending[1],
+                layer.input_layernorm.weight, layer.input_layernorm.eps,
+            )
+            pending = None
         if kind == "linear_attention":
             r, capture = _a3b_gdn_forward_with_fixed_postconv(
                 layer.linear_attn,
@@ -3025,12 +3047,28 @@ def forward_with_a3b_gdn_postconv_capture(
             captures[layer_idx] = capture
         else:
             r = layer.self_attn(normed, mask=attention_mask, cache=layer_cache)
-        h = hidden_states + r
-        mlp_input = layer.post_attention_layernorm(h)
-        hidden_states = h + layer.mlp(mlp_input)
+        if fused:
+            # Residual add and RMSNorm in one dispatch (bit-identical to the
+            # unfused pair at fp16/bf16, kernels/fused_norm.py): one fewer
+            # dependent kernel per norm on the verify's critical path.
+            h, mlp_input = fused_add_rmsnorm(
+                hidden_states, r,
+                layer.post_attention_layernorm.weight,
+                layer.post_attention_layernorm.eps,
+            )
+            pending = (h, layer.mlp(mlp_input))
+        else:
+            h = hidden_states + r
+            mlp_input = layer.post_attention_layernorm(h)
+            hidden_states = h + layer.mlp(mlp_input)
 
+    if pending is not None:
+        hidden_states, post_norm = fused_add_rmsnorm(
+            pending[0], pending[1], inner.norm.weight, inner.norm.eps,
+        )
+    else:
+        post_norm = inner.norm(hidden_states)
     pre_norm = hidden_states
-    post_norm = inner.norm(hidden_states)
     logits = (
         inner.embed_tokens.as_linear(post_norm)
         if text_model.args.tie_word_embeddings
