@@ -5,12 +5,14 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from .kernels import gdn_fused as _gdn_fused
 
 logger = logging.getLogger(__name__)
 
@@ -414,9 +416,21 @@ def install_a3b_gdn_postconv(
             for gdn in plan.gdns
         ),
     )
+    if _gdn_fused.enabled():
+        factory = replace(
+            factory,
+            m2_implementations=_gdn_fused.install_m2(
+                plan.gdns,
+                factory.m2_implementations,
+                stock_layer=_a3b_gdn_forward_with_fixed_postconv,
+                stock_conv=_stock_conv1d_capture,
+                stock_tape=_linear_gated_delta_from_conv_tape_capture,
+            ),
+        )
     _GDN_POSTCONV_STATS["installed"] = True
     _GDN_POSTCONV_STATS["installation_status"] = "installed"
     _GDN_POSTCONV_STATS["implementation"] = implementation
+    _GDN_POSTCONV_STATS["fused_layer"] = _gdn_fused.status()
     return factory
 
 
@@ -2719,6 +2733,31 @@ def gdn_forward_with_capture(
     from mlx_lm.models.gated_delta import compute_g
 
     B, S, _ = inputs.shape
+    if (
+        (B, S) == (1, 2)
+        and cache is not None
+        and cache[0] is not None
+        and cache[1] is not None
+        and _gdn_fused.generic_route_enabled()
+        and resolve_gdn_capture_backend(capture_backend) == "linear_gdn_from_conv_tape"
+        and os.environ.get("MTPLX_LINEAR_GDN_TAPE_IMPL", "").strip().lower() != "headquarter"
+    ):
+        fused = _gdn_fused.generic_layer(gdn, inputs, cache)
+        if fused is not None:
+            # One kernel in the tape capture's numerics; same capture layout.
+            out, final_state, conv_states, conv_out, g, tape = fused
+            state = cache[1]
+            cache[0] = mx.contiguous(conv_states[:, -1, :, :])
+            cache[1] = _maybe_contiguous_authoritative_gdn_leaf(final_state)
+            cache.advance(S)
+            return gdn.out_proj(out.reshape(B, S, -1)), {
+                "conv_states": conv_states,
+                "conv_out": conv_out,
+                "g": g,
+                "state_in": state,
+                "tape": tape,
+                "gdn_meta": _gdn_tape_meta(gdn),
+            }
     qkv, z, b, a = _gdn_input_projections(gdn, inputs)
     z = z.reshape(B, S, gdn.num_v_heads, gdn.head_v_dim)
 
@@ -2940,6 +2979,10 @@ def _a3b_gdn_forward_with_fixed_postconv(
 ):
     """Build the unchecked exact A3B GDN graph with stock surroundings."""
     B, S, _ = inputs.shape
+    if isinstance(postconv_implementation, _gdn_fused.FusedM2Layer):
+        # Installed after its own bit-identity check: one kernel from the fused
+        # projection to the gated norm.
+        return postconv_implementation.layer(gdn, inputs, cache)
     qkv = gdn.in_proj_qkv(inputs)
     z = gdn.in_proj_z(inputs).reshape(B, S, 32, 128)
     b = gdn.in_proj_b(inputs)

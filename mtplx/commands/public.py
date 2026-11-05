@@ -1482,6 +1482,12 @@ _M1_A3B_ENV = {
     # kernel (gdn_capture.forward_with_a3b_gdn_postconv_capture): 80 fewer
     # dependent dispatches, outputs bit-identical. 15.92 -> 15.84 ms.
     "MTPLX_A3B_FUSED_ADD_NORM": "1",
+    # One kernel per GDN layer from the fused in-projection to the gated norm
+    # (split copies, conv, SiLU, recurrence, gated RMSNorm; kernels/gdn_fused.py):
+    # 8 dependent dispatches -> 1, bit-identical to the tape capture the resident
+    # verify runs. Verify 15.1 -> 14.0 ms; server greedy 2K 104-105 -> 113-121
+    # tok/s, 30K 85-93 -> 97, text identical.
+    "MTPLX_A3B_GDN_FUSED": "1",
     "MTPLX_QWEN_ROW_OWNED_ROUTER": "1",
     "MTPLX_QWEN_COMBINE_TAIL": "1",
     "MTPLX_QWEN_MOE_PACK_GATE_UP": "1",

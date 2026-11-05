@@ -82,6 +82,7 @@ def test_a3b_gets_every_lane(_private_environ, tmp_path):
     assert child["MTPLX_M1_QMV_ROWS"] == "1"  # sampled-verify 2-row projections
     assert child["MTPLX_M1_CHUNK_TOPK"] == "1"  # sampled-round top-k candidates
     assert child["MTPLX_A3B_FUSED_ADD_NORM"] == "1"  # residual add inside the next norm
+    assert child["MTPLX_A3B_GDN_FUSED"] == "1"  # one kernel per GDN layer
     assert "MTPLX_QWEN_MOE_PACK_GATE_UP" not in child  # an explicit env wins
     assert "MTPLX_LINEAR_GDN_FROM_CONV_TGY" not in child
     assert "MTPLX_A3B_WHOLE_MOE_FUSION" not in env  # never this process's env
