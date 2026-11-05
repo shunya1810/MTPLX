@@ -23,9 +23,9 @@ How fast a prompt of about 8K, 32K, 64K and 128K tokens is read with no cache.
 
 | Model | | 8K | 32K | 64K | 128K |
 |---|---|---|---|---|---|
-| Qwen3.6-35B-A3B | this fork | **1,065** | **1,028** | **771** | **499** |
+| Qwen3.6-35B-A3B | this fork | **945** | **931** | **630** | **485** |
 |  | upstream 2.12.2 | 957 | 795 | 607 | 318 |
-| Ornith-1.5-35B-A3B | this fork | **1,069** | **1,034** | **766** | **499** |
+| Ornith-1.5-35B-A3B | this fork | **1,098** | **1,026** | **771** | **501** |
 |  | upstream 2.12.2 | 954 | 795 | 606 | 317 |
 | Qwen3.8-27B | this fork | **233** | **211** | **177** | **139** |
 |  | upstream 2.12.2 | 150 | 139 | 121 | 87 |
@@ -40,9 +40,9 @@ How fast a prompt of about 8K, 32K, 64K and 128K tokens is read with no cache.
 
 | Model | | short prompts | 8K | 32K | 64K | 128K |
 |---|---|---|---|---|---|---|
-| Qwen3.6-35B-A3B | this fork | **107.6** | **101.8** | **86.5** | **76.5** | **60.4** |
+| Qwen3.6-35B-A3B | this fork | **128.5** | **106.2** | **90.1** | **78.2** | **63.5** |
 |  | upstream 2.12.2 | 58.0 | 53.4 | 46.8 | 39.1 | 24.9 |
-| Ornith-1.5-35B-A3B | this fork | **110.5** | **106.8** | **94.6** | **81.9** | **63.8** |
+| Ornith-1.5-35B-A3B | this fork | **135.2** | **127.4** | **102.4** | **96.0** | **92.8** |
 |  | upstream 2.12.2 | 63.6 | 61.0 | 86.8 | 29.3 | 16.2 |
 | Qwen3.8-27B | this fork | **32.5** | **30.3** | **30.2** | **27.4** | **22.8** |
 |  | upstream 2.12.2 | 23.2 | 22.7 | 18.6 | 9.1 | 6.1 |
@@ -81,14 +81,16 @@ From bench 2 of [apple-silicon-llm-bench](https://github.com/shunya1810/apple-si
 
 ### Conditions
 
-- Qwen3.6-35B-A3B and Qwen3.8-27B were measured on v2.12.2-m1.10 (2026-10-20); the other rows are from v2.12.2-m1.8.
+- Qwen3.6-35B-A3B and Ornith-1.5-35B-A3B were measured on v2.12.2-m1.13 (2026-11-05), Qwen3.8-27B on v2.12.2-m1.10 (2026-10-20); the other rows of this fork are from v2.12.2-m1.8. Upstream's rows are unchanged.
 - v2.12.2-m1.11 fixes the prefill attention over long histories, whose running sum was kept in fp16: on the 27B most cold prompts of 192K–256K ended with NaN, and from 32K on the answers of both models change a little. Prefill speed is unchanged; in bench 3 the decode at 32K–128K moved by a few percent, so the tables above were not re-measured. Bench 3 of [apple-silicon-llm-bench](https://github.com/shunya1810/apple-silicon-llm-bench) has 192K–256K after the fix (27B: prefill 78–90 tok/s, decode 17–21 tok/s).
 - v2.12.2-m1.12 leaves these models' speed unchanged: against m1.11 on Qwen3.8-27B and Qwen3.6-35B-A3B, prefill and the time of one verify round at 1.6K tokens differed by less than 2%, so the tables were not re-measured.
+- v2.12.2-m1.13 speeds up the Qwen3.6-35B-A3B family's decode (the two A3B rows above were re-measured). It does not change the 27B models' path with the 8-bit KV cache used here, so their rows were not re-measured.
+- Qwen3.6-35B-A3B now reads 32K–64K prompts more slowly than Ornith-1.5-35B-A3B, which has the same layout (931 against 1,026 tok/s at 32K); on v2.12.2-m1.10 the two were equal (1,028 and 1,034). m1.13 does not change prefill and was not slower than m1.12 on the same day (cold prompts of about 29K and 104K tokens: 910 and 513 tok/s against 697 and 444). The cause is being investigated.
 - The 8K–128K prompts repeat one 11K-token HTML file. Read to about 256K (22 repeats), Qwen3.8-27B predicts its own next tokens poorly from the third repeat on (upstream MTPLX too), and the draft head, which reads the model's hidden states, then rarely matches, so 256K is shown with the non-repeating text above instead.
 - MacBook Pro M1 Max 64 GB, macOS 26. Profile `turbo`, 256K context limit, 8-bit KV cache, temperature 0.6 with fixed seeds.
 - Both engines use the MTP depth this fork runs fastest at (listed in [Models](#models)).
 - The server was restarted for each length, so every prompt is read cold. Items measured more than once show the faster run (some runs came out slower, for example with a hot GPU).
-- Upstream's 32K decode on Ornith-1.5-35B-A3B (86.8 tok/s) is higher than its other lengths because the answer quoted the file at length and upstream's context-copy copied it.
+- Upstream's 32K decode on Ornith-1.5-35B-A3B (86.8 tok/s) is higher than its other lengths because the answer quoted the file at length and upstream's context-copy copied it. This fork's 128K decode on the same model (92.8 tok/s) is high for the same reason: context-copy wrote 289 of the 512 tokens.
 - This fork's peak on the Qwen3.6-35B-A3B family (32.6 GB) is reached while the model loads: the MoE weights are repacked then, which needs memory for a while. While answering it uses 21–24 GB (24.4 GB at 128K, against 26.2 GB on upstream).
 - Swift-1.5-Qwen3.8-27b decodes more slowly at 128K than Huihui-Qwen3.8-27B-abliterated, which has the same layout (16.9 against 23.3 tok/s). Repeated runs agree; the cause is still being investigated.
 
@@ -124,7 +126,7 @@ From bench 2 of [apple-silicon-llm-bench](https://github.com/shunya1810/apple-si
 ## Install
 
 ```bash
-git clone --branch v2.12.2-m1.12 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.2-m1.13 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # about a minute; done when it prints "mfa_attn: ok", "ane_ffn: ok" and "qsa_kernels: ok"
 ```
@@ -164,7 +166,7 @@ More: [docs/m1max-longctx/USAGE.md](docs/m1max-longctx/USAGE.md).
 
 ```bash
 git fetch --tags
-git checkout <new tag>                  # for example v2.12.2-m1.12
+git checkout <new tag>                  # for example v2.12.2-m1.13
 scripts/build-m1-native-extensions.sh   # needed only when the native extensions changed (the release notes say so)
 ```
 
@@ -207,10 +209,11 @@ scripts/m1-depth-sweep.py --model "$HOME/.mtplx/models/<model folder>"
 ## What this fork changes
 
 - Prefill: part of the work runs on the Neural Engine alongside the GPU. Attention over the cached history uses flash-attention tuned for M1. Short additions to a long history (tool results and the like) read the 8-bit KV in place.
-- Decode: fewer CPU–GPU round trips per round. On Qwen3.6-35B-A3B family models, the next round is queued on the GPU before the CPU reads the previous one. File rewrites copy the parts that match the prompt (context-copy, exact matches only).
+- Decode: fewer CPU–GPU round trips per round. On Qwen3.6-35B-A3B family models, the next round is queued on the GPU before the CPU reads the previous one, and the verify runs each GDN layer as one kernel and computes both rows of a projection in one pass over the weights. File rewrites copy the parts that match the prompt (context-copy, exact matches only).
 - Memory: the KV cache is kept in 8-bit pages, and long prompts are prefilled straight into them (on dense models, prompts over 192K tokens are read with fp16 KV and repacked). Memory estimates follow values measured on this fork. A 256K-token conversation runs at the default settings on a 64 GB Mac.
 - Defaults: Qwen3.5, 3.6 and 3.8 family models launch on `turbo`. A Qwen3.6-35B-A3B family model started from the app also takes the A3B path.
 - Qwen4 groundwork (not yet tested on a real Qwen4 model): upstream's `qwen4_exp` path is written for Qwen3.8-Flash-Next (hidden size 2560, MoE, 24 query / 2 KV heads). In case a Qwen4 model uses this architecture at another size, it also takes dense layers, other widths and other head layouts. On M1, bf16 packs of this family run in fp16.
+- Qwen3.8-Flash-Next from ISTA's Q2_0 GGUF (experimental): `scripts/convert_flashnext_ista_gguf.py` turns the GGUF Splash serves into a model folder; the 2-bit experts stay in the GGUF and are read at load. On the M1 Max it decodes at 85–95% of Splash 1.5.0-m1's speed and uses about 12 GB more memory.
 - Agent sessions (on any Mac): finding the same conversation again across history rewrites, keeping the cache when thinking is switched on or off, keeping whitespace in tool arguments, retrying a request when macOS stops a long GPU command, resuming from the deepest saved state, and more.
 
 Every change with its measurements: [CHANGES.ja.md](docs/m1max-longctx/CHANGES.ja.md) (Japanese) and the [release notes](https://github.com/shunya1810/MTPLX/releases).
@@ -228,8 +231,9 @@ Each M1 default can be turned off with an environment variable; `MTPLX_M1_LONG_C
 | `MTPLX_M1_ENGINE_RAM_FRACTION=0.75` | 13/16 of memory | the engine's memory cap (set a smaller value) |
 | `MTPLX_M1_TURBO_DEFAULT=0` | `turbo` for Qwen3.5, 3.6 and 3.8 families | the `turbo` default |
 | `MTPLX_M1_FP16_CAST=0` | on for the `qwen4_exp` family | running a bf16 pack in fp16 (`=1` turns it on for other families; no effect on fp16 packs) |
-| `MTPLX_M1_MOE_LANE=0` | on for MoE models | every MoE default (the two rows below included) |
+| `MTPLX_M1_MOE_LANE=0` | on for MoE models | every MoE default (the rows below included) |
 | `MTPLX_M1_RESIDENT_DECODE=0` | on for Qwen3.6-35B-A3B family models | decode rounds queued on the GPU |
+| `MTPLX_A3B_GDN_FUSED=0` | on for Qwen3.6-35B-A3B family models | one kernel per GDN layer in verify |
 | `MTPLX_CONTEXT_COPY=0` | on for Qwen3.6-35B-A3B family models | context-copy |
 
 ## Known limitations
