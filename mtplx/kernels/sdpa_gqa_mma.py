@@ -442,17 +442,33 @@ def _wide_kernel():
     )
 
 
-def _wide_simdgroups(q_len: int, gqa: int, ceiling: int) -> int:
+def _wide_simdgroups(q_len: int, gqa: int, ceiling: int, kv_bits: int = 0) -> int:
     """Simdgroups per threadgroup of the verify partials (``MTPLX_GQA_MMA_NSG``, 4 or 8).
 
     Wide only for multi-row windows past 16K keys: below that the halved
     split count starves the GPU (4K ceiling: 0.32 -> 0.47 ms per layer).
+
+    With fp16/bf16 K/V, also only above 16 query rows
+    (``MTPLX_GQA_MMA_WIDE_MIN_ROWS``, default 17): the wide win was measured
+    on 24 rows (GQA-6 x 4). For 16 rows (A3B GQA-8 x 2-row verify,
+    2026-11-05, a3b-s6) the narrow kernel is faster: fp16 32K 0.41 -> 0.27,
+    115K 1.03 -> 0.86 ms per layer; server greedy ~30K 78.8 -> 80.3, ~104K
+    55.5 -> 58.4 tok/s. q8 banks keep the wide kernel: the server measured
+    narrow 4-5% slower there (95.2 -> 90.7 at ~30K).
     """
 
     from ..cache_state import m1_long_context_defaults
 
     nsg = _env_int("MTPLX_GQA_MMA_NSG", 8 if m1_long_context_defaults() else 4)
-    if nsg != 8 or q_len < 2 or gqa * q_len > 32 or int(ceiling) < 16384:
+    rows = gqa * q_len
+    min_rows = _env_int("MTPLX_GQA_MMA_WIDE_MIN_ROWS", 17) if int(kv_bits) == 0 else 0
+    if (
+        nsg != 8
+        or q_len < 2
+        or rows > 32
+        or rows < min_rows
+        or int(ceiling) < 16384
+    ):
         return 4
     return 8
 
@@ -633,7 +649,7 @@ def sdpa_gqa_mma(
         offset_arr = mx.array([offset_int], dtype=mx.int32)
 
     splits = splits_for_ceiling(ceiling)
-    nsg = _wide_simdgroups(q_len, gqa, ceiling)
+    nsg = _wide_simdgroups(q_len, gqa, ceiling, kv_bits)
     extra_template = []
     if nsg != 4:
         wide = _wide_kernel()

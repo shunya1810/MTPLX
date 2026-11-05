@@ -185,3 +185,16 @@ def test_prefill_row_geometries_match_the_default(positions, simdgroups):
     assert out is not None and ref is not None
     err = mx.max(mx.abs(out.astype(mx.float32) - ref.astype(mx.float32))).item()
     assert err < 1e-2, err
+
+
+def test_wide_kernel_only_above_16_rows_for_fp16_kv(monkeypatch):
+    from mtplx.kernels import sdpa_gqa_mma as G
+
+    monkeypatch.setenv("MTPLX_GQA_MMA_NSG", "8")
+    monkeypatch.delenv("MTPLX_GQA_MMA_WIDE_MIN_ROWS", raising=False)
+    assert G._wide_simdgroups(2, 8, 131072, kv_bits=0) == 4  # A3B verify: 16 rows
+    assert G._wide_simdgroups(4, 6, 131072, kv_bits=0) == 8  # 27B verify: 24 rows
+    assert G._wide_simdgroups(2, 8, 131072, kv_bits=8) == 8  # q8 banks keep wide
+    assert G._wide_simdgroups(2, 8, 8192, kv_bits=8) == 4  # short ceiling
+    monkeypatch.setenv("MTPLX_GQA_MMA_WIDE_MIN_ROWS", "0")
+    assert G._wide_simdgroups(2, 8, 131072, kv_bits=0) == 8
