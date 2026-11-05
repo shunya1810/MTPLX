@@ -3234,9 +3234,22 @@ def forward_with_gdn_capture(
         and context_len >= max(0, layer_eval_threshold)
     )
 
+    # Verify windows on the A3B lane add each residual inside the next RMSNorm
+    # (kernels/fused_norm exact kernel; bit-identical to add + rms_norm).
+    fuse_add = _a3b_fused_add_norm_enabled() and int(inputs.shape[1]) <= 8
+    if fuse_add:
+        from .kernels.fused_norm import fused_add_rmsnorm
+    pending = None
     for layer_idx, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
         mask = ssm_mask if layer.is_linear else fa_mask
-        normed = layer.input_layernorm(hidden_states)
+        if pending is None:
+            normed = layer.input_layernorm(hidden_states)
+        else:
+            hidden_states, normed = fused_add_rmsnorm(
+                pending[0], pending[1],
+                layer.input_layernorm.weight, layer.input_layernorm.eps,
+            )
+            pending = None
         if layer.is_linear:
             if os.environ.get("MTPLX_ABLATE_LINEAR_ATTN", "").lower() in {
                 "1",
@@ -3290,15 +3303,30 @@ def forward_with_gdn_capture(
                         else (512 if hidden_states.dtype == mx.bfloat16 else None)
                     ),
                 )
+        elif fuse_add:
+            h, mlp_input = fused_add_rmsnorm(
+                hidden_states, r,
+                layer.post_attention_layernorm.weight,
+                layer.post_attention_layernorm.eps,
+            )
         else:
             h = hidden_states + r
             mlp_input = layer.post_attention_layernorm(h)
-        hidden_states = h + layer.mlp(mlp_input)
-        if layer_eval_enabled and (layer_idx + 1) % layer_eval_every == 0:
+        eval_here = layer_eval_enabled and (layer_idx + 1) % layer_eval_every == 0
+        if fuse_add and not eval_here:
+            pending = (h, layer.mlp(mlp_input))
+        else:
+            hidden_states = h + layer.mlp(mlp_input)
+        if eval_here:
             mx.eval(hidden_states)
 
+    if pending is not None:
+        hidden_states, post_norm = fused_add_rmsnorm(
+            pending[0], pending[1], inner.norm.weight, inner.norm.eps,
+        )
+    else:
+        post_norm = inner.norm(hidden_states)
     pre_norm = hidden_states
-    post_norm = inner.norm(hidden_states)
     logits = (
         inner.embed_tokens.as_linear(post_norm)
         if text_model.args.tie_word_embeddings

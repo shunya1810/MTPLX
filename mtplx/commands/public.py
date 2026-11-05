@@ -1478,9 +1478,10 @@ _M1_A3B_ENV = {
     # top-k, ~0.4 ms of GPU per round; mtplx/kernels/chunk_topk.py). A3B
     # T=1.0 2K 92.1 -> 94.8 tok/s, same-seed text identical.
     "MTPLX_M1_CHUNK_TOPK": "1",
-    # The verify trace adds each residual inside the following RMSNorm's
-    # kernel (gdn_capture.forward_with_a3b_gdn_postconv_capture): 80 fewer
-    # dependent dispatches, outputs bit-identical. 15.92 -> 15.84 ms.
+    # The verify adds each residual inside the following RMSNorm's kernel
+    # (gdn_capture forward_with_gdn_capture - the resident/graphbank verify -
+    # and the A3B target-prefix trace): 80 fewer dependent dispatches, logits
+    # bit-identical. Generic verify 13.90 -> 13.74 ms.
     "MTPLX_A3B_FUSED_ADD_NORM": "1",
     # One kernel per GDN layer from the fused in-projection to the gated norm
     # (split copies, conv, SiLU, recurrence, gated RMSNorm; kernels/gdn_fused.py):
