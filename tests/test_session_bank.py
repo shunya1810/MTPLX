@@ -755,10 +755,13 @@ def test_supersede_tail_slack_keeps_wider_gaps_and_can_be_disabled(monkeypatch):
     _put_hybrid(bank, runtime, prompt + [50, 51], [4, 8])
     assert sorted(e.prefix_len for e in bank._entries.values()) == [10, 12]
     # The contained entry's own checkpoints must still be present exactly.
+    # Since upstream 2.12.3 the longer entry inherits the stored prefix's
+    # records (4 here), so it holds them all and supersedes the prefix.
     bank = SessionBank(max_entries=8, max_bytes=4096, per_session_max_bytes=2048)
     _put_hybrid(bank, runtime, prompt, [4, 9])
     _put_hybrid(bank, runtime, prompt + [50, 51], [9])
-    assert sorted(e.prefix_len for e in bank._entries.values()) == [10, 12]
+    assert sorted(e.prefix_len for e in bank._entries.values()) == [12]
+    assert [b[0] for b in next(iter(bank._entries.values())).gdn_boundaries] == [4, 9]
     monkeypatch.setenv("MTPLX_SESSION_BANK_SUPERSEDE_TAIL_SLACK", "0")
     bank = SessionBank(max_entries=8, max_bytes=4096, per_session_max_bytes=2048)
     _put_hybrid(bank, runtime, prompt, [4, 9])

@@ -45,6 +45,9 @@ def _resent(prompt: list[int], thinking: list[int], seam_at: int) -> list[int]:
 
 
 def test_a_seam_early_in_a_long_thinking_turn_keeps_the_session() -> None:
+    """Since upstream #624 the turn-boundary rule keeps a session whose match
+    ends inside the tokens a committed turn generated, before the seam check
+    is asked."""
     manager = EngineSessionManager()
     session, prompt, thinking = _thinking_session(manager)
     calls = []
@@ -58,26 +61,27 @@ def test_a_seam_early_in_a_long_thinking_turn_keeps_the_session() -> None:
     resolved, source, diagnostic = _resolve(manager, resent)
     assert resolved == session.session_id
     assert source == "common_prefix_reuse"
-    assert diagnostic["reuse_rule"] == "token_seam"
+    assert diagnostic["reuse_rule"] == "turn_boundary"
     assert diagnostic["matched_prefix_len"] == 19_000 + 5_000
-    assert calls == [24_000]
-    assert session.last_seam_reuse_at == 24_000
+    assert calls == []
 
 
-def test_without_a_seam_check_the_request_forks_as_before() -> None:
+def test_without_a_seam_check_the_session_is_kept_inside_generated_tokens() -> None:
     manager = EngineSessionManager()
     session, prompt, thinking = _thinking_session(manager)
     resolved, source, _ = _resolve(manager, _resent(prompt, thinking, 5_000))
-    assert resolved != session.session_id
-    assert source == "new"
+    assert resolved == session.session_id
+    assert source == "common_prefix_reuse"
 
 
-def test_a_real_edit_forks() -> None:
+def test_an_edit_inside_generated_tokens_keeps_the_session() -> None:
+    """The restore reuses only the verified shared tokens, so keeping the
+    session after an edit of the model's own turn changes no cached state."""
     manager = EngineSessionManager()
     session, prompt, thinking = _thinking_session(manager)
     manager.seam_resync = lambda tokens, committed, at: False
     resolved, source, _ = _resolve(manager, _resent(prompt, thinking, 5_000))
-    assert resolved != session.session_id and source == "new"
+    assert resolved == session.session_id and source == "common_prefix_reuse"
 
 
 def test_a_divergence_inside_the_prompt_is_not_a_seam() -> None:

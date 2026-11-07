@@ -62,6 +62,10 @@ def toy(monkeypatch):
     # The toy prompts are far below the production block and match floors.
     monkeypatch.setenv("MTPLX_SESSION_PREFIX_BLOCK_SIZE", "8")
     monkeypatch.setenv("MTPLX_SESSION_BLOCK_PREFIX_MIN_MATCH_TOKENS", "8")
+    # Fork: the answer entry replaces the prompt entry when its prompt-end
+    # checkpoint sits one token short (memory at 64K), so a follow-up resumes
+    # one token before the prompt's end. Exact supersede pins upstream's count.
+    monkeypatch.setenv("MTPLX_SESSION_BANK_SUPERSEDE_TAIL_SLACK", "0")
     for name in (
         "MTPLX_GDN_BOUNDARY_CAPTURE",
         "MTPLX_GDN_BOUNDARY_MAX",

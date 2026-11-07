@@ -38,9 +38,17 @@ def test_prompt_boundaries_ride_the_generation_final_entry():
     assert values["token_ids"] == [1, 2, 3, 4, 7, 8]
 
 
-def test_no_boundaries_when_the_banked_tokens_do_not_extend_the_prompt():
-    records = [(2, "snap2", None)]
+def test_only_boundaries_inside_the_shared_prefix_ride_along():
+    # Upstream 2.12.3 rule: a record at p is the state after the first p
+    # tokens, valid for any history that starts with them.
+    records = [(2, "snap2", None), (4, "snap4", None)]
     values = _values(_final_state(records), [1, 2, 3, 4], [1, 2, 9, 4, 7, 8])
+    assert values["gdn_boundaries"] == [(2, "snap2", None)]
+
+
+def test_no_boundaries_when_the_banked_tokens_part_before_the_first_record():
+    records = [(2, "snap2", None)]
+    values = _values(_final_state(records), [1, 2, 3, 4], [1, 9, 3, 4, 7, 8])
     assert "gdn_boundaries" not in values
 
 
