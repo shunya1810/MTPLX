@@ -5,7 +5,7 @@
 
 English | [日本語](README.ja.md)
 
-An unofficial fork of [MTPLX](https://github.com/youssofal/MTPLX) that makes it faster on Macs with an M1-family chip. It is MTPLX 2.12.2 plus changes that only switch on for M1-family GPUs. It targets Qwen3.5, Qwen3.6 and Qwen3.8 family models, mainly for long prompts and coding agents.
+An unofficial fork of [MTPLX](https://github.com/youssofal/MTPLX) that makes it faster on Macs with an M1-family chip. It is MTPLX 2.12.3 plus changes that only switch on for M1-family GPUs. It targets Qwen3.5, Qwen3.6 and Qwen3.8 family models, mainly for long prompts and coding agents.
 
 Like upstream, it decodes speculatively with the model's own MTP (multi-token prediction) heads, so the output distribution is the same as upstream's. It serves an OpenAI-compatible and an Anthropic-compatible API.
 
@@ -15,7 +15,7 @@ Like upstream, it decodes speculatively with the model's own MTP (multi-token pr
 
 ## Key numbers
 
-This fork and upstream MTPLX 2.12.2 (the version it is based on), measured on the same Mac under the same conditions. Bold is this fork.
+This fork and upstream MTPLX 2.12.2 (the version it was based on until v2.12.2-m1.13), measured on the same Mac under the same conditions. Bold is this fork.
 
 ### Prefill (tok/s)
 
@@ -85,6 +85,7 @@ From bench 2 of [apple-silicon-llm-bench](https://github.com/shunya1810/apple-si
 - v2.12.2-m1.11 fixes the prefill attention over long histories, whose running sum was kept in fp16: on the 27B most cold prompts of 192K–256K ended with NaN, and from 32K on the answers of both models change a little. Prefill speed is unchanged; in bench 3 the decode at 32K–128K moved by a few percent, so the tables above were not re-measured. Bench 3 of [apple-silicon-llm-bench](https://github.com/shunya1810/apple-silicon-llm-bench) has 192K–256K after the fix (27B: prefill 78–90 tok/s, decode 17–21 tok/s).
 - v2.12.2-m1.12 leaves these models' speed unchanged: against m1.11 on Qwen3.8-27B and Qwen3.6-35B-A3B, prefill and the time of one verify round at 1.6K tokens differed by less than 2%, so the tables were not re-measured.
 - v2.12.2-m1.13 speeds up the Qwen3.6-35B-A3B family's decode (the two A3B rows above were re-measured). It does not change the 27B models' path with the 8-bit KV cache used here, so their rows were not re-measured.
+- v2.12.3-m1.14 brings in upstream 2.12.3 and leaves these models' speed unchanged: against m1.13 on Qwen3.8-27B and Qwen3.6-35B-A3B, cold prefill and decode at 8K–128K and on short prompts differed by 1% or less, and peak memory was the same, so the tables were not re-measured. Upstream's rows were not re-measured on 2.12.3.
 - Qwen3.6-35B-A3B now reads 32K–64K prompts more slowly than Ornith-1.5-35B-A3B, which has the same layout (931 against 1,026 tok/s at 32K); on v2.12.2-m1.10 the two were equal (1,028 and 1,034). m1.13 does not change prefill and was not slower than m1.12 on the same day (cold prompts of about 29K and 104K tokens: 910 and 513 tok/s against 697 and 444). The cause is being investigated.
 - The 8K–128K prompts repeat one 11K-token HTML file. Read to about 256K (22 repeats), Qwen3.8-27B predicts its own next tokens poorly from the third repeat on (upstream MTPLX too), and the draft head, which reads the model's hidden states, then rarely matches, so 256K is shown with the non-repeating text above instead.
 - MacBook Pro M1 Max 64 GB, macOS 26. Profile `turbo`, 256K context limit, 8-bit KV cache, temperature 0.6 with fixed seeds.
@@ -126,7 +127,7 @@ From bench 2 of [apple-silicon-llm-bench](https://github.com/shunya1810/apple-si
 ## Install
 
 ```bash
-git clone --branch v2.12.2-m1.13 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.3-m1.14 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # about a minute; done when it prints "mfa_attn: ok", "ane_ffn: ok" and "qsa_kernels: ok"
 ```
@@ -166,7 +167,7 @@ More: [docs/m1max-longctx/USAGE.md](docs/m1max-longctx/USAGE.md).
 
 ```bash
 git fetch --tags
-git checkout <new tag>                  # for example v2.12.2-m1.13
+git checkout <new tag>                  # for example v2.12.3-m1.14
 scripts/build-m1-native-extensions.sh   # needed only when the native extensions changed (the release notes say so)
 ```
 

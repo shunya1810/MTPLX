@@ -5,7 +5,7 @@
 
 [English](README.md) | 日本語
 
-[MTPLX](https://github.com/youssofal/MTPLX) を M1 系の Mac で速く動かすための非公式のフォークです。MTPLX 2.12.2 に、M1 系の GPU でだけ有効になる変更を加えています。対象は Qwen3.5・Qwen3.6・Qwen3.8 系のモデルで、長いプロンプトとコーディングエージェントでの利用を主な用途にしています。
+[MTPLX](https://github.com/youssofal/MTPLX) を M1 系の Mac で速く動かすための非公式のフォークです。MTPLX 2.12.3 に、M1 系の GPU でだけ有効になる変更を加えています。対象は Qwen3.5・Qwen3.6・Qwen3.8 系のモデルで、長いプロンプトとコーディングエージェントでの利用を主な用途にしています。
 
 本家と同じく、モデル自身の MTP（multi-token prediction）ヘッドで投機的デコードを行うので、出力の分布は本家と変わりません。OpenAI 互換と Anthropic 互換の API で動きます。
 
@@ -15,7 +15,7 @@
 
 ## 主な計測値
 
-このフォークと本家 MTPLX 2.12.2（このフォークの元の版）を、同じ Mac・同じ条件で測りました。太字がこのフォークです。
+このフォークと本家 MTPLX 2.12.2（v2.12.2-m1.13 までのこのフォークの元の版）を、同じ Mac・同じ条件で測りました。太字がこのフォークです。
 
 ### prefill（tok/s）
 
@@ -85,6 +85,7 @@
 - v2.12.2-m1.11 で、長い履歴への prefill の attention を直しました。途中の和を fp16 で持っていたため、27B では 19.2 万〜25.6 万トークンの cold のプロンプトの多くが NaN で止まり、3.2 万トークン以上では両方のモデルで出力が少し変わっていました。prefill の速さは変わりません。bench 3 では 3.2 万〜12.8 万トークンの decode の差が数 % だったので、上の表は測り直していません。修正後の 19.2 万〜25.6 万トークンの値は [apple-silicon-llm-bench](https://github.com/shunya1810/apple-silicon-llm-bench) の bench 3 にあります（27B は prefill 78〜90 tok/s、decode 17〜21 tok/s）。
 - v2.12.2-m1.12 では、これらのモデルの速さは変わりません。Qwen3.8-27B と Qwen3.6-35B-A3B で m1.11 と比べ、1.6K トークンでの prefill と verify 1 回の時間の差は 2% 未満だったので、表は測り直していません。
 - v2.12.2-m1.13 では、Qwen3.6-35B-A3B 系の decode が速くなりました（上の A3B の 2 行は測り直しました）。ここで使っている 8bit の KV キャッシュでは 27B のモデルの経路は変わらないので、27B の行は測り直していません。
+- v2.12.3-m1.14 では本家 2.12.3 を取り込みましたが、これらのモデルの速さは変わりません。Qwen3.8-27B と Qwen3.6-35B-A3B で m1.13 と比べ、8K〜12.8 万トークンの cold の prefill と decode、短い質問の decode の差は 1% 以内で、ピークのメモリも同じだったので、表は測り直していません。本家の行も 2.12.3 では測り直していません。
 - Qwen3.6-35B-A3B は、同じ構成の Ornith-1.5-35B-A3B より 32K〜64K のプロンプトの読み込みが遅くなっています（32K で 931 と 1,026 tok/s）。v2.12.2-m1.10 では同じでした（1,028 と 1,034）。m1.13 は prefill を変えておらず、同じ日の m1.12 との比較でも遅くはありません（約 2.9 万と 10.4 万トークンの cold のプロンプトで 910 と 513 tok/s、m1.12 は 697 と 444）。原因は調べている途中です。
 - 8K〜128K のプロンプトは、1 万 1 千トークンの HTML ファイルを繰り返したものです。約 256K（22 回の繰り返し）まで読ませると、3 回目の繰り返しから Qwen3.8-27B 自身の次のトークンの予測が当たらなくなり（本家でも同じ）、モデルの hidden state を読む draft ヘッドも当たらなくなります。そのため 256K 前後は、上の繰り返しのない文章の計測で示しています。
 - MacBook Pro M1 Max 64 GB、macOS 26。プロファイルは `turbo`、文脈の上限は 256K、KV キャッシュは 8bit、temperature は 0.6（seed 固定）です。
@@ -126,7 +127,7 @@
 ## インストール
 
 ```bash
-git clone --branch v2.12.2-m1.13 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.3-m1.14 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # 1 分ほど。「mfa_attn: ok」「ane_ffn: ok」「qsa_kernels: ok」が出れば完了
 ```
@@ -166,7 +167,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'content-type: application/
 
 ```bash
 git fetch --tags
-git checkout <新しいタグ>               # 例: v2.12.2-m1.13
+git checkout <新しいタグ>               # 例: v2.12.3-m1.14
 scripts/build-m1-native-extensions.sh   # ネイティブ拡張が変わった版だけ必要です（リリースノートに書きます）
 ```
 
