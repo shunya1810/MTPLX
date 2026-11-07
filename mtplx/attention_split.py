@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 from typing import Any
 
@@ -1022,6 +1023,19 @@ def configure_mtp_draft_attention(model: Any) -> dict[str, int]:
         attn._mtplx_mma_draft_threshold = threshold
         stats["enabled"] += 1
     return stats
+def _takes_shared_kv(attn: Any) -> bool:
+    """True for attention that threads KV through ``shared_kv``/``offset``.
+
+    Gemma 4's ``Attention.__call__`` takes those keywords and returns
+    ``(out, (keys, values), offset)``; the generic hook's signature and return
+    value do not match. The Gemma 4 pair path runs its own attention and never
+    installs the hook, so a plain Gemma 4 load must be left alone as well.
+    """
+
+    try:
+        return "shared_kv" in inspect.signature(type(attn).__call__).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def _full_attention_layers(model: Any):
@@ -1038,6 +1052,8 @@ def _full_attention_layers(model: Any):
         # would replace their __call__ with a rewrite that drops those
         # semantics.
         if getattr(attn, "_mtplx_generic_sdpa_rewrites_unsupported", False):
+            continue
+        if _takes_shared_kv(attn):
             continue
         yield attn
 

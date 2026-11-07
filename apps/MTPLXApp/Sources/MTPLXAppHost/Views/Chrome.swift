@@ -18,7 +18,7 @@ struct DaemonStatePill: View {
                 .font(.system(size: 10, weight: .heavy, design: .monospaced))
                 .tracking(1.5)
             if let detail {
-                Text("·")
+                Text(verbatim: "·")
                     .foregroundStyle(Brand.textHighlight.opacity(0.4))
                 Text(detail)
                     .font(.caption2)
@@ -172,7 +172,7 @@ struct ProfilePill: View {
             Text(name.capitalized)
                 .font(.caption.weight(.medium))
             if let family, family != name {
-                Text("·")
+                Text(verbatim: "·")
                     .foregroundStyle(.tertiary)
                 Text(family)
                     .font(.caption2)
@@ -520,6 +520,40 @@ struct SSDLowDiskBanner: View {
                         .strokeBorder(tint.opacity(0.45), lineWidth: Brand.hairlineStrong)
                 }
         }
+    }
+}
+
+// MARK: - ThermalPressureBanner
+
+/// macOS holds the Mac at heavy thermal pressure or worse and slows the GPU:
+/// one plain line, so a decode speed that falls while the engine does the
+/// same work has its cause on screen. Driven by `/health`
+/// `thermal_pressure` (`ThermalPressureNotice`).
+struct ThermalPressureBanner: View {
+    let notice: ThermalPressureNotice
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "thermometer.high")
+                .font(.callout)
+                .foregroundStyle(Brand.warning)
+            Text(notice.message)
+                .font(.caption)
+                .foregroundStyle(Brand.textHighlight.opacity(0.75))
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background {
+            RoundedRectangle(cornerRadius: Brand.Radii.m, style: .continuous)
+                .fill(Brand.warning.opacity(0.08))
+                .overlay {
+                    RoundedRectangle(cornerRadius: Brand.Radii.m, style: .continuous)
+                        .strokeBorder(Brand.warning.opacity(0.35), lineWidth: Brand.hairlineStrong)
+                }
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 

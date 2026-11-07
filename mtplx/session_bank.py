@@ -885,6 +885,7 @@ class SessionBankEntry:
     # A lease a stopped prefill gave back (return_lease): it has no logits for
     # its last position, so it serves only prompts that extend it.
     extension_only: bool = False
+    boundary_logits: tuple[int, Any] | None = None
     # Passive probe: monotonic time this ENTRY OBJECT's cold-tier encode
     # completed (the encode evals the entry's lazy roots in place), or None.
     # Kept on the exact object — Site A and Site B can create distinct
@@ -1538,6 +1539,43 @@ class SessionBank:
                     inherited_loader = getattr(
                         prefix_donor, "gdn_boundary_loader", None
                     )
+        else:
+            # Supplied records can lack ones only the stored prefix holds:
+            # the generation-final commit hands over the prefill's
+            # checkpoints (#637), while the prompt-end anchor lives on the
+            # prompt's lease (prompt_lease_fields), and a retry resumes from
+            # that anchor with the logits kept beside it (#661). Records
+            # describe token prefixes, so the donor's stay valid when it was
+            # written under this entry's identity (a record's hidden state
+            # follows the hidden variant); supplied ones win a shared
+            # position. A loader-backed donor is left alone: its records are
+            # not in memory to merge.
+            prefix_donor = self.longest_prefix(tokens)
+            if (
+                prefix_donor is not None
+                and prefix_donor.gdn_boundaries
+                and getattr(prefix_donor, "gdn_boundary_loader", None) is None
+                and _restore_identity_compatible(
+                    prefix_donor,
+                    model_path=str(runtime.model_path),
+                    mtp_enabled=bool(runtime.mtp_enabled),
+                    hidden_variant=hidden_variant,
+                    template_hash=template_hash,
+                    mtp_history_policy=mtp_history_policy,
+                    draft_head_identity=draft_head_identity,
+                    policy_fingerprint=policy_fingerprint,
+                )
+            ):
+                supplied = {position for position, _state, _hidden in normalized_boundaries}
+                normalized_boundaries = sorted(
+                    normalized_boundaries
+                    + [
+                        (int(r[0]), r[1], r[2] if len(r) > 2 else None)
+                        for r in prefix_donor.gdn_boundaries
+                        if 0 < int(r[0]) <= len(tokens) and int(r[0]) not in supplied
+                    ],
+                    key=lambda item: item[0],
+                )
         if normalized_boundaries:
             # Every stored set keeps its anchors within the checkpoint budget,
             # whatever produced it (a prefill, an inheriting commit, a set
@@ -1720,6 +1758,18 @@ class SessionBank:
                 }
             )
             return None
+        if (
+            not keep_live_ref
+            and mtp_history_snapshot is None
+            and mtp_history_cache_ref is not None
+        ):
+            # A snapshot entry keeps no live reference, so it owns its draft
+            # history too. One-copy callers hand the history by reference for
+            # the lease; when this put keeps none (OpenCode's snapshot-only
+            # policy, an anonymous API session, a postcommit without a lease)
+            # dropping the reference left an entry the committed policy can
+            # never resume, and every turn prefilled cold (#591, #616, #649).
+            mtp_history_snapshot = snapshot_cache(mtp_history_cache_ref)
         trunk_snapshot_done = time.perf_counter()
         if timing_out is not None:
             timing_out["trunk_snapshot_s"] = trunk_snapshot_done - trunk_snapshot_started
@@ -1975,6 +2025,37 @@ class SessionBank:
                 best = entry
         return best
 
+    def cold_exact_prefix_len(
+        self,
+        token_ids: list[int] | tuple[int, ...],
+        *,
+        model_path: str,
+        mtp_enabled: bool,
+        hidden_variant: str | None = None,
+        template_hash: str | None = None,
+        mtp_history_policy: str | None = None,
+        draft_head_identity: str | None = None,
+        policy_fingerprint: str | None = None,
+    ) -> int:
+        """Longest SSD entry that is a whole prefix of ``token_ids`` (0 when
+        none, or without a cold tier). Manifest only: nothing is hydrated."""
+        probe = getattr(self.cold_tier, "exact_prefix_len", None)
+        if not callable(probe):
+            return 0
+        return int(
+            probe(
+                token_ids,
+                model_path=model_path,
+                mtp_enabled=mtp_enabled,
+                hidden_variant=hidden_variant,
+                template_hash=template_hash,
+                mtp_history_policy=mtp_history_policy,
+                draft_head_identity=draft_head_identity,
+                policy_fingerprint=policy_fingerprint,
+            )
+            or 0
+        )
+
     def near_prefix_candidates(
         self,
         token_ids: list[int] | tuple[int, ...],
@@ -2167,6 +2248,11 @@ class SessionBank:
             allow_block_prefix=allow_block_prefix,
             resident_duplicates=resident_duplicates,
             min_useful_matched_tokens=ram_best_matched,
+            # A hybrid row's restore lands at its recurrent boundary, below
+            # the match, and no caller uses one below its floor. A boundary
+            # at the floor itself still decodes: the batched lane serves it,
+            # the serial near lane refuses it.
+            min_restore_point=floor,
             model_path=model_path,
             mtp_enabled=mtp_enabled,
             hidden_variant=hidden_variant,
@@ -2238,6 +2324,7 @@ class SessionBank:
         policy_fingerprint: str | None,
         resident_duplicates: dict[str, dict[str, Any]] | None = None,
         min_useful_matched_tokens: int = 0,
+        min_restore_point: int = 0,
     ) -> tuple[SessionBankEntry, int] | None:
         if self.cold_tier is None:
             return None
@@ -2263,6 +2350,10 @@ class SessionBank:
             lookup_kwargs["min_useful_matched_tokens"] = int(
                 min_useful_matched_tokens
             )
+        if min_restore_point > 0 and getattr(
+            self.cold_tier, "SUPPORTS_MIN_RESTORE_POINT", False
+        ):
+            lookup_kwargs["min_restore_point"] = int(min_restore_point)
         result = lookup(
             tokens,
             model_path=model_path,
@@ -2362,6 +2453,61 @@ class SessionBank:
             return None
         return record
 
+    def _explain_cold_miss(
+        self,
+        cold_miss: str,
+        *,
+        ram_reason: str | None,
+        session_id: str | None,
+        token_ids: list[int] | tuple[int, ...],
+    ) -> str:
+        """Say what a plain SSD miss meant, instead of naming the last tier.
+
+        The cold tier reports ``ssd_prefix_miss`` whenever it holds nothing
+        reusable, which is the normal answer for a new conversation or for a
+        prompt that shares less than the reuse minimum with what is stored. The
+        reason this lookup reports is, in order: ``evicted`` when this
+        conversation's own earlier turn left RAM and is not on the SSD,
+        ``new_session`` when the bank held nothing, and
+        ``prefix_divergence_at_token`` when it held other conversations but no
+        shared prefix long enough to reuse. A real SSD failure
+        (``ssd_restore_error:*`` and the like) is passed through unchanged, and
+        so is ``ssd_prefix_miss`` when the RAM lane refused a prefix for some
+        other reason (that refusal is in ``last_ram_miss_reason``).
+        """
+        if cold_miss != "ssd_prefix_miss":
+            return cold_miss
+        if self._own_turn_evicted(session_id, token_ids):
+            return CacheMissReason.EVICTED.value
+        if ram_reason == CacheMissReason.NEW_SESSION.value:
+            return ram_reason
+        if ram_reason == CacheMissReason.PREFIX_DIVERGENCE_AT_TOKEN.value or str(
+            ram_reason or ""
+        ).startswith("below_block_min_match"):
+            return CacheMissReason.PREFIX_DIVERGENCE_AT_TOKEN.value
+        return cold_miss
+
+    def _own_turn_evicted(
+        self, session_id: str | None, token_ids: list[int] | tuple[int, ...]
+    ) -> bool:
+        """True when the eviction log holds this conversation's earlier turn
+        (a prefix of the prompt) as evicted from RAM."""
+        if not session_id:
+            return False
+        tokens = tuple(int(token) for token in token_ids)
+        for record in reversed(self.eviction_log):
+            if (
+                record.get("reason") != CacheMissReason.EVICTED.value
+                or record.get("session_id") != session_id
+            ):
+                continue
+            n = int(record.get("prefix_len") or 0)
+            if 0 < n <= len(tokens) and token_prefix_hash(tokens[:n]) == record.get(
+                "token_hash"
+            ):
+                return True
+        return False
+
     def _note_oversized_miss(
         self, session_id: str | None, token_ids: list[int] | tuple[int, ...]
     ) -> bool:
@@ -2430,6 +2576,8 @@ class SessionBank:
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
                 ram_refusal=ram_refusal,
+                cache_factory=cache_factory,
+                mtp_cache_factory=mtp_cache_factory,
             )
 
         entry = self.longest_prefix(token_ids)
@@ -3488,7 +3636,12 @@ class SessionBank:
         draft_head_identity: str | None,
         policy_fingerprint: str | None,
         ram_refusal: dict[str, Any] | None = None,
+        cache_factory: Callable[[], list[Any]] | None = None,
+        mtp_cache_factory: Callable[[], list[Any]] | None = None,
     ) -> SessionBankRestore | None:
+        # cache_factory / mtp_cache_factory: the request's cache layout, the same
+        # factories restore() hands to its RAM restore.
+        #
         # ram_refusal: restore() refused this lookup's longest RAM prefix
         # (ram_miss_reason, ram_refused_prefix_len, ram_refused_session_id).
         # It stays in the diagnostic whatever this lookup finds.
@@ -3531,7 +3684,16 @@ class SessionBank:
             else:
                 cold_miss = None
             if cold_miss:
-                self.last_miss_reason = str(cold_miss)
+                self.last_miss_reason = self._explain_cold_miss(
+                    str(cold_miss),
+                    ram_reason=(
+                        (ram_refusal or {}).get("ram_miss_reason")
+                        if ram_refusal is not None
+                        else self.last_miss_reason
+                    ),
+                    session_id=session_id,
+                    token_ids=token_ids,
+                )
                 if self.last_prefix_diagnostic is not None:
                     self.last_prefix_diagnostic["miss_reason"] = self.last_miss_reason
             self._note_oversized_miss(session_id, token_ids)
@@ -3588,14 +3750,28 @@ class SessionBank:
         ):
             self.last_miss_reason = CacheMissReason.SNAPSHOT_DESYNC.value
             return None
-        cache = runtime.make_cache()
-        restore_cache(cache, entry.cache_snapshot)
+        # The request's cache layout, exactly as a RAM restore builds it (restore() above).
+        # runtime.make_cache() is the default layout, which for a long context is the paged
+        # KV cache: about 5x slower prefill and slower decode than the dense cache the request
+        # asked for (Qwen3.8 27B, 2026-10-08: first token after an SSD restore at 50K and 80K
+        # 16 to 48 s with the default layout, 5 to 8 s with the request's). As in the RAM
+        # restore, the stored meta state is not imposed on the request's cache.
+        cache = cache_factory() if cache_factory is not None else runtime.make_cache()
+        restore_cache(
+            cache,
+            entry.cache_snapshot,
+            restore_meta_state=cache_factory is None,
+        )
         # Read back from disk, the entry's floor is its restored caches'.
         entry.restore_floor_tokens = _cache_restore_floor(cache)
         entry.window_nbytes = _cache_window_nbytes(cache)
         mtp_history_cache = None
         if entry.mtp_history_snapshot is not None:
-            mtp_history_cache = runtime.make_mtp_cache()
+            mtp_history_cache = (
+                mtp_cache_factory()
+                if mtp_cache_factory is not None
+                else runtime.make_mtp_cache()
+            )
             restore_cache(mtp_history_cache, entry.mtp_history_snapshot)
         entry.hits += 1
         entry.last_access_s = time.time()
@@ -3770,6 +3946,15 @@ class SessionBank:
             and entry.session_id == session_id
         ]
         for entry in stale:
+            if (
+                newest.live_ref_only
+                and entry.cache_ref is newest.cache_ref
+                and entry.logits is not None
+                and newest.token_ids[: entry.prefix_len] == entry.token_ids
+                and any(int(r[0]) == entry.prefix_len for r in newest.gdn_boundaries)
+            ):
+                newest.boundary_logits = (entry.prefix_len, entry.logits)
+                newest.lease_aux_nbytes += _tree_nbytes(entry.logits)
             self._evict_entry(entry, reason="superseded_session_lease")
 
     def _supersede_contained_prefixes(self, tokens: tuple[int, ...]) -> None:

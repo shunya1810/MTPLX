@@ -374,6 +374,7 @@ class SessionBankColdTier:
     # the pre-shadow call shape.
     SUPPORTS_RESIDENT_DUPLICATE_SHADOW = True
     SUPPORTS_MIN_USEFUL_MATCHED_TOKENS = True
+    SUPPORTS_MIN_RESTORE_POINT = True
 
     def __init__(
         self,
@@ -1118,6 +1119,66 @@ class SessionBankColdTier:
         self._set_last_miss("ssd_prefix_miss")
         return None
 
+    def exact_prefix_len(
+        self,
+        token_ids: list[int] | tuple[int, ...],
+        *,
+        model_path: str,
+        mtp_enabled: bool,
+        hidden_variant: str | None = None,
+        template_hash: str | None = None,
+        mtp_history_policy: str | None = None,
+        draft_head_identity: str | None = None,
+        policy_fingerprint: str | None = None,
+    ) -> int:
+        """Length of the longest stored entry that is a whole prefix of
+        ``token_ids``, read from the manifest alone (no tensor is read).
+
+        The rows are the ones ``lookup`` would try, under the row gates
+        ``_restore_row`` applies before it reads a tensor, and without the
+        rows ``SessionBank._restore_cold`` refuses once read: a request that
+        names a hidden variant needs the entry's final logits and hidden
+        (``ssd_missing_mtp_generation_state``), which a row carries exactly
+        when the bank stamped ``mtp_full`` on it. A probe, not a lookup: no
+        counter and no miss reason change.
+        """
+        if self.mode in {"off", "write-only"}:
+            return 0
+        tokens = tuple(int(token) for token in token_ids)
+        if not tokens:
+            return 0
+        try:
+            rows = self._candidate_rows(
+                tokens,
+                model_path=model_path,
+                mtp_enabled=mtp_enabled,
+                hidden_variant=hidden_variant,
+                template_hash=template_hash,
+                mtp_history_policy=mtp_history_policy,
+                draft_head_identity=draft_head_identity,
+                policy_fingerprint=policy_fingerprint,
+            )
+            for row in rows:
+                if int(row["format_version"]) != COLD_TIER_FORMAT_VERSION:
+                    continue
+                epoch = row["mtp_snapshot_epoch"]
+                if epoch is not None and int(epoch) != int(row["snapshot_epoch"]):
+                    continue
+                if hidden_variant is not None and not _row_carries_generation_state(row):
+                    continue
+                prefix = tuple(
+                    int(token) for token in json.loads(str(row["token_ids_json"]))
+                )
+                if prefix and tokens[: len(prefix)] == prefix:
+                    return len(prefix)
+        except Exception as exc:
+            logger.warning(
+                "SessionBank SSD exact-prefix probe failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+        return 0
+
     def lookup_prefix_boundary(
         self,
         token_ids: list[int] | tuple[int, ...],
@@ -1136,7 +1197,14 @@ class SessionBankColdTier:
         allow_block_prefix: bool = True,
         resident_duplicates: dict[str, dict[str, Any]] | None = None,
         min_useful_matched_tokens: int = 0,
+        min_restore_point: int = 0,
     ) -> ColdPrefixRestoreRecord | None:
+        # min_restore_point: the lowest point the caller can restore at. A
+        # hybrid row restores at its newest recurrent boundary at or below
+        # the match, which the row's payload.json gives before any tensor is
+        # read; a row whose boundary lies below this point is refused
+        # undecoded and the next one is tried (see _restore_row).
+        #
         # resident_duplicates: token_hash -> {prefix_len, has_mtp_history}
         # for RAM entries the caller has ALREADY proven identity-compatible
         # with this request, snapshot-capable (never live-ref-only), and
@@ -1275,6 +1343,7 @@ class SessionBankColdTier:
                     require_exact_prefix=False,
                     include_gdn_boundaries=True,
                     prefix_restore_tokens=int(candidate_matched),
+                    min_restore_point=int(min_restore_point),
                 )
                 if record is not None:
                     return ColdPrefixRestoreRecord(
@@ -1310,7 +1379,7 @@ class SessionBankColdTier:
         row_has_mtp = "mtp_full" in row_caps or row["mtp_snapshot_epoch"] is not None
         return (not row_has_mtp) or bool(dup.get("has_mtp_history"))
 
-    def _manifest_stats_row(self) -> tuple[int, int, int, int, int]:
+    def _manifest_stats_row(self) -> tuple[Any, ...]:
         """The stats() aggregate, opening the manifest only when it changed.
 
         Before 2.8.2 every stats() call — i.e. every /health and dashboard
@@ -1340,7 +1409,11 @@ class SessionBankColdTier:
                 "COALESCE(SUM(CASE WHEN physical_nbytes > 0 "
                 "THEN physical_nbytes ELSE nbytes END), 0), "
                 "COALESCE(SUM(deduped_nbytes), 0), "
-                "COALESCE(MAX(max(nbytes, logical_nbytes)), 0) FROM entries"
+                "COALESCE(MAX(max(nbytes, logical_nbytes)), 0), "
+                "COUNT(DISTINCT session_id), "
+                "COALESCE(SUM(CASE WHEN session_id IS NULL THEN 1 ELSE 0 END), 0), "
+                "MIN(created_at_s), MAX(created_at_s), "
+                "COALESCE(SUM(CASE WHEN hits = 0 THEN 1 ELSE 0 END), 0) FROM entries"
             ).fetchone()
         row = (
             int(fetched[0]),
@@ -1348,6 +1421,11 @@ class SessionBankColdTier:
             int(fetched[2]),
             int(fetched[3]),
             int(fetched[4]),
+            int(fetched[5]),
+            int(fetched[6]),
+            None if fetched[7] is None else float(fetched[7]),
+            None if fetched[8] is None else float(fetched[8]),
+            int(fetched[9]),
         )
         with self._manifest_stats_lock:
             self._manifest_stats_cache = {
@@ -1386,6 +1464,15 @@ class SessionBankColdTier:
             stats["deduped_bytes"] = int(row[3])
             logical = max(1, int(row[1]))
             stats["dedupe_ratio"] = max(0.0, float(row[3]) / float(logical))
+            # What the store holds, for the dashboard's cache overview: how
+            # many conversations the snapshots belong to (rows written
+            # without a session id are counted apart), how old the oldest
+            # and newest snapshot are, and how many were never restored.
+            stats["sessions"] = int(row[5])
+            stats["entries_without_session"] = int(row[6])
+            stats["oldest_created_at_s"] = row[7]
+            stats["newest_created_at_s"] = row[8]
+            stats["never_restored_entries"] = int(row[9])
             usage = self._managed_disk_usage()
             managed_file_bytes = int(usage.get("managed_file_bytes", 0))
             managed_disk_bytes = int(usage.get("managed_disk_bytes", 0))
@@ -2675,6 +2762,7 @@ class SessionBankColdTier:
         require_exact_prefix: bool = True,
         include_gdn_boundaries: bool = False,
         prefix_restore_tokens: int | None = None,
+        min_restore_point: int = 0,
     ) -> ColdRestoreRecord | None:
         metadata = dict(row)
         token_ids = tuple(int(token) for token in json.loads(str(metadata["token_ids_json"])))
@@ -2736,6 +2824,18 @@ class SessionBankColdTier:
                     self._inc("prefix_restores_without_boundary")
                     self._set_last_miss("ssd_prefix_no_recurrent_boundary")
                     return None
+            if (
+                has_recurrent
+                and boundary_prefix is not None
+                and boundary_prefix < int(min_restore_point)
+            ):
+                # The restore would land below the lowest point the caller
+                # can use (the near lane's floor: its exact prefix in RAM or
+                # on SSD). The lane refused such a candidate only after this
+                # decode, as boundary_not_better.
+                self._inc("prefix_restores_below_caller_floor")
+                self._set_last_miss("ssd_prefix_boundary_below_floor")
+                return None
             # Cache types whose metadata couples rolling state to their
             # tensors must use the exact decoder plus trim; so does a hybrid
             # entry without a boundary when boundary-true restores are off.
@@ -3351,3 +3451,20 @@ def _policy_compatible(entry_policy: str | None, lookup_policy: str | None) -> b
     if entry_policy is None or lookup_policy is None:
         return False
     return entry_policy in _COMMITTED_CACHE_POLICIES and lookup_policy in _COMMITTED_CACHE_POLICIES
+
+
+def _row_carries_generation_state(row: sqlite3.Row) -> bool:
+    """Whether a manifest row holds its entry's final logits and hidden.
+
+    The bank stamps ``mtp_full`` on a row exactly when the entry it writes
+    has both (``SessionBank._cold_enqueue_job``, ``run_live_ref_spill``); a
+    lease returned at a boundary has no logits for its last position and is
+    written without it. Unreadable capabilities count as carrying them, as
+    ``_shadowed_by_resident_duplicate`` assumes a maximal row.
+    """
+
+    try:
+        capabilities = {str(item) for item in json.loads(str(row["capabilities_json"] or "[]"))}
+    except Exception:
+        return True
+    return "mtp_full" in capabilities

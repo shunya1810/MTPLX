@@ -1662,6 +1662,20 @@ def _resolve_mtp_history_policy(requested_policy: str, prompt_tokens: int) -> st
     return "last_window" if int(prompt_tokens) >= threshold else "committed"
 
 
+def bank_history_policy_family() -> str:
+    """``cycle`` or ``committed``: the history family an MTP runtime banks under.
+
+    ``restore_or_prefill_prompt_state`` resolves the operator's
+    ``MTPLX_MTP_HISTORY_POLICY`` over the requested ``committed`` and runs its
+    own bank lookups and prompt store under that answer, so every other store,
+    lookup and fingerprint of the runtime has to name the same family, or the
+    conversation saved at the end of a turn is never found by the next one.
+    ``last_window`` and ``auto`` keep the committed history cache, and the bank
+    treats them as ``committed``.
+    """
+    return "cycle" if _resolve_mtp_history_policy("committed", 0) == "cycle" else "committed"
+
+
 #: Per-chunk prefill timings for the most recent chunked prompt prefill.
 #: Written on BOTH A/B arms (the scope below is entered unconditionally) and
 #: read by the PR #391 harness abba_driver.py.  Bounded and replaced wholesale at
@@ -4396,11 +4410,11 @@ class GenerationFinalState:
     prompt_boundary_logits: Any | None = None
     prompt_boundary_hidden: Any | None = None
     prompt_boundary_extra_state: dict[str, Any] | None = None
-    # GDN boundary records of the prompt this generation decoded from
-    # (captured by its prefill or inherited from the restored entry). They
-    # describe token prefixes of the prompt, so they stay valid for the
-    # generation-final entry, whose tokens extend the prompt.
-    prompt_gdn_boundaries: list[Any] | None = None
+    # The prompt's recurrent checkpoints (``PromptState.gdn_boundaries``):
+    # records at positions inside the prompt describe a prefix of the final
+    # history too, so the generation-final commit can bank them. When the
+    # admission skips the prompt-prefix commit, no other entry carries them.
+    prompt_gdn_boundaries: tuple = ()
 
 
 def _finish_reason_from_tokens(
@@ -5370,22 +5384,32 @@ def _restore_near_prefix_prompt_state(
     _candidates_kwargs: dict[str, Any] = {}
     if getattr(session_bank, "SUPPORTS_NEAR_PREFIX_MIN_RESTORE", False):
         _candidates_kwargs["min_restore_tokens"] = int(min_restore_tokens)
-    for entry, matched in candidates(
-        match_ids if image_keyed else prompt_ids,
-        max_token_gap=max_gap,
-        min_matched_tokens=min_match,
-        **_candidates_kwargs,
-        block_size=block_size,
-        block_min_matched_tokens=block_min_match,
-        allow_block_prefix=block_prefix_enabled,
-        model_path=str(rt.model_path),
-        mtp_enabled=bool(rt.mtp_enabled),
-        hidden_variant=base_hidden_variant,
-        template_hash=template_hash,
-        mtp_history_policy=mtp_history_policy,
-        draft_head_identity=draft_head_identity,
-        policy_fingerprint=policy_fingerprint,
-    ):
+    # Taken off the list as each one is tried, so a refused candidate is not
+    # held while a later one's suffix prefill runs: the cold tier decodes its
+    # best row into a candidate before this lane can refuse it (5.4 GB on
+    # 2026-10-09, refused as a whole prefix, held through a 54K-token prefill
+    # that the memory guard then stopped). The untried rest go before that
+    # prefill too.
+    pending = list(
+        candidates(
+            match_ids if image_keyed else prompt_ids,
+            max_token_gap=max_gap,
+            min_matched_tokens=min_match,
+            **_candidates_kwargs,
+            block_size=block_size,
+            block_min_matched_tokens=block_min_match,
+            allow_block_prefix=block_prefix_enabled,
+            model_path=str(rt.model_path),
+            mtp_enabled=bool(rt.mtp_enabled),
+            hidden_variant=base_hidden_variant,
+            template_hash=template_hash,
+            mtp_history_policy=mtp_history_policy,
+            draft_head_identity=draft_head_identity,
+            policy_fingerprint=policy_fingerprint,
+        )
+    )
+    while pending:
+        entry, matched = pending.pop(0)
         _check_postcommit_abort(abort_check)
         candidates_seen += 1
         matched = int(matched)
@@ -5661,10 +5685,13 @@ def _restore_near_prefix_prompt_state(
                 pass
             suffix = list(prompt_ids[restore_point:])
             if boundary_restore and not suffix:
-                # A boundary restore has no seed logits; decode cannot start from
-                # an empty suffix. (Only reachable when a boundary coincides with
-                # a fully-contained prompt — fall through to other candidates.)
-                continue
+                boundary_logits = getattr(entry, "boundary_logits", None)
+                if boundary_logits is None or int(boundary_logits[0]) != restore_point:
+                    # A boundary restore has no seed logits; decode cannot start from
+                    # an empty suffix. (Only reachable when a boundary coincides with
+                    # a fully-contained prompt — fall through to other candidates.)
+                    continue
+                logits = boundary_logits[1][:, None]
             inherited_boundaries = _inherited_gdn_boundaries(
                 entry,
                 restore_point,
@@ -5765,6 +5792,15 @@ def _restore_near_prefix_prompt_state(
                 served_truth["released_entry_bytes"] = int(
                     session_bank.release_restored_entry(entry, session_id=session_id)
                 )
+            # This candidate is served: no later one will be tried.
+            pending.clear()
+            # A candidate the SSD tier decoded is this request's own copy, and
+            # its state now sits in ``cache`` (the restore cloned it up to the
+            # restore point): let it go so the suffix prefill does not run next
+            # to a second copy. A RAM entry stays with the bank, which keeps
+            # its hits.
+            banked = None if ssd_cache_hit else entry
+            entry = None
             suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
                 _prefill_restored_prompt_suffix(
                     rt,
@@ -5787,8 +5823,9 @@ def _restore_near_prefix_prompt_state(
                     plan_ids=prompt_ids,
                 )
             )
-            entry.hits += 1
-            entry.last_access_s = time.time()
+            if banked is not None:
+                banked.hits += 1
+                banked.last_access_s = time.time()
             served = True
             return PromptState(
                 trunk_cache=cache,
@@ -7156,6 +7193,18 @@ def restore_or_prefill_prompt_state(
                     "prefill_compute_tok_s": compute_tok_s,
                     "prefill_wall_tok_s": wall_tok_s,
                     "cache_hit": bool(state.cache_hit),
+                    # The cache outcome as the request's stats will report
+                    # it, so a request cancelled during decode can still say
+                    # where its prompt came from.
+                    "cache_source": state.cache_source,
+                    "cache_miss_reason": state.cache_miss_reason,
+                    "ssd_cache_hit": bool(state.ssd_cache_hit),
+                    "ssd_cached_tokens": int(state.ssd_cached_tokens),
+                    "ssd_restore_s": float(state.ssd_restore_s),
+                    "ssd_suffix_tokens": new_tokens if state.ssd_cache_hit else 0,
+                    "session_restore_served": dict(
+                        getattr(state, "restore_served", None) or {}
+                    ),
                 }
             )
         except Exception:
@@ -7193,6 +7242,38 @@ def restore_or_prefill_prompt_state(
                     )
         except Exception:
             exact_prefix_len = 0
+        # With no exact prefix in RAM, an SSD entry that is a whole prefix of
+        # the prompt (a session the bank spilled) is the exact lane's to
+        # serve: session_bank.restore() reads it back (ssd_clone). The near
+        # lane cannot serve it (it needs matched < prefix_len), so it is the
+        # floor that lane must beat. Without it the near lane hydrated the
+        # spilled entry, refused it, and served a RAM neighbour that shares
+        # only the system prompt: 2026-10-09, a 58,529-token turn restored
+        # 4,019 tokens and re-read the rest (143 s) while its own 57,989
+        # tokens sat on disk, and held the hydrated copy (5.4 GB) through
+        # that prefill.
+        near_restore_floor = exact_prefix_len
+        if exact_prefix_len == 0:
+            try:
+                cold_exact_prefix_len = getattr(
+                    session_bank, "cold_exact_prefix_len", None
+                )
+                if callable(cold_exact_prefix_len):
+                    near_restore_floor = int(
+                        cold_exact_prefix_len(
+                            bank_match_ids,
+                            model_path=str(rt.model_path),
+                            mtp_enabled=bool(rt.mtp_enabled),
+                            hidden_variant=base_hidden_variant,
+                            template_hash=template_hash,
+                            mtp_history_policy=mtp_history_policy,
+                            draft_head_identity=draft_head_identity,
+                            policy_fingerprint=policy_fingerprint,
+                        )
+                        or 0
+                    )
+            except Exception:
+                near_restore_floor = 0
 
         tried_larger_near_prefix = False
         # Image prompts take the near/block-prefix lanes in their content-keyed
@@ -7242,7 +7323,7 @@ def restore_or_prefill_prompt_state(
                 template_hash=template_hash,
                 draft_head_identity=draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
-                min_restore_tokens=exact_prefix_len,
+                min_restore_tokens=near_restore_floor,
                 allow_block_prefix=allow_block_prefix,
                 abort_check=abort_check,
                 chunk_callback=prefill_callback,
@@ -7279,6 +7360,19 @@ def restore_or_prefill_prompt_state(
             cache_factory=restore_cache_factory,
         )
         restore_elapsed_s = time.perf_counter() - restore_started
+        if (
+            restored is not None
+            and restored.mtp_history_cache is None
+            and _mtp_history_uses_committed_cache(mtp_history_policy)
+        ):
+            # The entry matched but holds no draft history to resume from, so
+            # this turn prefills cold: report that, not the server's default
+            # new_session (2.12.2 hid #591 behind that label).
+            session_bank.last_miss_reason = "no_snapshot_coverage"
+            if isinstance(getattr(session_bank, "last_prefix_diagnostic", None), dict):
+                session_bank.last_prefix_diagnostic["miss_reason"] = (
+                    "missing_committed_mtp_history"
+                )
         if restored is not None and (
             not _mtp_history_uses_committed_cache(mtp_history_policy)
             or restored.mtp_history_cache is not None
@@ -9565,6 +9659,109 @@ def score_prompt_logprobs(
     }
 
 
+def _commit_ar_prompt_state(
+    rt: MTPLXRuntime,
+    prompt_ids: list[int],
+    prompt_state: PromptState,
+    *,
+    session_bank: Any,
+    session_id: str,
+    template_hash: str | None,
+    draft_head_identity: str | None,
+    policy_fingerprint: str | None,
+) -> dict[str, object]:
+    """Bank a plain-decoding prompt before its answer decodes, as generate_mtpk does.
+
+    The next turn of a conversation shares this prompt and then differs where
+    the answer starts (the client sends it back without its reasoning, or
+    renders a tool call its own way). On a hybrid model it can only resume at
+    a recurrent checkpoint, and the plain-decoding lane left none at the
+    prompt's end: its prefill store skips suffixes under the store-on-prefill
+    floor (1,024 tokens), so every follow-up resumed at the last turn that
+    reached it and read up to that much again. The one-copy store banks a
+    lease on the live cache plus a recurrent anchor at the prompt's end, so
+    the answer decoding into the same buffers is never restored under this
+    prefix; a copying store banks a snapshot, never a live reference to a
+    cache the decode is about to change. Identity is what the lane's own
+    lookup asks for: the trunk-only history and the contract's hidden variant.
+    """
+
+    started = time.perf_counter()
+    snapshot_done = started
+    try:
+        boundaries = list(getattr(prompt_state, "gdn_boundaries", None) or [])
+        committed_mtp_cache = prompt_state.committed_mtp_cache
+        if one_copy_runtime(rt):
+            bank_fields = prompt_lease_fields(
+                prompt_state.trunk_cache,
+                committed_mtp_cache=committed_mtp_cache,
+                hidden=prompt_state.hidden,
+                prompt_len=len(prompt_ids),
+                boundaries=boundaries,
+                runtime=rt,
+            )
+        else:
+            bank_fields = {
+                "keep_live_ref": False,
+                "mtp_history_snapshot": (
+                    snapshot_cache(committed_mtp_cache)
+                    if committed_mtp_cache is not None
+                    else None
+                ),
+                "mtp_history_cache_ref": None,
+                "gdn_boundaries": boundaries,
+            }
+        snapshot_done = time.perf_counter()
+        put_timing: dict[str, object] = {}
+        entry = session_bank.put(
+            runtime=rt,
+            token_ids=list(prompt_ids),
+            cache=prompt_state.trunk_cache,
+            logits=prompt_state.logits,
+            hidden=prompt_state.hidden,
+            hidden_variant=_resolve_runtime_base_hidden_variant(rt, None),
+            session_id=session_id,
+            template_hash=template_hash,
+            mtp_history_policy=prompt_state.mtp_history_policy,
+            draft_head_identity=draft_head_identity,
+            policy_fingerprint=policy_fingerprint,
+            snapshot_epoch=len(prompt_ids),
+            mtp_snapshot_epoch=(
+                len(prompt_ids) if committed_mtp_cache is not None else None
+            ),
+            timing_out=put_timing,
+            **bank_fields,
+        )
+        put_done = time.perf_counter()
+        return {
+            "stored": entry is not None,
+            "mode": "prompt_prefix",
+            "reason": (
+                "committed_prompt_prefix"
+                if entry is not None
+                else "sessionbank_snapshot_skipped"
+            ),
+            "prefix_len": int(entry.prefix_len if entry is not None else len(prompt_ids)),
+            "nbytes": int(entry.nbytes if entry is not None else 0),
+            "elapsed_s": put_done - started,
+            "mtp_snapshot_elapsed_s": snapshot_done - started,
+            "put_elapsed_s": put_done - snapshot_done,
+            "put_timing": put_timing,
+            "cached_tokens": int(prompt_state.cached_tokens),
+            "suffix_tokens": int(prompt_state.suffix_tokens),
+        }
+    except Exception as exc:
+        # Like the prefill store beside it: a failed commit costs the next
+        # turn its resume point, never this answer. The request log says why.
+        return {
+            "stored": False,
+            "mode": "prompt_prefix",
+            "reason": f"prompt_prefix_commit_error:{type(exc).__name__}",
+            "elapsed_s": time.perf_counter() - started,
+            "mtp_snapshot_elapsed_s": max(0.0, snapshot_done - started),
+        }
+
+
 def generate_ar(
     rt: MTPLXRuntime,
     prompt_ids: list[int],
@@ -9591,6 +9788,7 @@ def generate_ar(
     abort_check: Callable[[], bool] | None = None,
     first_token_logprobs_top_k: int | None = None,
     store_prefix_snapshot: bool | None = None,
+    commit_prompt_state_to_bank: bool = False,
 ) -> GenerationOutput:
     reject_non_k1_a3b_whole_moe_request(rt, entrypoint="generate_ar")
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
@@ -9656,6 +9854,36 @@ def generate_ar(
         store_prefix_snapshot=store_prefix_snapshot,
     )
     prompt_state_total_time_s = time.perf_counter() - _prompt_state_started
+    # The prompt-prefix commit generate_mtpk makes, under the same conditions:
+    # without it a follow-up whose history differs where this answer starts
+    # resumes at an older checkpoint (_commit_ar_prompt_state).
+    prompt_prefix_bank_commit: dict[str, object] = {}
+    if (
+        commit_prompt_state_to_bank
+        and session_bank is not None
+        and session_id is not None
+        and prompt_ids
+        and (
+            int(prompt_state.suffix_tokens) > 0
+            # An identical prompt took its conversation's only copy as a
+            # lease: banked again before the answer decodes into it, so a
+            # cancelled answer leaves the conversation where it was.
+            or (
+                one_copy_runtime(rt)
+                and str(prompt_state.restore_mode).endswith("reference_lease")
+            )
+        )
+    ):
+        prompt_prefix_bank_commit = _commit_ar_prompt_state(
+            rt,
+            prompt_ids,
+            prompt_state,
+            session_bank=session_bank,
+            session_id=session_id,
+            template_hash=session_template_hash,
+            draft_head_identity=session_draft_head_identity,
+            policy_fingerprint=session_policy_fingerprint,
+        )
     cache = prompt_state.trunk_cache
     logits = prompt_state.logits
     prompt_eval_time = prompt_state.prompt_eval_time_s
@@ -9994,9 +10222,7 @@ def generate_ar(
                 safe_to_commit=True,
                 finish_reason=finish_reason,
                 mtp_history_policy=prompt_state.mtp_history_policy,
-                prompt_gdn_boundaries=list(
-                    getattr(prompt_state, "gdn_boundaries", None) or []
-                ),
+                prompt_gdn_boundaries=tuple(prompt_state.gdn_boundaries or ()),
             )
         except Exception as exc:  # capture only — never lose a finished response
             final_state = None
@@ -10061,6 +10287,7 @@ def generate_ar(
         session_prefill_store=dict(
             getattr(prompt_state, "prefill_store_snapshot", None) or {}
         ),
+        session_prompt_prefix_bank_commit=prompt_prefix_bank_commit,
         session_restore_served=dict(
             getattr(prompt_state, "restore_served", None) or {}
         ),
@@ -11447,7 +11674,7 @@ def generate_mtpk(
             # cancelled answer leaves the conversation where it was.
             or (
                 one_copy_runtime(rt)
-                and str(prompt_state.restore_mode) == "reference_lease"
+                and str(prompt_state.restore_mode).endswith("reference_lease")
             )
         )
     ):
@@ -17483,9 +17710,7 @@ def generate_mtpk(
             # and the bank must hand the next turn a base that matches the
             # committed cache it stores.
             mtp_history_position_base=int(mtp_history_position_base),
-            prompt_gdn_boundaries=list(
-                getattr(prompt_state, "gdn_boundaries", None) or []
-            ),
+            prompt_gdn_boundaries=tuple(prompt_state.gdn_boundaries or ()),
         )
     reject_path_counts, repair_time_by_reject_depth = _reject_repair_breakdown(events)
     _forkev_snapshot: dict[str, object] = {}

@@ -507,6 +507,47 @@ IMPLICIT_SESSION_SOURCES = frozenset(
     {"longest_prefix", "pending_postcommit_near_prefix", "common_prefix_reuse"}
 )
 
+# Claude Code stamps its parent session id on every request, including the
+# side requests it runs next to the main turn. A busy session named this way
+# forks like an inferred one instead of answering 409, unless its holder was
+# cancelled (then it is the same conversation coming back, and it waits).
+FORK_WHEN_BUSY_SESSION_SOURCES = frozenset({"header.x-claude-code-session-id"})
+
+
+# x-claude-code-request-class values that are the conversation itself (see
+# EngineSessionManager._claude_code_side_request).
+_CLAUDE_CODE_CONVERSATION_REQUEST_CLASSES = frozenset(
+    {"main", "subagent", "workflow", "compaction"}
+)
+
+
+# OpenCode 2.x request kinds, passed by MTPLX's plugin as
+# x-mtplx-request-kind (see EngineSessionManager._opencode_side_request).
+# Every other kind (primary, compaction) is the conversation.
+_OPENCODE_SIDE_REQUEST_KINDS = frozenset({"title"})
+
+
+def _is_opencode_request(lowered_headers: Mapping[str, Any]) -> bool:
+    """Per-request evidence that OpenCode sent this request."""
+    if str(lowered_headers.get("x-mtplx-client") or "").strip().lower() == "opencode":
+        return True
+    if any(str(key).startswith("x-opencode-") for key in lowered_headers):
+        return True
+    return "opencode" in str(lowered_headers.get("user-agent") or "").lower()
+
+
+def _claude_code_session_id(session_id: str, lowered_headers: Mapping[str, Any]) -> str:
+    """Give each Claude Code subagent its own session.
+
+    Subagent requests carry the parent's x-claude-code-session-id plus their
+    own x-claude-code-agent-id (claude-cli 2.1.287); the parent's requests
+    carry no agent id. A subagent is a separate conversation, so sharing the
+    parent's session would answer 409 to parallel subagents and move the
+    parent's cached frontier to the subagent's history.
+    """
+    agent_id = str(lowered_headers.get("x-claude-code-agent-id") or "").strip()
+    return f"{session_id}:agent:{agent_id}" if agent_id else session_id
+
 # common_prefix_reuse thresholds: adopt an existing session's identity when
 # no exact prefix matches but a session shares at least this much committed
 # prefix with the incoming prompt. Two unrelated conversations essentially
@@ -1032,6 +1073,10 @@ class EngineSession:
         # Where best_common_prefix_session last adopted this session at a
         # token-boundary seam (diagnostics only).
         self.last_seam_reuse_at: int | None = None
+        # Where each of those turns' generated tokens ended (prompt length ->
+        # committed length): a client's rendering of a turn can diverge from
+        # what this session generated anywhere inside it (#624).
+        self.turn_generated_ends: dict[int, int] = {}
         self.in_flight = False
         self.in_flight_started_s: float | None = None
         self.last_commit_s: float | None = None
@@ -1226,6 +1271,15 @@ class EngineSession:
         if record is None:
             return {"aborted": False, "reason": "no_pending"}
         cancelled = record.abort(reason)
+        if cancelled:
+            # Cancelled before it started: the scheduler skips the job, so it
+            # never finishes its own record. Left here, the record read as
+            # pending for the session's life and every later admission
+            # aborted it again (#640: "count": 262 such records per request).
+            self.finish_pending_postcommit(
+                record,
+                {"stored": False, "mode": "cancelled_before_start", "reason": str(reason)},
+            )
         return {
             "aborted": True,
             "reason": str(reason),
@@ -1742,8 +1796,8 @@ class EngineSession:
         # assistant turn. Aborted/cancelled/error finishes stay refused.
         if finish_reason not in {"stop", "length", "tool_calls"}:
             return EngineSessionCommit(False, f"unsafe_finish:{finish_reason}", self.prefix_len)
-        self.note_turn_prompt_len(len(prompt_ids))
         tokens = tuple(int(token) for token in prompt_ids) + tuple(int(token) for token in generated_ids)
+        self.note_turn_prompt_len(len(prompt_ids), generated_end=len(tokens))
         self.committed_token_ids = tokens
         self.last_commit_s = time.time()
         self.last_finish_reason = finish_reason
@@ -1889,14 +1943,23 @@ class EngineSession:
         self.touch()
         return boundary
 
-    def note_turn_prompt_len(self, prompt_len: int) -> None:
-        """Record the prompt length a turn generated from (#446 identity)."""
+    def note_turn_prompt_len(self, prompt_len: int, generated_end: int | None = None) -> None:
+        """Record the prompt length a turn generated from (#446 identity), and
+        where its generated tokens ended when the turn committed them (#624)."""
         prompt_len = int(prompt_len)
-        if prompt_len <= 0 or prompt_len in self.turn_prompt_lens:
+        if prompt_len <= 0:
+            return
+        if generated_end is not None and int(generated_end) > prompt_len:
+            self.turn_generated_ends[prompt_len] = max(
+                int(generated_end), self.turn_generated_ends.get(prompt_len, 0)
+            )
+        if prompt_len in self.turn_prompt_lens:
             return
         self.turn_prompt_lens.append(prompt_len)
         overflow = len(self.turn_prompt_lens) - _TURN_PROMPT_LENS_MAX
         if overflow > 0:
+            for dropped in self.turn_prompt_lens[:overflow]:
+                self.turn_generated_ends.pop(dropped, None)
             del self.turn_prompt_lens[:overflow]
 
     def turn_boundary_at(self, common_prefix: int) -> int | None:
@@ -1904,11 +1967,19 @@ class EngineSession:
 
         The match may run up to the probe window past the boundary: a chat
         template can repeat the generation prompt's tail (``<think>``) in the
-        rendered history before the streamed reasoning diverges from it.
+        rendered history before the streamed reasoning diverges from it. It
+        may also end anywhere inside the tokens the turn generated: the
+        client resends that turn as text and the template's rendering of it
+        can differ from the generated stream deep inside (96 tokens in, at a
+        tool-call block, in #624). A match that ends past the generated
+        tokens, inside a message the client wrote, is not this rule's.
         """
         common_prefix = int(common_prefix)
         for prompt_len in reversed(self.turn_prompt_lens):
             if prompt_len <= common_prefix <= prompt_len + _COMMON_PREFIX_PROBE_TOKENS:
+                return prompt_len
+            generated_end = self.turn_generated_ends.get(prompt_len, 0)
+            if prompt_len <= common_prefix < generated_end:
                 return prompt_len
         return None
 
@@ -2130,12 +2201,46 @@ class EngineSessionManager:
             # on-wire prompt shrank at r4/r8/r9 and prefix identity churned).
             "x-session-affinity",
             "x-session-id",
+            # Claude Code (CLI and Agent SDK) stamps every /v1/messages
+            # request with its session id; without it a Claude Code agent is
+            # found by prompt inference only, which loses the session when
+            # the agent compacts its history.
+            "x-claude-code-session-id",
             "x-openwebui-chat-id",
             "x-openwebui-user-id",
         ):
             value = lowered_headers.get(key)
             if str(value or "").strip():
-                return str(value).strip(), f"header.{key}"
+                session_id = str(value).strip()
+                if key == "x-claude-code-session-id":
+                    session_id = _claude_code_session_id(session_id, lowered_headers)
+                    side_reason = self._claude_code_side_request(
+                        session_id, prompt_ids, lowered_headers
+                    )
+                    if side_reason is not None:
+                        if diagnostic_out is not None:
+                            diagnostic_out["claude_code_side_request"] = {
+                                "named_session_id": session_id,
+                                "reason": side_reason,
+                            }
+                        continue
+                elif _is_opencode_request(lowered_headers):
+                    side_reason = self._opencode_side_request(
+                        session_id, prompt_ids, lowered_headers
+                    )
+                    if side_reason is not None:
+                        if diagnostic_out is not None:
+                            diagnostic_out["opencode_side_request"] = {
+                                "named_session_id": session_id,
+                                "header": key,
+                                "reason": side_reason,
+                            }
+                        # OpenCode stamps the same id under several of these
+                        # headers (x-session-affinity, X-Session-Id and the
+                        # plugin's x-mtplx-session-id): a side request leaves
+                        # the header lookup instead of falling to an alias.
+                        break
+                return session_id, f"header.{key}"
         for key in ("session_id", "mtplx_session_id", "chat_id", "conversation_id"):
             value = metadata.get(key)
             if value:
@@ -2290,6 +2395,103 @@ class EngineSessionManager:
             result["marathon_protected_count"] = len(protected)
         return result
 
+    def _claude_code_side_request(
+        self,
+        session_id: str,
+        prompt_ids: list[int] | tuple[int, ...] | None,
+        lowered_headers: Mapping[str, Any],
+    ) -> str | None:
+        """Why a request named into a Claude Code conversation is not that
+        conversation, or None when it is.
+
+        Claude Code stamps its session id on its side requests too (the
+        session title, the auto-mode safety classifier, the Bash command
+        prefix check). Their prompts share nothing with the conversation's.
+        Taking the conversation's session would replace its committed stream,
+        which the next turn's reasoning re-insertion and token splice read,
+        and abort its pending commit.
+
+        Claude Code names the request class itself in
+        x-claude-code-request-class when CLAUDE_CODE_GATEWAY_HINT_HEADERS=1
+        (2.1.273 on; off by default for a custom endpoint): ``auxiliary`` is
+        a side request, ``main``, ``subagent``, ``workflow`` and
+        ``compaction`` belong to the conversation. Without the header, a
+        request that does not share the conversation's first
+        _COMMON_PREFIX_REUSE_MIN_TOKENS tokens (its system prompt and tool
+        contract) is resolved by its own prompt, as it was before the header
+        was read. A compacted or rewound conversation keeps those tokens, so
+        it keeps its session; a session shorter than that has nothing to
+        protect and is taken as before.
+        """
+        request_class = (
+            str(lowered_headers.get("x-claude-code-request-class") or "")
+            .strip()
+            .lower()
+        )
+        if request_class == "auxiliary":
+            return "request_class_auxiliary"
+        if request_class in _CLAUDE_CODE_CONVERSATION_REQUEST_CLASSES:
+            return None
+        if not prompt_ids:
+            return None
+        session = self.peek(session_id)
+        if session is None:
+            return None
+        return self._outside_conversation_prefix(session, prompt_ids)
+
+    @staticmethod
+    def _outside_conversation_prefix(
+        session: "EngineSession",
+        prompt_ids: list[int] | tuple[int, ...],
+    ) -> str | None:
+        """The side-request reason when ``prompt_ids`` does not open with the
+        first _COMMON_PREFIX_REUSE_MIN_TOKENS tokens ``session`` committed
+        (its system prompt and tool contract), else None. A session shorter
+        than that has nothing to protect."""
+        committed = session.committed_token_ids
+        span = _COMMON_PREFIX_REUSE_MIN_TOKENS
+        if len(committed) < span:
+            return None
+        if tuple(int(token) for token in prompt_ids[:span]) == committed[:span]:
+            return None
+        return "prompt_does_not_share_the_conversation_prefix"
+
+    def _opencode_side_request(
+        self,
+        session_id: str,
+        prompt_ids: list[int] | tuple[int, ...] | None,
+        lowered_headers: Mapping[str, Any],
+    ) -> str | None:
+        """Why an OpenCode request named into a conversation is not that
+        conversation, or None when it is.
+
+        OpenCode 2.x stamps the conversation's id (x-session-affinity,
+        X-Session-Id, x-opencode-session) on every request of a session,
+        including the title request it sends beside each turn. On 3 Nov the
+        title won the race to the named session: the user's 18,348-token
+        turn got HTTP 409 and the title replaced the conversation's live
+        cache, so the retry re-read 9,465 tokens (7 s to first token). The
+        server answers recognised title prompts without the model before
+        this point. Here only OpenCode's own word counts: MTPLX's plugin
+        passes the request kind, and ``title`` is a side request. A prompt
+        comparison is not used for OpenCode: an agent with a short system
+        prompt has generated reasoning inside the conversation's first
+        4,096 committed tokens, which the client's resent history does not
+        carry until the session's canonicalization restores it, so the
+        comparison would move a real follow-up off its own session.
+        """
+        del session_id, prompt_ids
+        kind = str(lowered_headers.get("x-mtplx-request-kind") or "").strip().lower()
+        if kind in _OPENCODE_SIDE_REQUEST_KINDS:
+            return f"request_kind_{kind}"
+        return None
+
+    def _begin_on_fresh_anon_session(self, cancel_event: Any | None) -> EngineSession:
+        while True:
+            fresh = self.get_or_create(_new_anon_session_id())
+            if fresh.try_begin_generation(cancel_event=cancel_event):
+                return fresh
+
     @contextmanager
     def generation_slot(
         self,
@@ -2321,7 +2523,14 @@ class EngineSessionManager:
                     "disabled",
                 }:
                     handoff_out.update(handoff)
-                if not handoff.get("acquired"):
+                if handoff.get("acquired"):
+                    pass
+                elif (
+                    str(source or "") in FORK_WHEN_BUSY_SESSION_SOURCES
+                    and handoff.get("outcome") == "holder_not_cancelled"
+                ):
+                    acquired = self._begin_on_fresh_anon_session(cancel_event)
+                else:
                     detail = f"session {session.session_id} is already in flight"
                     if handoff.get("outcome") == "timeout":
                         detail += (
@@ -2330,10 +2539,7 @@ class EngineSessionManager:
                         )
                     raise EngineSessionBusy(detail)
             else:
-                while True:
-                    acquired = self.get_or_create(_new_anon_session_id())
-                    if acquired.try_begin_generation(cancel_event=cancel_event):
-                        break
+                acquired = self._begin_on_fresh_anon_session(cancel_event)
         try:
             yield acquired
         finally:

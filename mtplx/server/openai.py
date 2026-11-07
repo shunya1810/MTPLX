@@ -69,7 +69,7 @@ from fastapi.responses import (
     Response,
     StreamingResponse,
 )
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from mtplx import progress_heartbeat
 from mtplx.a3b_mtp_batch import (
@@ -141,6 +141,7 @@ from mtplx.constrained import (
 # (mtplx.errors, shared with the generation's optional allocations).
 from mtplx.errors import is_allocation_failure as _is_allocation_failure
 from mtplx.errors import is_gpu_display_abort as _is_gpu_display_abort
+from mtplx.errors import is_resource_count_failure as _is_resource_count_failure
 from mtplx.gemma4_pair import (
     GEMMA4_BACKEND,
     gemma4_pair_sampler_defaults,
@@ -1137,6 +1138,16 @@ def _server_runtime_env_overrides(
                 # The tail also requires the fused gate+up owners, so the
                 # MTPLX_FUSED_GATE_UP kill switch drops it with them.
                 lane_defaults.append("MTPLX_QWEN4_M4_STAGE3")
+            # --no-load-mtp and --stock-ar load no MTP head, and the loader
+            # refuses a draft-head gate without one ("relaxed Qwen4 draft
+            # ties require native MTP"): plain decoding of the pack, the
+            # fallback on GPUs where speculative rounds lose (#400), could
+            # not boot.
+            mtp_head_loads = bool(getattr(args, "load_mtp", True))
+            if not mtp_head_loads:
+                lane_defaults = [
+                    key for key in lane_defaults if key not in _QWEN4_MTP_HEAD_LANE_KEYS
+                ]
             for key in lane_defaults:
                 if os.environ.get(key) is None:
                     overrides.setdefault(key, "1")
@@ -1189,7 +1200,7 @@ def _server_runtime_env_overrides(
             # rows-gather engage floor and under MTPLX_QSA_GATHER=0.
             if os.environ.get("MTPLX_QSA_GATHER_MAX_ROWS") is None:
                 overrides.setdefault("MTPLX_QSA_GATHER_MAX_ROWS", "32")
-            if _served_model_lm_head_is_q8_g64(args):
+            if mtp_head_loads and _served_model_lm_head_is_q8_g64(args):
                 if os.environ.get("MTPLX_FRSPEC_DRAFT") is None:
                     overrides.setdefault("MTPLX_FRSPEC_DRAFT", "1")
                 if (
@@ -1408,6 +1419,17 @@ _QWEN4_LANE_KEYS = _QWEN4_PORT_KEYS + (
     "MTPLX_FRSPEC_DRAFT",
     "MTPLX_FRSPEC_VOCAB",
     "MTPLX_QSA_GATHER_MAX_ROWS",
+)
+# Lane defaults the model loader consumes only together with the native MTP
+# head (runtime.load: the relaxed draft-tie reader and the compiled draft-head
+# preparation), so they are stamped only when the head loads. The FR-Spec draft
+# head and the two draft readers that follow it are gated the same way where
+# they are stamped.
+_QWEN4_MTP_HEAD_LANE_KEYS = frozenset(
+    {
+        "MTPLX_QWEN4_COMPILED_MTP_PREPARE",
+        "MTPLX_QWEN4_RELAXED_DRAFT_TIES",
+    }
 )
 
 
@@ -1877,6 +1899,14 @@ def _order_tool_results_by_calls(messages: list[ChatMessage]) -> list[ChatMessag
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+    # Set by the Anthropic conversion only. Pydantic does not read a private
+    # attribute from client JSON, so a body field of the same name is ignored.
+    _auto_mode_classifier: bool = PrivateAttr(default=False)
+
+    @property
+    def auto_mode_classifier(self) -> bool:
+        return self._auto_mode_classifier
+
     model: str | None = None
     messages: list[ChatMessage] = Field(default_factory=list)
     max_tokens: int | None = None
@@ -2240,6 +2270,7 @@ class AnthropicMessagesRequest(BaseModel):
     tool_choice: Any = None
     thinking: Any | None = None
     chat_template_kwargs: dict[str, Any] | None = None
+    output_config: Any | None = None
     depth: int | None = None
     draft_block_size: int | None = None
     gemma_draft_block_size: int | None = None
@@ -3320,6 +3351,22 @@ def _validate_mtp_batch_settings(args: argparse.Namespace) -> None:
                 "requires scheduler_mode=mtp_batch"
             )
         return
+    # The family first: mtp_batch is the Qwen 3.6 35B-A3B service, and on a
+    # Flash-Next pack the flag list below asked for target_prefix, which the
+    # family coerces back to batched, so the refusal repeated whatever the
+    # user set. An unreadable folder keeps the checks below; the load
+    # validates the architecture exactly (a3b_mtp_batch._validate_config).
+    config = _served_model_config(args)
+    model_type = (
+        str(config.get("model_type") or "").strip().lower() if config is not None else ""
+    )
+    if model_type and model_type != "qwen3_5_moe":
+        raise A3BMTPBatchInstallError(
+            "--scheduler-mode mtp_batch serves the Qwen 3.6 35B-A3B packs only, and "
+            f"this model is {model_type}. Remove --scheduler-mode mtp_batch and its "
+            "settings (--mtp-batch-numerics, --verify-strategy target_prefix); the "
+            "default scheduler serves one request at a time and queues the rest."
+        )
     required = (
         (str(getattr(args, "generation_mode", "")) == "mtp", "generation_mode=mtp"),
         (bool(getattr(args, "load_mtp", False)), "load_mtp=true"),
@@ -5295,6 +5342,12 @@ class _BatchedARGenerationService:
                                 "prefill_compute_tok_s": prefill_tok_s,
                                 "prefill_wall_tok_s": prefill_tok_s,
                                 "cache_hit": bool(job.session_cache_hit),
+                                "cache_source": job.cache_source,
+                                "cache_miss_reason": job.cache_miss_reason,
+                                "ssd_cache_hit": bool(job.ssd_cache_hit),
+                                "ssd_cached_tokens": int(job.ssd_cached_tokens),
+                                "ssd_restore_s": float(job.ssd_restore_s),
+                                "ssd_suffix_tokens": int(job.ssd_suffix_tokens),
                                 "scheduler_lane": "ar_batch",
                                 "request_id": job.request_id,
                             }
@@ -5426,13 +5479,27 @@ def _is_localhost_bind(host: str | None) -> bool:
     return str(host or "").strip().lower().strip("[]") in LOCALHOST_BINDS
 
 
+# What a keyless non-localhost bind is refused with, and how to opt out (#491).
+NETWORK_KEY_REQUIRED_MESSAGE = (
+    "--api-key or --api-key-file is required when --host is not localhost; "
+    "on a network you trust, --no-auth --trust-network serves without a key"
+)
+
+
+def keyless_network_bind_allowed(args: Any) -> bool:
+    """A non-localhost bind may serve without a key only on both opt-ins."""
+    return bool(getattr(args, "no_auth", False)) and bool(
+        getattr(args, "trust_network", False)
+    )
+
+
 def validate_server_security_args(args: argparse.Namespace) -> None:
-    if not _is_localhost_bind(getattr(args, "host", None)) and not getattr(
-        args, "api_key", None
+    if (
+        not _is_localhost_bind(getattr(args, "host", None))
+        and not getattr(args, "api_key", None)
+        and not keyless_network_bind_allowed(args)
     ):
-        raise SystemExit(
-            "--api-key or --api-key-file is required when --host is not localhost"
-        )
+        raise SystemExit(NETWORK_KEY_REQUIRED_MESSAGE)
     if int(getattr(args, "stream_interval", 1)) < 1:
         raise SystemExit("--stream-interval must be >= 1")
     if int(getattr(args, "rate_limit", 0)) < 0:
@@ -6716,6 +6783,31 @@ def _anthropic_disable_parallel_tool_use(tool_choice: Any) -> bool | None:
     return bool(raw)
 
 
+# Claude Code sends output_config.effort in Anthropic's vocabulary, which has
+# "max" and "none"; the chat-template vocabulary has neither. "high" is left
+# out on purpose: it is what Claude Code sends when the user never picked a
+# level, so it keeps the server's default instead of standing for a choice.
+# Qwen 3.8 has no "high" and maps it up to xhigh, which on the dense models
+# would replace their measured medium default (51.5 s against 314.9 s for the
+# same coding task, descriptors.py) on every default Claude Code turn.
+_ANTHROPIC_EFFORT_TO_REASONING_EFFORT = {
+    "low": "low",
+    "medium": "medium",
+    "xhigh": "xhigh",
+    "max": "xhigh",
+    "none": "low",
+}
+
+
+def _anthropic_output_config_effort(output_config: Any) -> str | None:
+    if not isinstance(output_config, dict):
+        return None
+    effort = output_config.get("effort")
+    if not isinstance(effort, str):
+        return None
+    return _ANTHROPIC_EFFORT_TO_REASONING_EFFORT.get(effort.strip().lower())
+
+
 def _anthropic_to_chat_request(
     request: AnthropicMessagesRequest,
 ) -> ChatCompletionRequest:
@@ -6738,6 +6830,10 @@ def _anthropic_to_chat_request(
     requested_effort = getattr(request, "reasoning_effort", None)
     if isinstance(requested_effort, str) and requested_effort.strip():
         extra_fields["reasoning_effort"] = requested_effort.strip()
+    else:
+        output_config_effort = _anthropic_output_config_effort(request.output_config)
+        if output_config_effort:
+            extra_fields["reasoning_effort"] = output_config_effort
     disable_parallel = _anthropic_disable_parallel_tool_use(request.tool_choice)
     chat_request = ChatCompletionRequest(
         model=request.model,
@@ -6766,7 +6862,52 @@ def _anthropic_to_chat_request(
         # own bridges but record the defaulting for observability instead of
         # rejecting (a 400 here would break those bridges).
         chat_request.anthropic_max_tokens_defaulted = True
+    # Claude Code's auto-mode safety classifier. The policy turns thinking
+    # off for it, because it needs only a verdict.
+    chat_request._auto_mode_classifier = _claude_code_auto_mode_classifier(
+        request, system_text
+    )
     return chat_request
+
+
+# The first sentence of the system prompt of Claude Code's auto-mode safety
+# classifier, in both of its stages (claude-cli 2.1.201).
+_CLAUDE_CODE_CLASSIFIER_SYSTEM_START = (
+    "You are a security monitor for autonomous AI coding agents."
+)
+
+
+def _anthropic_system_has_billing_block(system: Any) -> bool:
+    """Whether the system carries Claude Code's x-anthropic-billing-header line."""
+    blocks = system if isinstance(system, list) else [system]
+    for block in blocks:
+        if any(
+            line.strip().lower().startswith("x-anthropic-billing-header:")
+            for line in _anthropic_content_to_text([block]).splitlines()
+        ):
+            return True
+    return False
+
+
+def _claude_code_auto_mode_classifier(
+    request: AnthropicMessagesRequest, system_text: str
+) -> bool:
+    """Whether a /v1/messages request is Claude Code's auto-mode safety classifier.
+
+    The classifier wants a verdict and is written for a model without extended
+    thinking: it sends no ``thinking`` field, which on the Anthropic API means
+    thinking off, while this server thinks by default. Thinking first pushed
+    the verdict past Claude Code's classifier deadline (#669). Turning thinking
+    off changes generation, so only the classifier's exact shape matches:
+    Claude Code's billing block, a system prompt that begins with the
+    classifier's first sentence, no tools, no stream, and no thinking choice of
+    the client's own.
+    """
+    if request.tools or request.stream or request.thinking is not None:
+        return False
+    if not system_text.startswith(_CLAUDE_CODE_CLASSIFIER_SYSTEM_START):
+        return False
+    return _anthropic_system_has_billing_block(request.system)
 
 
 def _anthropic_tool_input_from_arguments(arguments: Any) -> dict[str, Any]:
@@ -7294,6 +7435,39 @@ _ORPHAN_TOOL_MARKUP_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _CODE_FENCE_SPAN_RE = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)
+
+
+# ---- opt-out for the no-tools markup strip -------------------------------
+# Leave tool-call markup in the reply even when the request declares no
+# tools, and skip the "no tools are active" notice. For a client that parses
+# the reply as its own text protocol (#674), where the markup is the command,
+# not dead syntax. Default off (strip + notice, for the app chat: #160, #349).
+# The operator sets MTPLX_KEEP_ORPHAN_TOOL_MARKUP=on for every request; a
+# client sets it for its own requests with the x-mtplx-keep-tool-markup header
+# or a "keep_orphan_tool_markup": true body or metadata field, so it needs no
+# access to the server's environment.
+_KEEP_TOOL_MARKUP_HEADER = "x-mtplx-keep-tool-markup"
+_KEEP_TOOL_MARKUP_FIELD = "keep_orphan_tool_markup"
+_KEEP_TOOL_MARKUP_ON = {"1", "true", "yes", "on"}
+
+
+def _keep_orphan_tool_markup(
+    request: Any = None,
+    headers: Mapping[str, str] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> bool:
+    def on(value: Any) -> bool:
+        return value is True or str(value or "").strip().lower() in _KEEP_TOOL_MARKUP_ON
+
+    if on(os.environ.get("MTPLX_KEEP_ORPHAN_TOOL_MARKUP")):
+        return True
+    if headers is not None and on(headers.get(_KEEP_TOOL_MARKUP_HEADER)):
+        return True
+    extra = getattr(request, "model_extra", None) or {}
+    if on(extra.get(_KEEP_TOOL_MARKUP_FIELD)):
+        return True
+    return bool(metadata) and on(metadata.get(_KEEP_TOOL_MARKUP_FIELD))
+# ---- end opt-out --------------------------------------------------------
 
 
 def _strip_orphan_tool_markup(text: str) -> tuple[str, int]:
@@ -8448,7 +8622,21 @@ def _tool_example_value(schema: Any) -> str:
 def _tool_call_example(tools: list[dict[str, Any]]) -> str:
     if not tools:
         return "<tool_call>\n<function=tool_name>\n</function>\n</tool_call>"
-    tool = tools[0]
+    # Models copy this example (#170, the <string> wrappers). In compact mode
+    # (OpenCode's) the chat template is given no tools, so it is also the only
+    # place the prompt shows how a parameter is written. Built from a first
+    # tool that takes no parameters, it showed none, and after a screenshot
+    # the model wrote values as "<parameter=290>" (#584). Use the first tool
+    # that has parameters; the example is unchanged whenever the first does.
+    tool = next(
+        (
+            candidate
+            for candidate in tools
+            if isinstance(_tool_json_schema(candidate).get("properties"), dict)
+            and _tool_json_schema(candidate)["properties"]
+        ),
+        tools[0],
+    )
     name = _tool_spec_name(tool) or "tool_name"
     schema = _tool_json_schema(tool)
     properties = schema.get("properties")
@@ -16943,6 +17131,10 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
         reread = rereads.pop(str(record["request_id"]))
         if reread is not None:
             record.setdefault("reread", reread)
+        # Only a cancellation reads its prefill outcome; let it go here.
+        outcomes = getattr(state.dashboard, "prefill_outcomes", None)
+        if outcomes is not None:
+            outcomes.pop(str(record["request_id"]))
     safe = _json_safe(record)
     # Warmup generations (startup pass and the idle background ladder) are
     # not user requests: keep them out of the RAM ring that feeds the
@@ -17046,19 +17238,47 @@ def _strip_client_injected_output_cap(
     *,
     headers: Mapping[str, str],
     metadata: Mapping[str, Any],
+    context_window: int | None = None,
 ) -> tuple[int | None, bool]:
-    """Strip exactly hermes's injected default cap for hermes-hinted requests.
+    """Strip exactly a client's injected default cap for that client's requests.
 
-    Same contract as the OpenCode plugin's 32,000 strip and Pi's
-    request-policy extension: MTPLX owns the uncapped generation contract for
-    the known client-injected value, while any other value is a deliberate
-    client choice and passes through untouched.
+    hermes-agent sends 65,536 when its user set no cap. OpenCode sends
+    ``min(limit.output, 32,000)`` with every request, and MTPLX writes
+    ``limit.output`` as its reply reserve (``opencode_output_limit``: half
+    the window, at most 32,000). OpenCode 1.x let the session-headers
+    plugin strip that value in ``chat.params``; OpenCode 2.x no longer calls
+    that hook, so without this rule every 2.x answer stopped at 32,000
+    tokens (an xhigh answer runs past that). An answer cap the user asked
+    MTPLX for (--max-response-tokens) rides along as the model's
+    x-mtplx-max-response-tokens header and replaces the stripped value, as
+    the plugin did. Same contract as Pi's request-policy extension: MTPLX
+    owns the uncapped generation contract for the known client-injected
+    value, while any other value is a deliberate client choice and passes
+    through untouched.
     """
 
     if request_max_tokens == _HERMES_INJECTED_DEFAULT_MAX_TOKENS and _is_hermes_client(
         headers=headers, metadata=metadata
     ):
         return None, True
+    if request_max_tokens is not None and _is_opencode_client(
+        headers=headers, metadata=metadata
+    ):
+        from mtplx.opencode import (
+            OPENCODE_INJECTED_OUTPUT_CAP,
+            OPENCODE_REQUESTED_OUTPUT_HEADER,
+            opencode_output_limit,
+        )
+
+        injected = {OPENCODE_INJECTED_OUTPUT_CAP}
+        if context_window and int(context_window) > 0:
+            injected.add(opencode_output_limit(int(context_window)))
+        if int(request_max_tokens) in injected:
+            try:
+                requested = int(str(headers.get(OPENCODE_REQUESTED_OUTPUT_HEADER) or "").strip())
+            except ValueError:
+                requested = 0
+            return (requested if requested > 0 else None), True
     return request_max_tokens, False
 
 
@@ -17070,34 +17290,87 @@ def _request_max_tokens(request: BaseModel) -> int | None:
     return None if alias is None else int(alias)
 
 
-def _is_opencode_title_request(request: ChatCompletionRequest) -> bool:
+# The system message of OpenCode's title agent: each tuple is one release
+# line's prompt, matched when all of its phrases appear. 1.x: "You are a
+# title generator ...". 2.x (2.2.3 to 2.2.5 checked): "You name
+# conversations so the user can find them later in a list of past
+# sessions", sent beside the first turn and again during the conversation.
+_OPENCODE_TITLE_SYSTEM_MARKERS = (
+    ("You are a title generator", "Generate a brief title", "Never use tools"),
+    ("You name conversations so the user can find them later",),
+)
+# MTPLX's OpenCode plugin passes OpenCode 2.x's own request kind.
+_OPENCODE_REQUEST_KIND_HEADER = "x-mtplx-request-kind"
+# The 1.x prompt is matched on its own, as before 2.12.3. The 2.x phrase is
+# short enough for another client's custom title prompt to share it (an Open
+# WebUI title prompt asking for JSON, for example), so it and the kind header
+# count only on a request that carries per-request OpenCode evidence.
+_OPENCODE_TITLE_SYSTEM_MARKERS_ANY_CLIENT = _OPENCODE_TITLE_SYSTEM_MARKERS[:1]
+
+
+def _is_opencode_title_request(
+    request: ChatCompletionRequest,
+    headers: Mapping[str, str] | None = None,
+) -> bool:
     """Detect OpenCode's auxiliary thread-title call.
 
-    OpenCode sends this beside the real coding request. Letting the 27B model
+    OpenCode sends this beside the real coding request. Letting the model
     spend seconds on a cosmetic title blocks the single model-owner lane and
     makes users stare at "Thinking..." before their actual request starts.
-    This fast path only handles the exact title-generator prompt shape and
-    never touches normal user chat/tool requests.
+    Under OpenCode 2.x it also arrived under the conversation's own session
+    id, so it took the conversation's session: the user's turn got HTTP 409
+    and the title replaced the conversation's live cache (3 Nov: a 7 s
+    re-read of 9,465 tokens). This fast path only handles the title agent's
+    prompt shape, or a request MTPLX's plugin marks as OpenCode's title
+    kind, and never touches normal user chat or tool requests.
     """
     if request.tools or len(request.messages) < 2:
         return False
+    opencode = headers is not None and _is_opencode_client(
+        headers=headers, metadata=_request_metadata(request)
+    )
+    if opencode:
+        kind = str(headers.get(_OPENCODE_REQUEST_KIND_HEADER) or "").strip().lower()
+        if kind == "title":
+            return True
     first = request.messages[0]
     if str(first.role).lower() != "system":
         return False
     system_text = _content_to_text(first.content)
-    return (
-        "You are a title generator" in system_text
-        and "Generate a brief title" in system_text
-        and "Never use tools" in system_text
+    markers = (
+        _OPENCODE_TITLE_SYSTEM_MARKERS if opencode else _OPENCODE_TITLE_SYSTEM_MARKERS_ANY_CLIENT
     )
+    return any(all(phrase in system_text for phrase in phrases) for phrases in markers)
+
+
+def _opencode_title_subject(text: str) -> str:
+    """The conversation's original request inside an OpenCode title prompt.
+
+    OpenCode 2.x wraps it: "Here is the first message of the conversation:
+    <message>...</message>", or for an ongoing conversation "<conversation>
+    Original request: ... Recent conversation: User: ... </conversation>".
+    Titling from the original request keeps the title stable across the
+    conversation instead of following its latest message.
+    """
+    match = re.search(r"<message>\s*(.*?)\s*</message>", text, re.S)
+    if match:
+        return match.group(1)
+    match = re.search(
+        r"Original request:\s*(.*?)\s*(?:\n\s*\nRecent conversation:|</conversation>|\Z)",
+        text,
+        re.S,
+    )
+    if match:
+        return match.group(1)
+    return text
 
 
 def _opencode_fast_title(request: ChatCompletionRequest) -> str:
     user_text = ""
-    for message in reversed(request.messages):
+    for message in request.messages:
         if str(message.role).lower() != "user":
             continue
-        text = _content_to_text(message.content).strip()
+        text = _opencode_title_subject(_content_to_text(message.content)).strip()
         if not text or text.lower().startswith("generate a title"):
             continue
         user_text = text
@@ -18495,6 +18768,43 @@ def _dashboard_record_completion(
         _safe_stdout_print(f"[dashboard] record_completion suppressed error: {exc!r}")
 
 
+def _prefill_cache_outcome(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The cache outcome a completed prefill reports, in the request-log
+    field names and with the defaults ``_metrics_envelope`` applies, or None
+    when the event says nothing about the cache.
+
+    A request cancelled during decode never reaches its stats; its receipt
+    takes these fields instead.
+    """
+
+    hit = payload.get("session_cache_hit", payload.get("cache_hit"))
+    if hit is None:
+        return None
+    hit = bool(hit)
+    prompt_tokens = int(payload.get("tokens_total") or 0)
+    cached_tokens = int(payload.get("cached_tokens") or 0)
+    new_prefill_tokens = payload.get("new_prefill_tokens")
+    if new_prefill_tokens is None:
+        new_prefill_tokens = prompt_tokens - cached_tokens
+    outcome: dict[str, Any] = {
+        "session_cache_hit": hit,
+        "cached_tokens": cached_tokens,
+        "new_prefill_tokens": max(0, int(new_prefill_tokens)),
+        "cache_source": str(payload.get("cache_source") or ("ram" if hit else "none")),
+        "cache_miss_reason": None if hit else payload.get("cache_miss_reason"),
+        "ssd_cache_hit": bool(payload.get("ssd_cache_hit") or False),
+        "ssd_cached_tokens": int(payload.get("ssd_cached_tokens") or 0),
+        "ssd_restore_s": float(payload.get("ssd_restore_s") or 0.0),
+        "ssd_suffix_tokens": int(payload.get("ssd_suffix_tokens") or 0),
+    }
+    if isinstance(payload.get("prompt_eval_time_s"), (int, float)):
+        outcome["prompt_eval_time_s"] = float(payload["prompt_eval_time_s"])
+    served = payload.get("session_restore_served")
+    if isinstance(served, Mapping) and served:
+        outcome["session_restore_served"] = dict(served)
+    return outcome
+
+
 def _dashboard_publish_prefill(
     state: "ServerState",
     *,
@@ -18574,6 +18884,11 @@ def _dashboard_publish_prefill(
         # for the SSE stream.
         if enriched.get("phase") == "completed":
             dashboard.in_flight.update_prefill(request_id, None)
+            outcome = _prefill_cache_outcome(enriched)
+            if outcome is not None:
+                dashboard.prefill_outcomes.put(request_id, outcome)
+            # Kept for the receipt only; the live view has no use for it.
+            enriched.pop("session_restore_served", None)
         else:
             dashboard.in_flight.update_prefill(request_id, enriched)
         dashboard.bus.publish({"kind": "prefill", "when_s": time.time(), **enriched})
@@ -20233,10 +20548,112 @@ def _shed_after_allocation_failure(state: "ServerState") -> dict[str, Any]:
     return receipt
 
 
+def _shed_after_resource_count_failure(state: ServerState) -> dict[str, Any]:
+    """Let go of arrays after Metal's live-buffer limit refused one; never raises.
+
+    The count is of buffer objects, not bytes: halving the bank's byte budget
+    took nothing from a bank under that half, and MLX empties its own cache
+    of free buffers before it raises (#640). So every conversation that is
+    not generating gives up its saved state (``release_idle_sessions``: the
+    ones the SSD already holds first; they restore from there). A session in
+    flight, the failing request's included, keeps everything.
+    """
+
+    receipt: dict[str, Any] = {
+        "action": "resource_count_shed",
+        "released_sessions": [],
+        "released_entries": 0,
+        "released_bytes": 0,
+    }
+    sessions = getattr(state, "sessions", None)
+    bank = getattr(sessions, "bank", None)
+    try:
+        keep = _in_flight_session_ids(state)
+        release = getattr(sessions, "release_idle_sessions", None)
+        if callable(release):
+            try:
+                released = release(None, keep_session_ids=keep, reason="resource_count_failure")
+            except Exception as exc:
+                # The release ran; a queued job it could not cancel still
+                # holds its entry. Report what left, then the failure.
+                released = getattr(exc, "receipt", None)
+                if not isinstance(released, dict):
+                    raise
+                receipt["release_error"] = repr(exc)
+                _note_guard_health(state, where="resource_count_shed", error=exc)
+            receipt["released_sessions"] = sorted(
+                str(row.get("session_id"))
+                for row in released.get("sessions") or []
+                if isinstance(row, dict)
+            )
+            receipt["released_entries"] = int(released.get("entries") or 0)
+            receipt["released_bytes"] = int(released.get("held_bytes") or 0)
+        elif bank is not None:
+            receipt["released_entries"] = bank.shrink_to_bytes(
+                0, reason="resource_count_failure", protect_session_ids=keep
+            )
+        if bank is not None:
+            receipt["bank_entries_after"] = len(bank)
+            receipt["bank_bytes_after"] = int(bank.total_nbytes)
+        if "release_error" not in receipt:
+            _note_guard_health(state, where="resource_count_shed", error=None)
+    except Exception as exc:
+        receipt["release_error"] = repr(exc)
+        receipt["guard_degraded"] = True
+        _note_guard_health(state, where="resource_count_shed", error=exc)
+    try:
+        import mlx.core as _mx
+
+        _mx.clear_cache()
+        receipt["cache_cleared"] = True
+    except Exception:
+        receipt["cache_cleared"] = False
+    _record_guard_event(state, receipt)
+    try:
+        print("[mtplx] memory guard " + json.dumps(receipt), flush=True)
+    except Exception:
+        pass
+    return receipt
+
+
+def _resource_count_failure_http_exception(
+    state: ServerState, exc: BaseException
+) -> HTTPException:
+    """The 507 for Metal's live-buffer limit, after the count shed."""
+
+    receipt = _shed_after_resource_count_failure(state)
+    released = int(receipt.get("released_entries") or 0)
+    conversations = len(receipt.get("released_sessions") or ()) or released
+    if released > 0:
+        outcome = (
+            f"The engine released the saved state of {conversations} idle "
+            f"{'conversation' if conversations == 1 else 'conversations'} "
+            "(those on the SSD cache restore from it) and stays up; this "
+            "request failed and a retry can succeed."
+        )
+    else:
+        outcome = (
+            "No idle conversation held saved state to release, so the engine "
+            "itself holds the buffers; this request failed. Restart the "
+            "engine to recover (in the app, Stop and Start; on the command "
+            "line, restart mtplx serve)."
+        )
+    return HTTPException(
+        status_code=507,
+        detail=(
+            "the request reached the GPU's limit on live buffers "
+            f"({exc}). This limit counts buffer objects, and it is not a "
+            f"shortage of memory. {outcome}"
+        ),
+    )
+
+
 def _allocation_failure_http_exception(
     state: "ServerState", exc: BaseException
 ) -> HTTPException:
     """Shed caches, then turn the raw allocator error into an honest 507."""
+    if _is_resource_count_failure(exc):
+        return _resource_count_failure_http_exception(state, exc)
     _shed_after_allocation_failure(state)
     plan = getattr(state, "memory_plan", None)
     advice = "Reduce --context-window, close other apps, or try q8 KV quantization."
@@ -25435,10 +25852,18 @@ def _commit_prompt_prefix_for_request(
     if not prompt_ids:
         return False
     tier = getattr(state, "session_bank_cold_tier", None)
-    if tier is None or not bool(getattr(tier, "enabled", False)):
-        return False
-    min_prefix_tokens = int(getattr(tier, "min_prefix_tokens", 512) or 512)
-    return len(prompt_ids) >= max(512, min_prefix_tokens)
+    if tier is not None and bool(getattr(tier, "enabled", False)):
+        min_prefix_tokens = int(getattr(tier, "min_prefix_tokens", 512) or 512)
+        return len(prompt_ids) >= max(512, min_prefix_tokens)
+    # Without the SSD tier a copying store skips this commit for plain chat:
+    # it would snapshot views the answer's first decode write then copies.
+    # The one-copy store banks the prompt as a lease plus one recurrent anchor
+    # and copies nothing, and that anchor is where the next turn resumes when
+    # the client sends the answer back without its reasoning (the history
+    # diverges where the assistant turn starts). Skipping it left every
+    # follow-up at the first turn's prompt, re-reading one more answer each
+    # turn (#291, with --ssd-session-cache off).
+    return one_copy_runtime(getattr(state, "runtime", None)) and len(prompt_ids) >= 512
 
 
 def _anonymous_coding_agent_tool_request(
@@ -26543,10 +26968,25 @@ def _record_stream_cancellation_metric(
         "server_tok_s": partial_tok_s,
         "partial_decode_tok_s": partial_tok_s,
         "partial_request_tok_s": partial_tok_s,
-        "session_cache_hit": False,
+        # Unknown until the prefill completes: None, not a miss.
+        "session_cache_hit": None,
+        "cached_tokens": None,
+        "new_prefill_tokens": None,
+        "cache_source": None,
         "cache_miss_reason": None,
+        "ttft_s": None,
     }
+    outcomes = getattr(getattr(state, "dashboard", None), "prefill_outcomes", None)
+    outcome = outcomes.pop(response_id) if outcomes is not None else None
+    if outcome is not None:
+        envelope.update(outcome)
     if token_times:
+        # As in _metrics_envelope: from the request's arrival to its first token.
+        received_s = request_observability.get("request_received_monotonic_s")
+        first_token_origin_s = (
+            float(received_s) if isinstance(received_s, (int, float)) else stream_started_s
+        )
+        envelope["ttft_s"] = max(0.0, token_times[0] - first_token_origin_s)
         envelope.update(_producer_gap_census(token_times))
         envelope["sliding_decode_tok_s_first_32"] = _token_window_rate_first(
             token_times, 32
@@ -26671,6 +27111,18 @@ def _record_stream_error_metric(
         "session_cache_hit": False,
         "cache_miss_reason": None,
     }
+    # The refusal's own verdict (why, and what would let a retry succeed)
+    # rides the receipt so the dashboard can say more than "507".
+    refusal = (
+        _http_exception_detail_payload(error)
+        if isinstance(error, HTTPException)
+        else None
+    )
+    memory = refusal.get("memory") if isinstance(refusal, dict) else None
+    if isinstance(memory, dict):
+        for key in ("refusal_reason", "retry_when", "retry_can_succeed"):
+            if memory.get(key) is not None:
+                envelope[key] = memory[key]
     if token_times:
         envelope.update(_producer_gap_census(token_times))
     # Allocator truth at failure time — for memory refusals this is the
@@ -26726,6 +27178,9 @@ def _request_observability(
         if key.lower()
         in {
             "x-mtplx-session-id",
+            "x-claude-code-session-id",
+            "x-claude-code-agent-id",
+            "x-claude-code-request-class",
             "x-openwebui-chat-id",
             "x-openwebui-user-id",
             "x-openwebui-task",
@@ -26920,6 +27375,12 @@ def _bank_history_policy(state: "ServerState") -> str:
     ``extra_state``; there is no committed MTP-history cache). Until PR #283
     every server put site banked Gemma 4 under the Qwen strings while the
     backend restored under its own, so no Gemma 4 turn ever restored warm.
+
+    An MTP runtime whose operator set ``MTPLX_MTP_HISTORY_POLICY`` to
+    ``cycle`` banks under ``cycle``: generation applies that override to the
+    policy it is handed (``generation.bank_history_policy_family``), and the
+    rest of the committed family (``last_window``, ``auto``) keeps
+    ``committed``, so nothing changes for anyone who did not ask for cycle.
     """
     declared = str(
         getattr(getattr(state, "backend_descriptor", None), "mtp_history_policy", "")
@@ -26928,7 +27389,16 @@ def _bank_history_policy(state: "ServerState") -> str:
     if declared and declared != "committed":
         return declared
     runtime = getattr(state, "runtime", None)
-    return "committed" if bool(getattr(runtime, "mtp_enabled", True)) else "cycle"
+    if not bool(getattr(runtime, "mtp_enabled", True)):
+        return "cycle"
+    # An MTP runtime under the operator's MTPLX_MTP_HISTORY_POLICY=cycle (the
+    # #400 workaround on M1 and M2): generation runs, looks up and stores its
+    # prompt under cycle, so the server's own stores and lookups must too.
+    # Labelled committed, the generation-final save was refused by the next
+    # turn's lookup and every turn read its whole prompt again (#422, M2 Ultra).
+    from mtplx.generation import bank_history_policy_family
+
+    return bank_history_policy_family()
 
 
 def _policy_fingerprint(
@@ -27013,6 +27483,12 @@ def _policy_fingerprint(
         # Old vision entries used dense attention, including their text
         # prefixes. They must not seed the corrected sparse model path.
         parts.append(f"vision_attention=mrope_qsa_v1:{int(vision_qsa_enabled())}")
+        # Entries stored before 2.12.3 may hold another conversation's pooled
+        # index keys: a restore from the SSD tier below an entry's end kept
+        # that entry's block count, and the next commit stored its blocks
+        # (#635). Such entries must not seed this build; the cold tier's LRU
+        # eviction reclaims them.
+        parts.append("qsa_pooled_index=v2")
     mtp_batch_lane = getattr(state, "mtp_batch_lane", None)
     if mtp_batch_lane is not None:
         parts.extend(
@@ -28487,7 +28963,8 @@ def _generation_final_bank_metadata(
     if committed_mtp_cache is not None and one_copy_runtime(state.runtime):
         # One-copy store: the draft head's history rides the lease by
         # reference, like the trunk; a snapshot here would be copied into the
-        # entry (session_bank live_ref_entry).
+        # entry (session_bank live_ref_entry). A put that keeps no live
+        # reference snapshots it there instead (SessionBank.put).
         return {
             "hidden_variant": (
                 "gemma4_pre_norm" if backend_id == GEMMA4_BACKEND else "post_norm"
@@ -28562,20 +29039,40 @@ def _generation_final_bank_values(
         "hidden": final_state.final_hidden,
         "extra_state": getattr(final_state, "extra_state", None),
     }
-    # The prompt's own GDN boundaries. Without them the bank can only borrow
-    # records from a stored entry that is a prefix of these tokens; once the
-    # prompt entry has been evicted (long prompts, where each entry is
-    # several GB), an entry banked after a boundary restore stored none, and
-    # the next request with the same prompt fell back to a cold prefill.
-    boundaries = list(getattr(final_state, "prompt_gdn_boundaries", None) or [])
-    prompt_len = len(prompt_ids)
-    if boundaries and list(final_token_ids[:prompt_len]) == [
-        int(token) for token in prompt_ids
-    ]:
-        values["gdn_boundaries"] = [
-            record for record in boundaries if int(record[0]) <= prompt_len
-        ]
+    boundaries = _generation_final_prompt_boundaries(
+        final_state, prompt_ids=prompt_ids, final_token_ids=values["token_ids"]
+    )
+    if boundaries:
+        values["gdn_boundaries"] = boundaries
     return values
+
+
+def _generation_final_prompt_boundaries(
+    final_state: Any,
+    *,
+    prompt_ids: Sequence[int],
+    final_token_ids: Sequence[int],
+) -> list[Any]:
+    """The prompt's recurrent checkpoints that the final history shares.
+
+    A checkpoint at position p is the recurrent state after the first p
+    tokens, so it stays valid for any history that starts with those tokens.
+    The prompt-prefix commit used to be the only entry that carried the
+    prefill's checkpoints; when the admission skips it (a cold prefill near
+    the memory line), the generation-final entry had none, put() found no
+    donor, and the checkpoints were lost: every later restore below the
+    previous prompt's end fell back to whatever older entry still had one.
+    """
+
+    records = list(getattr(final_state, "prompt_gdn_boundaries", None) or ())
+    if not records:
+        return []
+    shared = 0
+    for prompt_token, final_token in zip(prompt_ids, final_token_ids):
+        if int(prompt_token) != int(final_token):
+            break
+        shared += 1
+    return [record for record in records if 0 < int(record[0]) <= shared]
 
 
 def _store_generation_final_history_snapshot(
@@ -28655,11 +29152,16 @@ def _store_generation_final_history_snapshot(
         # was refused every time.
         _flight(state).pc(session_id, {"action": "generation_final", **outcome})
         return outcome
+    bank_token_ids = compatibility.get("token_ids") or prompt_ids
     bank_values = _generation_final_bank_values(
         state,
         final_state,
-        prompt_ids=prompt_ids,
-        final_token_ids=compatibility.get("token_ids") or prompt_ids,
+        # Both sides in the bank's view. For an image prompt the compatibility
+        # check returns content-keyed ids for prompt plus answer, the same
+        # length as the raw ids; compared with the raw prompt they parted at
+        # the first image pad and every checkpoint after it was dropped.
+        prompt_ids=bank_token_ids[: len(prompt_ids)],
+        final_token_ids=bank_token_ids,
     )
     token_ids = bank_values.pop("token_ids")
     lock_started = time.perf_counter()
@@ -31793,6 +32295,10 @@ def _run_generation(
     ttft_clock = request_spans.clock_from_observability(request_observability)
     if ttft_clock is not None:
         ttft_clock.mark("scheduler_queue")
+        # The serial scheduler queues a request before this function runs, so
+        # the generation lock below is uncontended. Report that queue time as
+        # lock wait, as the batched lanes already do with queue_wait_s.
+        lock_wait_time_s = ttft_clock.scheduler_queue_wait_s() or 0.0
         _owner = getattr(state, "model_scheduler", None)
         _receipt = (
             _owner.active_item_receipt()
@@ -31945,9 +32451,9 @@ def _run_generation(
                 mtp_depth=effective_depth,
                 prefill_chunk_tokens=prefill_chunk_tokens,
                 restore_mode=_session_bank_restore_mode(session_restore_mode),
-                commit_prompt_prefix=bool(
-                    commit_prompt_prefix_to_bank and effective_mode != "ar"
-                ),
+                # Both lanes commit the prompt before decoding into it, so the
+                # admission prices the commit for both.
+                commit_prompt_prefix=bool(commit_prompt_prefix_to_bank),
                 restore_identity=admission_restore_identity,
                 pricing=admission_pricing,
                 wide_prefill_rungs=wide_prefill_rungs,
@@ -32136,6 +32642,15 @@ def _run_generation(
                                 capture_final_state=session_bank is not None,
                                 abort_check=_prefill_abort_check,
                                 store_prefix_snapshot=store_prefix_snapshot,
+                                # The same prompt-prefix commit the MTP branch makes:
+                                # without it a follow-up that differs where the answer
+                                # starts resumed at the last 1,024-token prefill.
+                                commit_prompt_state_to_bank=(
+                                    commit_prompt_prefix_to_bank
+                                    and session_bank is not None
+                                    and session_id is not None
+                                    and not prompt_publish_skipped
+                                ),
                             )
                         else:
                             adaptive_policy = _make_adaptive_policy(
@@ -33690,6 +34205,8 @@ class _ThinkingContentStreamSplitter:
         suppress_orphan_tool_markup: bool = False,
         trim_visible_content_edges: bool = False,
         tool_names: Iterable[str] | None = None,
+        no_tools_declared: bool = False,
+        tool_markup_is_content: bool = False,
     ) -> None:
         # Live-SSE lanes only (stream/non-stream text parity): the
         # non-stream cleaner ends with a global strip(), so streamed
@@ -33708,6 +34225,11 @@ class _ThinkingContentStreamSplitter:
         # dead syntax the client cannot execute — suppress instead of
         # streaming raw XML to the user (#160).
         self._suppress_orphan_tool_markup = bool(suppress_orphan_tool_markup)
+        # No tools declared: nothing the model writes can be a call, whether
+        # its markup is stripped or kept as the client's text (#674).
+        self._no_tools_declared = bool(no_tools_declared) or self._suppress_orphan_tool_markup
+        # Kept markup is ordinary content: it gets no tool-marker trimming.
+        self._tool_markup_is_content = bool(tool_markup_is_content)
         self.suppressed_tool_markup_chars = 0
         self._orphan_in_span = False
         self._orphan_hold = ""
@@ -33810,7 +34332,9 @@ class _ThinkingContentStreamSplitter:
             if channel != "content" or not text:
                 out.append((channel, text))
                 continue
-            if text.lstrip().startswith(self._TOOL_CONTROL_MARKERS):
+            if not self._tool_markup_is_content and text.lstrip().startswith(
+                self._TOOL_CONTROL_MARKERS
+            ):
                 # The pre-tool separator ("...\n\n<tool_call>") rides at the
                 # head of the markup chunk; non-stream strips it, so drop it
                 # here too along with any held run. The markup itself passes
@@ -34110,7 +34634,7 @@ class _ThinkingContentStreamSplitter:
         be followed by a JSON object or a "<function=" element; a bare
         "<function=NAME>" must name a declared tool when the names are known.
         """
-        if self._suppress_orphan_tool_markup:
+        if self._no_tools_declared:
             # No tools declared: nothing the model writes can be a call.
             return "text"
         if self._think_line_has_text or self._think_fence_open:
@@ -34570,6 +35094,8 @@ def _stream_splitter_for_state(
     recover_unclosed_reasoning_as_content: bool = True,
     start_inside_thinking: bool = True,
     suppress_orphan_tool_markup: bool = False,
+    no_tools_declared: bool = False,
+    tool_markup_is_content: bool = False,
     tool_names: Iterable[str] | None = None,
 ) -> Any:
     parser = _reasoning_parser_for_state(state)
@@ -34580,6 +35106,8 @@ def _stream_splitter_for_state(
         recover_unclosed_reasoning_as_content=recover_unclosed_reasoning_as_content,
         start_inside_thinking=start_inside_thinking,
         suppress_orphan_tool_markup=suppress_orphan_tool_markup,
+        no_tools_declared=no_tools_declared,
+        tool_markup_is_content=tool_markup_is_content,
         trim_visible_content_edges=True,
         tool_names=tool_names,
     )
@@ -34613,6 +35141,28 @@ def _generated_text_attempts_tool_call(
     content = "".join(part for field, part in chunks if field == "content").lower()
     return any(
         marker in content
+        for marker in _ThinkingContentStreamSplitter._TOOL_CONTROL_MARKERS
+    )
+
+
+def _unclosed_reasoning_recovery_allowed(
+    *, finish_reason: str, tools_active: bool, generated_text: str
+) -> bool:
+    """Gate for surfacing an unclosed reasoning block as visible content.
+
+    Needs a natural stop (a ``length`` cut is not an answer). With tools
+    declared, every agent turn qualifies, so the turn must also hold no tool
+    markup: a call that opened inside the reasoning belongs to the tool
+    parser, not to the recovered text. A turn whose tool call parsed never
+    reaches the recovery, because the tool-call branch comes first.
+    """
+    if finish_reason != "stop":
+        return False
+    if not tools_active:
+        return True
+    lowered = generated_text.lower()
+    return not any(
+        marker in lowered
         for marker in _ThinkingContentStreamSplitter._TOOL_CONTROL_MARKERS
     )
 
@@ -34863,6 +35413,7 @@ def _chat_ui_html(
     server_url: str,
     api_key_required: bool,
     default_settings: dict[str, Any],
+    vision_input: bool = False,
 ) -> str:
     api_note = "API key required" if api_key_required else "local · no API key"
     depth_max = max(1, int(default_settings.get("depth_max", 3) or 3))
@@ -35267,6 +35818,25 @@ def _chat_ui_html(
     }
     #status-row.ready { color: var(--muted); }
     #status-row.streaming { color: var(--accent-strong); }
+    #status-row.error { color: var(--error); }
+    /* Images pasted or dropped into the composer, before they are sent */
+    #attachments { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 4px 8px; }
+    #attachments[hidden] { display: none; }
+    .attachment { position: relative; }
+    .attachment img {
+      display: block; height: 64px; max-width: 160px; object-fit: cover;
+      border: 1px solid var(--line); border-radius: 8px;
+    }
+    .attachment-remove {
+      position: absolute; top: -6px; right: -6px;
+      width: 20px; height: 20px; border-radius: 50%;
+      border: 1px solid var(--line); background: var(--surface); color: var(--text);
+      font-size: 13px; line-height: 1; cursor: pointer; padding: 0;
+    }
+    .turn-user .turn-image {
+      display: block; max-width: 100%; max-height: 320px;
+      margin-top: 8px; border-radius: 8px;
+    }
     #status-row .dot {
       width: 6px; height: 6px;
       border-radius: 50%;
@@ -35419,6 +35989,7 @@ def _chat_ui_html(
           <span id="live-stats"></span>
         </div>
         <form id="chat-form" autocomplete="off">
+          <div id="attachments" hidden></div>
           <div class="composer-box">
             <textarea id="prompt" placeholder="Message MTPLX (Enter to send · Shift+Enter for newline)" rows="1" autofocus></textarea>
             <button id="send" class="send-btn" type="submit" aria-label="Send">
@@ -35433,6 +36004,9 @@ def _chat_ui_html(
   <script>
     "use strict";
     const MODEL_ID = __MODEL_JSON__;
+    // Whether the served model has a vision tower (the /v1/models
+    // supports_vision answer); a text-only model gets no image parts.
+    const VISION_INPUT = __VISION_INPUT_JSON__;
     const messagesEl = document.getElementById("messages");
     const messagesInner = messagesEl.querySelector(".messages-inner");
     const messagesBottom = document.getElementById("messages-bottom");
@@ -35901,12 +36475,19 @@ def _chat_ui_html(
       statusText.textContent = text;
       statusRow.className = kind || "";
     }
-    function appendUser(text) {
+    function appendUser(text, images) {
       const node = document.createElement("div");
       node.className = "turn turn-user";
       const body = document.createElement("div");
       body.className = "turn-body";
       body.textContent = text;
+      for (const url of images || []) {
+        const img = document.createElement("img");
+        img.className = "turn-image";
+        img.alt = "attached image";
+        img.src = url;
+        body.appendChild(img);
+      }
       node.appendChild(body);
       messagesInner.appendChild(node);
       scheduleScrollToBottom();
@@ -36044,15 +36625,26 @@ def _chat_ui_html(
         sendBtn.setAttribute("aria-label", "Send");
       }
     }
-    async function sendMessage(text) {
+    // A user turn with images is sent as text and image_url parts, the shape
+    // agent clients use for screenshots; a text-only turn stays a string.
+    function userContent(text, images) {
+      if (!images.length) return text;
+      const parts = [];
+      if (text) parts.push({type: "text", text: text});
+      for (const url of images) parts.push({type: "image_url", image_url: {url: url}});
+      return parts;
+    }
+
+    async function sendMessage(text, images) {
+      const attached = Array.isArray(images) ? images : [];
       // Remove the greeting bubble on first send.
       const greeting = messagesInner.querySelector(".turn-greeting");
       if (greeting) greeting.remove();
 
       pinnedToBottom = true;
       forceAutoScroll = true;
-      appendUser(text);
-      history.push({role: "user", content: text});
+      appendUser(text, attached);
+      history.push({role: "user", content: userContent(text, attached)});
       const turn = appendAssistantTurn();
       scheduleScrollToBottom({force: true});
       setSendButton("stop");
@@ -36249,17 +36841,102 @@ def _chat_ui_html(
     }
     promptEl.addEventListener("input", autoResizePrompt);
 
+    // ---------- images: paste or drop into the composer --------------------
+    const attachmentsEl = document.getElementById("attachments");
+    const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+    const pendingImages = [];
+    let pendingReads = 0;
+    function renderAttachments() {
+      attachmentsEl.textContent = "";
+      attachmentsEl.hidden = pendingImages.length === 0;
+      pendingImages.forEach((image, index) => {
+        const chip = document.createElement("div");
+        chip.className = "attachment";
+        const img = document.createElement("img");
+        img.src = image.url;
+        img.alt = image.name;
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "attachment-remove";
+        remove.setAttribute("aria-label", "Remove image");
+        remove.textContent = "\u00d7";
+        remove.addEventListener("click", () => {
+          pendingImages.splice(index, 1);
+          renderAttachments();
+          promptEl.focus();
+        });
+        chip.appendChild(img);
+        chip.appendChild(remove);
+        attachmentsEl.appendChild(chip);
+      });
+    }
+    function addImageFiles(files) {
+      const images = files.filter((file) => file && String(file.type || "").startsWith("image/"));
+      if (!images.length) return 0;
+      if (!VISION_INPUT) {
+        setStatus("This model reads text only, so images are not sent", "error");
+        return images.length;
+      }
+      for (const file of images) {
+        if (file.size > MAX_IMAGE_BYTES) {
+          setStatus("That image is " + Math.round(file.size / 1048576) + " MB; the limit is 20 MB", "error");
+          continue;
+        }
+        pendingReads += 1;
+        const reader = new FileReader();
+        reader.onload = () => {
+          pendingImages.push({url: String(reader.result), name: file.name || "pasted image"});
+          renderAttachments();
+        };
+        reader.onerror = () => setStatus("Could not read that image", "error");
+        reader.onloadend = () => { pendingReads -= 1; };
+        reader.readAsDataURL(file);
+      }
+      return images.length;
+    }
+    promptEl.addEventListener("paste", (event) => {
+      const data = event.clipboardData;
+      if (!data) return;
+      const files = [];
+      for (const item of Array.from(data.items || [])) {
+        if (item.kind === "file") {
+          const file = item.getAsFile();
+          if (file) files.push(file);
+        }
+      }
+      // A screenshot carries no text: keep the image and paste nothing.
+      if (addImageFiles(files) > 0 && !data.getData("text/plain")) event.preventDefault();
+    });
+    form.addEventListener("dragover", (event) => {
+      if (event.dataTransfer && Array.from(event.dataTransfer.types || []).includes("Files")) {
+        event.preventDefault();
+      }
+    });
+    form.addEventListener("drop", (event) => {
+      const files = event.dataTransfer ? Array.from(event.dataTransfer.files || []) : [];
+      if (files.length) {
+        event.preventDefault();
+        addImageFiles(files);
+      }
+    });
+
     form.addEventListener("submit", (event) => {
       event.preventDefault();
       if (sendBtn.dataset.action === "stop") {
         if (activeAbort) activeAbort.abort();
         return;
       }
+      if (pendingReads > 0) {
+        setStatus("Still reading the image", "streaming");
+        return;
+      }
       const text = promptEl.value.trim();
-      if (!text) return;
+      if (!text && !pendingImages.length) return;
+      const images = pendingImages.splice(0).map((image) => image.url);
+      renderAttachments();
       promptEl.value = "";
       autoResizePrompt();
-      sendMessage(text);
+      sendMessage(text, images);
     });
     promptEl.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
@@ -36271,6 +36948,8 @@ def _chat_ui_html(
     newChatBtn.addEventListener("click", () => {
       if (activeAbort) activeAbort.abort();
       history.length = 0;
+      pendingImages.length = 0;
+      renderAttachments();
       messagesInner.innerHTML = '<div class="turn turn-assistant turn-greeting"><div class="avatar">M</div><div class="turn-body"><div class="answer"><p>New conversation. Settings on the left are unchanged.</p></div></div></div>';
       pinnedToBottom = true;
       forceAutoScroll = false;
@@ -36291,6 +36970,7 @@ def _chat_ui_html(
         .replace("__API_NOTE__", html.escape(api_note))
         .replace("__SERVER_URL__", html.escape(server_url))
         .replace("__MODEL_JSON__", json.dumps(model_id))
+        .replace("__VISION_INPUT_JSON__", json.dumps(bool(vision_input)))
         .replace(
             "__DEFAULT_SETTINGS_JSON__", json.dumps(default_settings, sort_keys=True)
         )
@@ -36986,6 +37666,7 @@ def create_app(state: ServerState) -> FastAPI:
                     "reasoning": str(getattr(state.args, "reasoning", None) or "auto"),
                     "system": "",
                 },
+                vision_input=_server_vision_spec(state) is not None,
             )
         )
 
@@ -38473,7 +39154,12 @@ def create_app(state: ServerState) -> FastAPI:
         metadata = _request_metadata(request)
         request_max_tokens, hermes_default_cap_stripped = (
             _strip_client_injected_output_cap(
-                _request_max_tokens(request), headers=headers, metadata=metadata
+                _request_max_tokens(request),
+                headers=headers,
+                metadata=metadata,
+                # The window OpenCode was configured from: the served one,
+                # not --context-window (0 when the server sizes it itself).
+                context_window=int(served_execution_window(state).get("tokens") or 0),
             )
         )
         requested_model = request.model
@@ -38510,7 +39196,7 @@ def create_app(state: ServerState) -> FastAPI:
             response_id, arrival=_arrival_s, handler_start=_handler_start_s
         )
         created = int(time.time())
-        if _is_opencode_title_request(request):
+        if _is_opencode_title_request(request, headers):
             return _opencode_title_response(
                 state,
                 request,
@@ -39063,7 +39749,11 @@ def create_app(state: ServerState) -> FastAPI:
         if reasoning_effort is not None:
             request_observability["resolved_reasoning_effort"] = reasoning_effort
         if hermes_default_cap_stripped:
-            request_observability["hermes_default_cap_stripped"] = True
+            # The client's own default cap was dropped (hermes 65,536,
+            # OpenCode's 32,000 reserve); the server's limits apply.
+            request_observability["client_default_cap_stripped"] = True
+            if _is_hermes_client(headers=headers, metadata=metadata):
+                request_observability["hermes_default_cap_stripped"] = True
         if transient_suffix_contract_active:
             if read_only_force_answer_contract_active:
                 _restore_policy_label = "stable_without_transient_force_answer"
@@ -39795,6 +40485,10 @@ def create_app(state: ServerState) -> FastAPI:
                 )
                 decoder = _IncrementalTokenDecoder(state.runtime.tokenizer)
 
+                keep_tool_markup = not tools_active and _keep_orphan_tool_markup(
+                    request, headers, metadata
+                )
+
                 def new_stream_splitter() -> Any:
                     return _stream_splitter_for_state(
                         state,
@@ -39803,7 +40497,14 @@ def create_app(state: ServerState) -> FastAPI:
                         start_inside_thinking=not aime_visible_working,
                         # No declared tools: raw tool-call XML must not stream
                         # to the user as visible content (#160).
-                        suppress_orphan_tool_markup=not tools_active,
+                        suppress_orphan_tool_markup=(
+                            not tools_active and not keep_tool_markup
+                        ),
+                        # Kept markup is still not a call: with no tools
+                        # declared nothing ends thinking, and the markup is
+                        # the client's own text, whitespace included (#674).
+                        no_tools_declared=not tools_active,
+                        tool_markup_is_content=keep_tool_markup,
                         # Declared names let the splitter tell a real call
                         # from tool markup the model is only quoting in its
                         # thinking.
@@ -42037,8 +42738,15 @@ def create_app(state: ServerState) -> FastAPI:
                                             ):
                                                 yield mark_sse_sent(chunk)
                                 recover_unclosed_reasoning = (
-                                    str(generated.get("finish_reason") or "") == "stop"
-                                    and not tools_active
+                                    _unclosed_reasoning_recovery_allowed(
+                                        finish_reason=str(
+                                            generated.get("finish_reason") or ""
+                                        ),
+                                        tools_active=tools_active,
+                                        generated_text=str(
+                                            generated.get("text") or ""
+                                        ),
+                                    )
                                 )
                                 for field, text in _finish_stream_splitter(
                                     splitter,
@@ -43142,11 +43850,15 @@ def create_app(state: ServerState) -> FastAPI:
                     suppress_visible_reasoning=suppress_visible_reasoning,
                     footer_allowed=_stats_footer_allowed(state, headers, metadata),
                     # Same gate as the streaming twin (#F3): recover only on a
-                    # natural stop with no tools declared. /v1/messages
-                    # inherits through chat_completions.
+                    # natural stop; with tools declared also only when the
+                    # turn holds no tool markup. /v1/messages inherits
+                    # through chat_completions.
                     recover_unclosed_reasoning=(
-                        str(generated.get("finish_reason") or "") == "stop"
-                        and not tools_active
+                        _unclosed_reasoning_recovery_allowed(
+                            finish_reason=str(generated.get("finish_reason") or ""),
+                            tools_active=tools_active,
+                            generated_text=str(generated.get("text") or ""),
+                        )
                     ),
                     suppress_stats_footer=request.suppress_stats_footer,
                 )
@@ -43157,9 +43869,15 @@ def create_app(state: ServerState) -> FastAPI:
                     # answer "look it up" prompts with raw
                     # <tool_call><function=web_search> XML in the app chat).
                     pre_strip_text = display_text
-                    display_text, orphan_blocks = _strip_orphan_tool_markup(
-                        display_text
-                    )
+                    if _keep_orphan_tool_markup(request, headers, metadata):
+                        # The client asked to keep raw protocol markup: it
+                        # parses the text itself, so nothing is dead syntax.
+                        display_text, orphan_blocks = display_text, 0
+                        generated["stats"]["raw_tool_markup_kept"] = True
+                    else:
+                        display_text, orphan_blocks = _strip_orphan_tool_markup(
+                            display_text
+                        )
                     if orphan_blocks:
                         generated["stats"]["raw_tool_markup_suppressed"] = True
                         generated["stats"]["orphan_tool_markup_blocks"] = int(
@@ -44560,8 +45278,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Serve without API-key auth even when MTPLX_API_KEY or a config "
-            "key is set. Localhost binds only — non-localhost still requires "
-            "a key (#235)."
+            "key is set (#235). A non-localhost bind also needs "
+            "--trust-network."
+        ),
+    )
+    parser.add_argument(
+        "--trust-network",
+        action="store_true",
+        help=(
+            "With --no-auth, serve without an API key on a non-localhost "
+            "bind. Anyone who can reach the port can use the model, so use "
+            "it only on a network you trust (#491)."
         ),
     )
     parser.add_argument(
@@ -45217,8 +45944,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.api_key_source = resolved_key.source
     if getattr(args, "no_auth", False):
         # #235: an explicit off-switch beats patching site-packages. The
-        # non-localhost guard downstream still refuses keyless remote binds,
-        # so this can only widen access on loopback.
+        # non-localhost guard downstream still refuses keyless remote binds
+        # unless --trust-network is given as well (#491).
         args.api_key = None
         args.api_key_source = "disabled_by_no_auth_flag"
     try:
@@ -45306,6 +46033,19 @@ def _refuse_unresolvable_retrieval_models(registry: Any) -> None:
     raise RetrievalError("\n".join(lines))
 
 
+def _startup_api_key_line(args: Any) -> str:
+    if getattr(args, "api_key", None):
+        return "API key: required"
+    if not _is_localhost_bind(getattr(args, "host", None)):
+        # Only reachable through --no-auth --trust-network (#491): say so
+        # where the operator reads the bind, not only in the help text.
+        return (
+            "API key: off (--no-auth --trust-network): anyone who can reach "
+            f"port {int(args.port)} can use the model"
+        )
+    return "API key: leave blank for localhost"
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     validate_server_security_args(args)
@@ -45338,7 +46078,11 @@ def main(argv: list[str] | None = None) -> None:
             _startup_line(
                 "Network OpenAI API Base URL: "
                 + network_url
-                + " (use from other devices and VM guests, with your API key)"
+                + (
+                    " (use from other devices and VM guests, with your API key)"
+                    if getattr(args, "api_key", None)
+                    else " (use from other devices and VM guests, no API key)"
+                )
             )
     else:
         _startup_line("Chat UI: " + chat_url)
@@ -45353,10 +46097,7 @@ def main(argv: list[str] | None = None) -> None:
         }[_reasoning_history_mode(state)]
         + f" (policy {getattr(args, 'preserve_thinking', 'auto')})"
     )
-    if getattr(args, "api_key", None):
-        _startup_line("API key: required")
-    else:
-        _startup_line("API key: leave blank for localhost")
+    _startup_line(_startup_api_key_line(args))
     _startup_line("Health check: " + _startup_server_url(args) + "/health")
     _startup_line("Keep this terminal open. Press Ctrl-C to stop MTPLX.")
     if args.server_console:

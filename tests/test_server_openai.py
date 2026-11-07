@@ -1617,6 +1617,47 @@ def test_long_prompt_commits_prompt_prefix_when_ssd_cache_is_enabled():
     )
 
 
+def test_one_copy_plain_chat_commits_its_prompt_without_the_ssd_cache(monkeypatch):
+    """#291 with --ssd-session-cache off: a client that sends the answer back
+    without its reasoning diverges where the assistant turn starts, so the
+    next turn resumes from the prompt's end anchor. The one-copy store banks
+    the prompt as a lease plus that anchor and copies nothing, so the commit
+    no longer waits for the SSD tier; a copying store still skips it."""
+
+    monkeypatch.delenv("MTPLX_ONE_COPY", raising=False)
+    one_copy = SimpleNamespace(qwen4_fixed_m4_compiled_verify=True)
+    copying = SimpleNamespace(qwen4_fixed_m4_compiled_verify=False)
+
+    assert openai._commit_prompt_prefix_for_request(
+        SimpleNamespace(session_bank_cold_tier=None, runtime=one_copy),
+        prompt_ids=list(range(512)),
+        tools_active=False,
+    )
+    assert openai._commit_prompt_prefix_for_request(
+        SimpleNamespace(
+            session_bank_cold_tier=SimpleNamespace(enabled=False), runtime=one_copy
+        ),
+        prompt_ids=list(range(4000)),
+        tools_active=False,
+    )
+    assert not openai._commit_prompt_prefix_for_request(
+        SimpleNamespace(session_bank_cold_tier=None, runtime=one_copy),
+        prompt_ids=list(range(511)),
+        tools_active=False,
+    )
+    assert not openai._commit_prompt_prefix_for_request(
+        SimpleNamespace(session_bank_cold_tier=None, runtime=copying),
+        prompt_ids=list(range(4000)),
+        tools_active=False,
+    )
+    monkeypatch.setenv("MTPLX_ONE_COPY", "0")
+    assert not openai._commit_prompt_prefix_for_request(
+        SimpleNamespace(session_bank_cold_tier=None, runtime=one_copy),
+        prompt_ids=list(range(4000)),
+        tools_active=False,
+    )
+
+
 def test_implicit_anonymous_sessions_do_not_keep_live_refs(monkeypatch):
     monkeypatch.delenv(
         "MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS",
@@ -5323,6 +5364,357 @@ def test_opencode_title_request_fast_path_does_not_enter_model(monkeypatch):
     assert state.last_metrics[-1]["request_max_tokens"] == 32000
 
 
+# OpenCode 2.x (2.2.3 to 2.2.5) rewrote its title agent's prompt and sends it
+# beside the first turn and again during the conversation, under the
+# conversation's own session id. The 1.x fast path no longer matched it, so
+# the title ran on the model and took the conversation's session (3 Nov).
+_OPENCODE_2_TITLE_SYSTEM = (
+    "You name conversations so the user can find them later in a list of past "
+    "sessions.\n\nYou will receive the first message of a conversation, or for an "
+    "ongoing conversation its original request and recent messages."
+)
+
+
+@pytest.mark.parametrize(
+    ("user_content", "expected"),
+    [
+        (
+            "Here is the first message of the conversation:\n\n<message>\n"
+            "make me a flappy bird game in one html file\n</message>\n\n"
+            "Reply with only the title.",
+            "make me a flappy bird game in one",
+        ),
+        (
+            "Here is the conversation so far:\n\n<conversation>\nOriginal request:\n"
+            "fix the snake speed bug in game.js\n\nRecent conversation:\nUser: "
+            "now make it prettier\n\nAssistant: Done.\n</conversation>\n\n"
+            "Reply with only the title.",
+            "fix the snake speed bug in game.js",
+        ),
+        (
+            "Here is the first message of the conversation:\n\n<message>\nhey\n"
+            "</message>\n\nReply with only the title.",
+            "Greeting",
+        ),
+    ],
+)
+def test_opencode_2_title_request_fast_path_does_not_enter_model(
+    monkeypatch, user_content, expected
+):
+    state = _fake_state()
+    client = TestClient(create_app(state))
+
+    def fail_generation(*_args, **_kwargs):
+        raise AssertionError("OpenCode title request should not enter generation")
+
+    monkeypatch.setattr(openai, "_run_generation", fail_generation)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={
+            "x-session-affinity": "ses_title_case",
+            "x-opencode-client": "desktop",
+            "User-Agent": "opencode/2.2.5",
+        },
+        json={
+            "model": "mtplx-test-model",
+            "stream": False,
+            "max_tokens": 32000,
+            "messages": [
+                {"role": "system", "content": _OPENCODE_2_TITLE_SYSTEM},
+                {"role": "user", "content": user_content},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == expected
+    assert state.last_metrics[-1]["opencode_title_fast_path"] is True
+
+
+def test_opencode_title_kind_header_takes_the_fast_path(monkeypatch):
+    state = _fake_state()
+    client = TestClient(create_app(state))
+
+    def fail_generation(*_args, **_kwargs):
+        raise AssertionError("a request the plugin marks as a title must not reach the model")
+
+    monkeypatch.setattr(openai, "_run_generation", fail_generation)
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-client": "opencode", "x-mtplx-request-kind": "title"},
+        json={
+            "model": "mtplx-test-model",
+            "messages": [
+                {"role": "system", "content": "Name this conversation in a few words."},
+                {"role": "user", "content": "debug 500 errors in production"},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "debug 500 errors in production"
+
+
+def test_a_coding_turn_with_the_title_phrase_in_chat_is_not_a_title():
+    request = openai.ChatCompletionRequest(
+        model="m",
+        messages=[
+            {"role": "system", "content": "You are opencode, an interactive CLI agent."},
+            {"role": "user", "content": "You name conversations so the user can find them later"},
+        ],
+    )
+    assert not openai._is_opencode_title_request(request, {"x-mtplx-client": "opencode"})
+    with_tools = openai.ChatCompletionRequest(
+        model="m",
+        messages=[
+            {"role": "system", "content": _OPENCODE_2_TITLE_SYSTEM},
+            {"role": "user", "content": "hi"},
+        ],
+        tools=[_write_tool_schema()],
+    )
+    assert not openai._is_opencode_title_request(
+        with_tools, {"x-mtplx-request-kind": "title"}
+    )
+
+
+_OPENCODE_2_HEADERS = {"x-opencode-client": "desktop", "user-agent": "opencode/2.2.5"}
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "headers", "window", "expected"),
+    [
+        # OpenCode 2.x sends min(limit.output, 32,000); MTPLX wrote that reserve.
+        (32_000, _OPENCODE_2_HEADERS, 262_144, (None, True)),
+        (16_384, _OPENCODE_2_HEADERS, 32_768, (None, True)),
+        # The user's --max-response-tokens rides on the model's own header.
+        (32_000, {**_OPENCODE_2_HEADERS, "x-mtplx-max-response-tokens": "48000"}, 262_144, (48_000, True)),
+        # A cap set in OpenCode itself passes through untouched.
+        (8_000, _OPENCODE_2_HEADERS, 262_144, (8_000, False)),
+        # Another client's 32,000 is that client's choice.
+        (32_000, {"user-agent": "curl/8.7"}, 262_144, (32_000, False)),
+        (None, _OPENCODE_2_HEADERS, 262_144, (None, False)),
+    ],
+)
+def test_opencode_injected_output_cap_is_stripped_server_side(
+    max_tokens, headers, window, expected
+):
+    assert (
+        openai._strip_client_injected_output_cap(
+            max_tokens, headers=headers, metadata={}, context_window=window
+        )
+        == expected
+    )
+
+
+_TEXT_PROTOCOL_CALL = (
+    'Running it now.\n<tool_call>\n{"name": "run", "arguments": {"cmd": "echo hi"}}\n</tool_call>'
+)
+
+
+@pytest.mark.parametrize(
+    ("headers", "extra_body", "kept"),
+    [
+        ({}, {}, False),
+        ({"x-mtplx-keep-tool-markup": "on"}, {}, True),
+        ({}, {"keep_orphan_tool_markup": True}, True),
+        ({}, {"metadata": {"keep_orphan_tool_markup": "true"}}, True),
+    ],
+)
+def test_a_text_protocol_client_can_keep_tool_markup_per_request(
+    monkeypatch, headers, extra_body, kept
+):
+    """#674: a client that parses the reply itself declares no tools; the
+    strip ate the command it was waiting for. The default (strip and notice,
+    for the app chat) stays; the client can opt its own requests out."""
+    monkeypatch.delenv("MTPLX_KEEP_ORPHAN_TOOL_MARKUP", raising=False)
+    state = _fake_state()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai, "_encode_rendered_chat_text", lambda *_args, **_kwargs: [1, 2, 3]
+    )
+    monkeypatch.setattr(
+        openai,
+        "_run_generation",
+        lambda *_args, **_kwargs: _fake_generation(_TEXT_PROTOCOL_CALL),
+    )
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", **headers},
+        json={
+            "messages": [{"role": "user", "content": "RUN: echo hi"}],
+            "max_tokens": 64,
+            **extra_body,
+        },
+    )
+    assert response.status_code == 200
+    content = response.json()["choices"][0]["message"]["content"]
+    if kept:
+        assert '<tool_call>\n{"name": "run"' in content
+        assert "no tools are active" not in content
+    else:
+        assert "<tool_call>" not in content
+        assert "no tools are active" in content
+
+
+def test_another_clients_title_prompt_with_the_2x_phrase_reaches_the_model(monkeypatch):
+    """The 2.x phrase alone is not OpenCode: a custom title prompt of another
+    client that shares it (here asking for JSON) is generated as usual."""
+    state = _fake_state()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    calls = []
+
+    def generation(*_args, **_kwargs):
+        calls.append(1)
+        return _fake_generation('{"title": "UTF-8 CSV importer failure"}')
+
+    monkeypatch.setattr(openai, "_run_generation", generation)
+    for headers in ({"x-mtplx-client": "openwebui"}, {"x-mtplx-request-kind": "title"}):
+        response = client.post(
+            "/v1/chat/completions",
+            headers={"x-mtplx-cache-mode": "bypass", **headers},
+            json={
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You name conversations so the user can find them later. "
+                        "Return a JSON object with the key title.",
+                    },
+                    {"role": "user", "content": "why does the new importer fail on UTF-8 CSV files"},
+                ],
+                "max_tokens": 64,
+            },
+        )
+        assert response.status_code == 200
+        assert "UTF-8 CSV importer failure" in response.json()["choices"][0]["message"]["content"]
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize(("served", "wire_cap"), [(32_768, 16_384), (262_144, 32_000)])
+def test_opencode_reserve_is_stripped_for_the_window_it_was_configured_from(
+    monkeypatch, served, wire_cap
+):
+    """OpenCode is configured from the served window, which the server may
+    size itself (--context-window 0) or fit to the Mac; its reserve for that
+    window is OpenCode's default, not a cap."""
+    state = _fake_state()
+    state.args.stats_footer = False
+    state.args.context_window = 0
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(openai, "served_execution_window", lambda _state: {"tokens": served})
+    seen = {}
+
+    def generation(_state, _prompt_ids, **kwargs):
+        seen["max_tokens"] = kwargs.get("max_tokens")
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", generation)
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass", "user-agent": "opencode/latest/2.2.5/desktop"},
+        json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": wire_cap},
+    )
+    assert response.status_code == 200
+    assert seen["max_tokens"] != wire_cap
+
+
+_KEEP = {"x-mtplx-cache-mode": "bypass", "x-mtplx-keep-tool-markup": "on"}
+
+
+def _stream_text(client, headers, body):
+    response = client.post(
+        "/v1/chat/completions", headers=headers, json={**body, "stream": True}
+    )
+    assert response.status_code == 200
+    payloads = _stream_payloads(response.text)
+    content = "".join(
+        choice.get("delta", {}).get("content") or ""
+        for payload in payloads
+        for choice in payload.get("choices", [])
+    )
+    reasoning = "".join(
+        choice.get("delta", {}).get("reasoning_content") or ""
+        for payload in payloads
+        for choice in payload.get("choices", [])
+    )
+    return content, reasoning
+
+
+def test_kept_markup_quoted_in_closed_thinking_stays_reasoning_when_streamed(monkeypatch):
+    """With no tools declared nothing ends thinking, even when the client
+    keeps tool markup: a call the model only considers stays reasoning."""
+    text = (
+        "<think>I should consider this:\n<tool_call>\n"
+        '{"name": "run", "arguments": {"cmd": "echo hi"}}\n</tool_call>\n'
+        "This is still my reasoning.</think>\nFinal answer."
+    )
+    state = _fake_state()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation(text))
+    content, reasoning = _stream_text(
+        client,
+        _KEEP,
+        {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 256,
+         "enable_thinking": True},
+    )
+    assert content.strip() == "Final answer."
+    assert "This is still my reasoning." in reasoning
+
+
+def test_kept_markup_streams_with_its_line_breaks(monkeypatch):
+    text = "RUN: echo hi\n<tool_call>\nWRITE: result.txt\nhello\n</tool_call>"
+    state = _fake_state()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai, "_encode_rendered_chat_text", lambda *_args, **_kwargs: [1, 2, 3]
+    )
+    body = {"messages": [{"role": "user", "content": "go"}], "max_tokens": 256,
+            "enable_thinking": False}
+    monkeypatch.setattr(openai, "_run_generation", _fake_streaming_generation(text))
+    content, _ = _stream_text(client, _KEEP, body)
+    assert content == text
+    monkeypatch.setattr(openai, "_run_generation", lambda *_a, **_k: _fake_generation(text))
+    response = client.post("/v1/chat/completions", headers=_KEEP, json=body)
+    assert response.json()["choices"][0]["message"]["content"] == content
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_the_operator_switch_keeps_markup_and_drops_the_notice(monkeypatch, stream):
+    monkeypatch.setenv("MTPLX_KEEP_ORPHAN_TOOL_MARKUP", "on")
+    state = _fake_state()
+    state.args.stats_footer = False
+    client = TestClient(create_app(state))
+    monkeypatch.setattr(openai, "_encode_messages", lambda *_args, **_kwargs: [1, 2, 3])
+    monkeypatch.setattr(
+        openai, "_encode_rendered_chat_text", lambda *_args, **_kwargs: [1, 2, 3]
+    )
+    body = {"messages": [{"role": "user", "content": "RUN: echo hi"}], "max_tokens": 128,
+            "enable_thinking": False}
+    headers = {"x-mtplx-cache-mode": "bypass"}
+    if stream:
+        monkeypatch.setattr(
+            openai, "_run_generation", _fake_streaming_generation(_TEXT_PROTOCOL_CALL)
+        )
+        content, _ = _stream_text(client, headers, body)
+    else:
+        monkeypatch.setattr(
+            openai, "_run_generation", lambda *_a, **_k: _fake_generation(_TEXT_PROTOCOL_CALL)
+        )
+        content = client.post("/v1/chat/completions", headers=headers, json=body).json()[
+            "choices"
+        ][0]["message"]["content"]
+    assert '<tool_call>\n{"name": "run"' in content
+    assert "no tools are active" not in content
+
+
 def test_stream_cancellation_metric_records_prompt_and_policy_context():
     state = _fake_streaming_session_state()
     state.requests_cancelled = 0
@@ -5381,6 +5773,152 @@ def test_stream_cancellation_metric_keeps_partial_throughput():
     assert latest["server_tok_s"] > 0.0
     assert latest["partial_decode_tok_s"] == latest["decode_tok_s"]
     assert latest["partial_request_tok_s"] == latest["request_tok_s"]
+
+
+def _publish_completed_prefill(state, request_id, **fields):
+    openai._dashboard_publish_prefill(
+        state,
+        request_id=request_id,
+        session_id="ses_cancel",
+        payload={"phase": "completed", "tokens_total": 92819, **fields},
+    )
+
+
+def test_stream_cancellation_metric_carries_the_known_cache_outcome(monkeypatch):
+    """A turn cancelled during decode after a RAM restore read MISS in the
+    request log: the receipt hard-coded session_cache_hit False."""
+
+    state = _fake_streaming_session_state()
+    published = []
+    monkeypatch.setattr(state.dashboard.bus, "publish", published.append)
+    _publish_completed_prefill(
+        state,
+        "chatcmpl_cancel_hit",
+        cached_tokens=92636,
+        new_prefill_tokens=183,
+        cache_hit=True,
+        cache_source="ram",
+        cache_miss_reason=None,
+        ssd_cache_hit=False,
+        ssd_cached_tokens=0,
+        ssd_restore_s=0.0,
+        ssd_suffix_tokens=0,
+        prompt_eval_time_s=0.8,
+        session_restore_served={"actual_restore_point": 92636},
+    )
+    received_s = time.perf_counter() - 180.0
+    openai._record_stream_cancellation_metric(
+        state,
+        response_id="chatcmpl_cancel_hit",
+        session_id="ses_cancel",
+        prompt_tokens=92819,
+        streamed_completion_tokens=3,
+        stream_started_s=received_s + 0.5,
+        reason="client_disconnected",
+        request_observability={"request_received_monotonic_s": received_s},
+        client_disconnected=True,
+        token_times=[received_s + 2.0, received_s + 2.1, received_s + 2.2],
+    )
+
+    latest = state.last_metrics[-1]
+    assert latest["request_cancelled"] is True
+    assert latest["session_cache_hit"] is True
+    assert latest["cached_tokens"] == 92636
+    assert latest["new_prefill_tokens"] == 183
+    assert latest["cache_source"] == "ram"
+    assert latest["cache_miss_reason"] is None
+    assert latest["ssd_cache_hit"] is False
+    assert latest["prompt_eval_time_s"] == 0.8
+    assert latest["session_restore_served"] == {"actual_restore_point": 92636}
+    assert latest["ttft_s"] == pytest.approx(2.0)
+    assert state.dashboard.prefill_outcomes.get("chatcmpl_cancel_hit") is None
+    # The live prefill event does not carry the served record.
+    (prefill_event,) = [e for e in published if e["kind"] == "prefill"]
+    assert "session_restore_served" not in prefill_event
+    assert prefill_event["cache_source"] == "ram"
+
+
+def test_stream_cancellation_metric_carries_a_miss_and_its_reason():
+    state = _fake_streaming_session_state()
+    _publish_completed_prefill(
+        state,
+        "chatcmpl_cancel_miss",
+        cached_tokens=0,
+        new_prefill_tokens=92819,
+        cache_hit=False,
+        cache_source="none",
+        cache_miss_reason="evicted",
+    )
+    openai._record_stream_cancellation_metric(
+        state,
+        response_id="chatcmpl_cancel_miss",
+        session_id="ses_cancel",
+        prompt_tokens=92819,
+        streamed_completion_tokens=0,
+        stream_started_s=time.perf_counter() - 30.0,
+        reason="client_disconnected",
+        request_observability={},
+        client_disconnected=True,
+    )
+
+    latest = state.last_metrics[-1]
+    assert latest["session_cache_hit"] is False
+    assert latest["cache_miss_reason"] == "evicted"
+    assert latest["cache_source"] == "none"
+    assert latest["new_prefill_tokens"] == 92819
+    # No token reached the client: there is no first-token time.
+    assert latest["ttft_s"] is None
+
+
+def test_stream_cancellation_before_the_prefill_completed_leaves_the_outcome_unknown():
+    state = _fake_streaming_session_state()
+    openai._record_stream_cancellation_metric(
+        state,
+        response_id="chatcmpl_cancel_early",
+        session_id="ses_cancel",
+        prompt_tokens=92819,
+        streamed_completion_tokens=0,
+        stream_started_s=time.perf_counter() - 5.0,
+        reason="client_disconnected",
+        request_observability={},
+        client_disconnected=True,
+    )
+
+    latest = state.last_metrics[-1]
+    for key in (
+        "session_cache_hit",
+        "cached_tokens",
+        "new_prefill_tokens",
+        "cache_source",
+        "cache_miss_reason",
+        "ttft_s",
+    ):
+        assert key in latest
+        assert latest[key] is None, key
+
+
+def test_a_completed_request_releases_its_prefill_outcome():
+    state = _fake_streaming_session_state()
+    _publish_completed_prefill(state, "chatcmpl_done", cached_tokens=10, cache_hit=True)
+    assert state.dashboard.prefill_outcomes.get("chatcmpl_done") is not None
+    openai._record_request_metrics(state, {"request_id": "chatcmpl_done"})
+    assert state.dashboard.prefill_outcomes.get("chatcmpl_done") is None
+
+
+def test_prefill_cache_outcome_applies_the_envelope_defaults():
+    outcome = openai._prefill_cache_outcome(
+        {"tokens_total": 100, "cached_tokens": 60, "cache_hit": True}
+    )
+    assert outcome is not None
+    assert outcome["session_cache_hit"] is True
+    assert outcome["cache_source"] == "ram"
+    assert outcome["new_prefill_tokens"] == 40
+    assert outcome["cache_miss_reason"] is None
+    # An event that says nothing about the cache gives no outcome.
+    assert openai._prefill_cache_outcome({"tokens_total": 100}) is None
+    # A hit never keeps a miss reason.
+    hit = openai._prefill_cache_outcome({"cache_hit": True, "cache_miss_reason": "evicted"})
+    assert hit["cache_miss_reason"] is None
 
 
 @pytest.mark.parametrize(
@@ -10464,6 +11002,106 @@ def test_anthropic_bridge_forwards_reasoning_effort():
     assert openai._anthropic_to_chat_request(without).reasoning_effort is None
 
 
+def _anthropic_effort_request(**fields):
+    return openai.AnthropicMessagesRequest(
+        model="m",
+        max_tokens=16,
+        messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        **fields,
+    )
+
+
+@pytest.mark.parametrize(
+    ("sent", "expected"),
+    [
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", None),
+        ("xhigh", "xhigh"),
+        ("max", "xhigh"),
+        ("none", "low"),
+    ],
+)
+def test_anthropic_bridge_maps_output_config_effort(sent, expected):
+    # Claude Code sends output_config.effort, never the flat field. "high" is
+    # what it sends when the user picked no level, so it keeps the server's
+    # default.
+    request = _anthropic_effort_request(output_config={"effort": sent})
+    chat = openai._anthropic_to_chat_request(request)
+    assert chat.reasoning_effort == expected
+
+
+def test_anthropic_bridge_flat_reasoning_effort_beats_output_config():
+    request = _anthropic_effort_request(
+        reasoning_effort="low", output_config={"effort": "max"}
+    )
+    assert openai._anthropic_to_chat_request(request).reasoning_effort == "low"
+
+
+@pytest.mark.parametrize(
+    "output_config",
+    [None, {}, {"effort": "ultra"}, {"effort": 3}, {"effort": None}, "high", ["high"]],
+)
+def test_anthropic_bridge_ignores_absent_or_unknown_output_config(output_config):
+    fields = {} if output_config is None else {"output_config": output_config}
+    chat = openai._anthropic_to_chat_request(_anthropic_effort_request(**fields))
+    assert chat.reasoning_effort is None
+
+
+def test_anthropic_effort_vocabulary_is_accepted_by_the_server():
+    # Whatever the bridge emits must survive the server's own normaliser. An
+    # unmapped "max" would be a 400 on every Claude Code `--effort max` request.
+    from mtplx.reasoning_effort import normalize_reasoning_effort
+
+    for emitted in openai._ANTHROPIC_EFFORT_TO_REASONING_EFFORT.values():
+        assert normalize_reasoning_effort(emitted) == emitted
+
+
+@pytest.mark.parametrize(
+    ("sent", "expected"),
+    [
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "medium"),
+        ("xhigh", "xhigh"),
+        ("max", "xhigh"),
+        ("none", "low"),
+    ],
+)
+def test_anthropic_messages_route_applies_output_config_effort(monkeypatch, sent, expected):
+    from mtplx.backends.descriptors import QWEN3_8_REASONING_CODEC
+
+    state = _fake_state()
+    state.runtime.tokenizer = StreamingTokenizer()
+    state.args.reasoning = "on"
+    state.args.enable_thinking = True
+    state.args.reasoning_effort = "medium"  # the server default the request must override
+    state.args.stats_footer = False
+    captured = {}
+    monkeypatch.setattr(openai, "_reasoning_codec_for_state", lambda _state: QWEN3_8_REASONING_CODEC)
+
+    def generate(_state, _prompt_ids, **kwargs):
+        captured.update(kwargs)
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", generate)
+    client = TestClient(create_app(state))
+
+    response = client.post(
+        "/v1/messages",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": sent},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured["request_observability"]["request_reasoning_effort"] == expected
+
+
 def test_cancel_attribution_first_origin_wins_and_labels():
     # #381: one shared cancel event, many setters — the terminal frame
     # blamed every non-disconnect trip on POST /v1/mtplx/cancel. The first
@@ -11739,6 +12377,105 @@ def test_anthropic_messages_returns_tool_use_nonstream(monkeypatch):
     assert payload["content"][0]["name"] == "Bash"
     assert payload["content"][0]["input"] == {"command": "./test.sh"}
     assert "<tool_call" not in response.text
+
+
+def test_anthropic_auto_mode_classifier_request_runs_with_thinking_off(monkeypatch):
+    # Issue #669: Claude Code's safety classifier only needs a verdict, so its
+    # request runs with thinking off. The same request from a client that is
+    # not Claude Code (no billing block) keeps the default.
+    state = _fake_state()
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    state.args.reasoning_parser = "qwen3"
+    client = TestClient(create_app(state))
+    seen: list[dict[str, object]] = []
+
+    def fake_run_generation(*_args, **kwargs):
+        seen.append(dict(kwargs["request_observability"]))
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+    user = [{"role": "user", "content": "Is `rm -rf build` safe?"}]
+    monitor = "You are a security monitor for autonomous AI coding agents."
+    billing = {
+        "type": "text",
+        "text": "x-anthropic-billing-header: cc_version=2.1.201.af3; cc_entrypoint=sdk-cli;",
+    }
+
+    # A short max_tokens with a foreign system prompt reads as a background
+    # title job, which is a different path. Keep both requests above it.
+    classifier = client.post(
+        "/v1/messages",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 2112,
+            "system": [billing, {"type": "text", "text": monitor}],
+            "messages": user,
+        },
+    )
+    classifier_renders = list(state.runtime.tokenizer.calls)
+    normal = client.post(
+        "/v1/messages",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 2112,
+            "system": monitor,
+            "messages": user,
+        },
+    )
+
+    assert classifier.status_code == 200
+    assert normal.status_code == 200
+    classifier_stats, normal_stats = seen
+    assert classifier_stats["request_enable_thinking"] is False
+    assert normal_stats["request_enable_thinking"] is True
+    normal_renders = state.runtime.tokenizer.calls[len(classifier_renders) :]
+    assert classifier_renders and normal_renders
+    assert all(kwargs.get("enable_thinking") is False for _m, kwargs in classifier_renders)
+    assert all(kwargs.get("enable_thinking") is not False for _m, kwargs in normal_renders)
+
+
+@pytest.mark.parametrize("body_key", ["auto_mode_classifier", "_auto_mode_classifier"])
+def test_client_cannot_set_auto_mode_classifier_flag_on_chat_completions(
+    monkeypatch, body_key
+):
+    # The flag comes from the Anthropic conversion only. A chat body field of
+    # either name must leave thinking on, whatever its value.
+    state = _fake_state()
+    state.runtime.tokenizer = CaptureTokenizer()
+    state.args.stats_footer = False
+    state.args.reasoning_parser = "qwen3"
+    client = TestClient(create_app(state))
+    seen: dict[str, object] = {}
+
+    def fake_run_generation(*_args, **kwargs):
+        seen["request_observability"] = dict(kwargs["request_observability"])
+        return _fake_generation("ok")
+
+    monkeypatch.setattr(openai, "_run_generation", fake_run_generation)
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"x-mtplx-cache-mode": "bypass"},
+        json={
+            "model": "mtplx-test-model",
+            "max_tokens": 256,
+            body_key: True,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a security monitor for autonomous AI coding agents.",
+                },
+                {"role": "user", "content": "Is `rm -rf build` safe?"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    stats = seen["request_observability"]
+    assert stats["request_enable_thinking"] is True
 
 
 def test_anthropic_messages_streams_tool_use_without_text_leak(monkeypatch):

@@ -384,12 +384,15 @@ def _input_to_chat_messages(
                 "type": "function",
                 "function": {"name": chat_name, "arguments": arguments},
             }
-            if (
-                messages
-                and messages[-1]["role"] == "assistant"
-                and messages[-1].get("tool_calls")
-            ):
-                messages[-1]["tool_calls"].append(tool_call)
+            if messages and messages[-1]["role"] == "assistant":
+                # One response is one assistant turn: a message item (Codex's
+                # preamble, or the text MTPLX itself returned with its tool
+                # calls) followed by its calls is that turn's content and
+                # calls, as output_from_chat wrote them. Rendered as two
+                # assistant turns, every tool call in the history reads as
+                # "announce, end the turn", and the model copies it: Codex
+                # agents stopped after 10 to 25 tool calls (#603).
+                messages[-1].setdefault("tool_calls", []).append(tool_call)
             else:
                 messages.append(
                     {"role": "assistant", "content": "", "tool_calls": [tool_call]}
@@ -516,14 +519,28 @@ def _text_format_to_chat(text: Any) -> tuple[Any, str | None]:
     return {"type": "json_schema", "json_schema": wrapper}, verbosity
 
 
+# Codex (CLI and desktop app, from October 2026) sends this in both reasoning
+# and stream_options to choose how reasoning summaries are delivered. MTPLX
+# writes no reasoning summary item (see _reasoning_to_chat), so every delivery
+# choice is met as sent. Refusing it answered every Codex turn with a 400 (#658).
+_SUMMARY_DELIVERY_KEY = "reasoning_summary_delivery"
+
+
+def _validate_summary_delivery(options: Mapping[str, Any], *, field_name: str) -> None:
+    value = options.get(_SUMMARY_DELIVERY_KEY)
+    if value is not None and not isinstance(value, str):
+        raise unsupported(f"{field_name}.{_SUMMARY_DELIVERY_KEY} must be a string")
+
+
 def _reasoning_to_chat(reasoning: Any) -> tuple[str | None, str | None]:
     if reasoning is None:
         return None, None
     if not isinstance(reasoning, Mapping):
         raise unsupported("reasoning must be an object")
-    unknown = sorted(set(reasoning) - {"effort", "summary"})
+    unknown = sorted(set(reasoning) - {"effort", "summary", _SUMMARY_DELIVERY_KEY})
     if unknown:
         raise unsupported("reasoning has unsupported key(s): " + ", ".join(unknown))
+    _validate_summary_delivery(reasoning, field_name="reasoning")
     summary = reasoning.get("summary")
     if summary not in {None, "none", "auto"}:
         raise unsupported(
@@ -549,11 +566,15 @@ def _validate_stream_options(stream_options: Any) -> None:
         return
     if not isinstance(stream_options, Mapping):
         raise unsupported("stream_options must be an object")
-    unknown = sorted(set(stream_options) - {"include_usage", "include_obfuscation"})
+    unknown = sorted(
+        set(stream_options)
+        - {"include_usage", "include_obfuscation", _SUMMARY_DELIVERY_KEY}
+    )
     if unknown:
         raise unsupported(
             "stream_options has unsupported key(s): " + ", ".join(unknown)
         )
+    _validate_summary_delivery(stream_options, field_name="stream_options")
     for key in ("include_usage", "include_obfuscation"):
         if key in stream_options and not isinstance(stream_options[key], bool):
             raise unsupported(f"stream_options.{key} must be a boolean")
@@ -918,12 +939,26 @@ async def _iter_sse_data(body_iterator: Any) -> AsyncIterator[str]:
             ]
             if data_lines:
                 yield "\n".join(data_lines)
+            elif frame.startswith(":"):
+                # SSE comment-only frame — the pre-first-token keep-alive
+                # from the chat lane (#358). Without this branch a long prefill
+                # puts zero bytes on the wire between response.in_progress and
+                # the first token, so strict client and proxy read-timeouts kill
+                # the connection while the engine is still computing. Forward it
+                # verbatim so stream_from_chat_sse restates it; the leading ":"
+                # is unambiguous because data payloads here are JSON or
+                # "[DONE]".
+                yield frame
     if pending.strip():
         data_lines = [
             line[6:] for line in pending.splitlines() if line.startswith("data: ")
         ]
         if data_lines:
             yield "\n".join(data_lines)
+        elif pending.startswith(":"):
+            # The body can end inside a frame; a trailing comment is still
+            # liveness, so apply the same rule instead of dropping it.
+            yield pending
 
 
 async def stream_from_chat_sse(
@@ -976,6 +1011,22 @@ async def stream_from_chat_sse(
         async for data in _iter_sse_data(body_iterator):
             if data == "[DONE]":
                 break
+            if data.startswith(":"):
+                # Keep-alive comment from the chat lane (#358), emitted only
+                # while a long prefill has produced no token yet. Forwarding
+                # the comment alone would not be enough: it resets
+                # read-timeouts but produces no event, and clients that arm
+                # a watchdog over the parsed event stream (codex-rs:
+                # timeout(idle_timeout, stream.next()) in
+                # codex-api/src/sse/responses.rs) never see a comment disarm
+                # it. Restating it as a real response.in_progress does; base()
+                # already reports that status, and event_payload keeps
+                # sequence_number monotonic.
+                yield _sse(
+                    "response.in_progress",
+                    event_payload("response.in_progress", response=base("in_progress")),
+                )
+                continue
             try:
                 chat_chunk = json.loads(data)
             except json.JSONDecodeError as exc:

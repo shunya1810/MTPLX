@@ -30,6 +30,10 @@ struct AcceptanceSection: View {
     /// beat rather than three independent reveals.
     static let liftStaggerIndex: Int = 5
 
+    private var motionEnabled: Bool {
+        !backend.configuration.performanceLock && !themeStore.reduceMotionPreference
+    }
+
     var body: some View {
         let smoothed = backend.smoothedMetrics
         let liveRows = acceptanceRows(latest: backend.latest, smoothed: smoothed)
@@ -111,7 +115,7 @@ struct AcceptanceSection: View {
                     .font(.system(size: 12, weight: .heavy, design: .rounded))
                     .foregroundStyle(Brand.textHighlight)
                 Spacer()
-                Text("\(Format.percent(rate)) (\(accepted)/\(drafted))")
+                Text(verbatim: "\(Format.percent(rate)) (\(accepted)/\(drafted))")
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .monospacedDigit()
                     .foregroundStyle(Brand.textHighlight.opacity(0.85))
@@ -125,7 +129,10 @@ struct AcceptanceSection: View {
                     Capsule()
                         .fill(barGradient(rate: rate))
                         .frame(width: proxy.size.width * max(0, min(1, rate)))
-                        .animation(Motion.metricBar, value: rate)
+                        // Gated like the Live tab's other motion: under
+                        // Performance mode or Reduce Motion the bar moves
+                        // without the 0.3 s glide restarted on every update.
+                        .animation(motionEnabled ? Motion.metricBar : nil, value: rate)
                 }
             }
             .frame(height: 10)
