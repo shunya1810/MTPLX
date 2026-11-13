@@ -912,6 +912,10 @@ def load(
         if nax_env_enabled():
             nax_report = install_nax_qlinear_patch()
             logger.info("[nax-verify] %s", nax_report)
+        from .qwen35_inforward_boundary import enabled as _ifb_enabled, install as _ifb_install
+
+        if _ifb_enabled():
+            logger.info("[qwen35-inforward-boundary] %s", _ifb_install(model))
         from .kernels.gdn_blocked_prefill import (
             blocked_prefill_env_enabled,
             install_gdn_blocked_prefill_patch,

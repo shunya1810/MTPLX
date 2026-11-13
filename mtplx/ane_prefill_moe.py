@@ -32,6 +32,21 @@ _STATE: dict[str, Any] = {"lin": None, "slots": {}, "staged": set(), "chunks": 0
                           "t_run": 0.0, "t_wait": 0.0, "t_total": 0.0}
 
 
+# Below ~2,560 rows a chunk is faster on the GPU alone: the two halves are narrow forwards, and every
+# forward pays the dequantization of all experts whatever its width (35B-A3B on M1 Max, one chunk at
+# offset 0, GPU-only vs pipeline: 2,048 rows 2.07 vs 2.19 s, 2,560 2.55 vs 2.53, 3,072 3.07 vs 2.87,
+# 4,096 4.08 vs 3.72; a3b-s7).
+_DEFAULT_MIN_ROWS = 2560
+_DEFAULT_MIN_OFFSET = 0
+
+
+def _env_rows(name: str, default: int) -> int:
+    try:
+        return int((os.environ.get(name) or "").strip() or default)
+    except ValueError:
+        return default
+
+
 def enabled() -> bool:
     if (os.environ.get("MTPLX_ANE_PREFILL_MOE") or "").strip().lower() not in {"1", "true", "yes", "on"}:
         return False
@@ -209,8 +224,11 @@ def _attn_give(layer: Any, x: mx.array, out: mx.array) -> None:
     attn.v_proj.give(x, o[..., nq + nk :])
 
 
-def _gdn_rest(gdn: Any, inputs: mx.array, qkv: mx.array, z: mx.array, cache: Any) -> mx.array:
-    """qwen3_5 ``GatedDeltaNet.__call__`` after the qkv / z projections (no mask, cache present)."""
+def _gdn_rest(gdn: Any, inputs: mx.array, qkv: mx.array, z: mx.array, cache: Any, row0: int = 0) -> mx.array:
+    """qwen3_5 ``GatedDeltaNet.__call__`` after the qkv / z projections (no mask, cache present).
+
+    ``row0`` is this call's first row in the chunk: the in-forward boundary offsets
+    (``qwen35_inforward_boundary``) are rows of the chunk, the pipeline calls this per half."""
 
     import mlx.nn as nn
     from mlx_lm.models import qwen3_5 as q5
@@ -243,7 +261,19 @@ def _gdn_rest(gdn: Any, inputs: mx.array, qkv: mx.array, z: mx.array, cache: Any
     inv_scale = k.shape[-1] ** -0.5
     q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
     k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
-    out, state = q5.gated_delta_update(q, k, v, a, b, gdn.A_log, gdn.dt_bias, cache[1], None, use_kernel=True)
+    from . import qwen35_inforward_boundary as _ifb
+
+    offsets = _ifb.capture_offsets() if cache.lengths is None else ()
+    if row0 in offsets:  # the seam between the two halves: the state the first half left
+        _ifb.record_entry_state(cache, row0, conv_tail=conv_state)
+    capture_at = tuple(p - row0 for p in offsets if 0 < p - row0 < S)
+    if capture_at:
+        out, state = _ifb.segmented_update(
+            q5.gated_delta_update, q, k, v, a, b, gdn.A_log, gdn.dt_bias, cache[1],
+            conv_stream=conv_input, n_keep=n_keep, cache=cache, capture_at=capture_at, row0=row0,
+        )
+    else:
+        out, state = q5.gated_delta_update(q, k, v, a, b, gdn.A_log, gdn.dt_bias, cache[1], None, use_kernel=True)
     cache[1] = state
     cache.advance(S)
     out = gdn.norm(out, z)
@@ -291,9 +321,18 @@ def pipelined_layers(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ss
         return None
     if ssm_mask is not None or not (isinstance(fa_mask, str) or fa_mask is None):
         return None
+    if S < _env_rows("MTPLX_ANE_PREFILL_MOE_MIN_ROWS", _DEFAULT_MIN_ROWS):
+        return None
     layers = inner.layers
     if not any(_is_moe_layer(layer) for layer in layers):
         return None
+    min_offset = _env_rows("MTPLX_ANE_PREFILL_MOE_MIN_OFFSET", _DEFAULT_MIN_OFFSET)
+    if min_offset > 0:
+        for layer, c in zip(layers, cache):
+            if not layer.is_linear and c is not None:
+                if int(getattr(c, "offset", 0) or 0) < min_offset:
+                    return None
+                break
     # Past MTPLX_ANE_PREFILL_MOE_MAX_CONTEXT keys the ANE path gains little (77K
     # turn re-prefill: 106 vs 111 s) and its extra working memory trips the
     # system-memory abort beside a desktop's apps (7 of 17 prefills failed vs 0
@@ -326,6 +365,9 @@ def pipelined_layers(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ss
     slots = _STATE["slots"]
     dtype = h.dtype
     ha, hb = h[:, :half], h[:, half:]
+    # Both halves run the same program function (the larger half's): alternating two functions of the
+    # program between the halves costs more than the padding (3,583 rows: 4.05 s vs 3.3 s, a3b-s7).
+    run_rows = max(half, S - half) if os.environ.get("MTPLX_ANE_PREFILL_MOE_SAME_FN", "1") != "0" else 0
     copied = None  # the last run's output copy, evaluated before the next run reuses the buffer
     try:
         for index, (layer, c) in enumerate(zip(layers, cache)):
@@ -339,7 +381,7 @@ def pipelined_layers(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ss
                 xa = layer.input_layernorm(ha)
                 mx.eval(_attn_project(alin, layer, xa, aslot), *(() if copied is None else (copied,)))
                 mx.async_eval(hb)
-                alin.run(xa.shape[1], aslot)
+                alin.run(run_rows or xa.shape[1], aslot)
                 out_a = _copy_output(alin, xa.shape[1], dtype)
                 _attn_give(layer, xa, out_a)
                 ha = ha + layer.self_attn(xa, mask=fa_mask, cache=c)
@@ -347,7 +389,7 @@ def pipelined_layers(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ss
                 xb = layer.input_layernorm(hb)
                 mx.eval(_attn_project(alin, layer, xb, aslot), out_a)
                 mx.async_eval(ha)
-                alin.run(xb.shape[1], aslot)
+                alin.run(run_rows or xb.shape[1], aslot)
                 copied = _copy_output(alin, xb.shape[1], dtype)
                 _attn_give(layer, xb, copied)
                 hb = hb + layer.self_attn(xb, mask=fa_mask, cache=c)
@@ -360,7 +402,7 @@ def pipelined_layers(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ss
             mx.eval(_project(lin, layer, xa, slot), *(() if copied is None else (copied,)))
             _t1 = time.perf_counter()
             mx.async_eval(hb)
-            lin.run(xa.shape[1], slot)
+            lin.run(run_rows or xa.shape[1], slot)
             _t2 = time.perf_counter()
             _STATE["t_wait"] += _t1 - _t0
             _STATE["t_run"] += _t2 - _t1
@@ -375,17 +417,19 @@ def pipelined_layers(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ss
             mx.eval(_project(lin, layer, xb, slot), out_a)
             _t1 = time.perf_counter()
             mx.async_eval(ha)
-            lin.run(xb.shape[1], slot)
+            lin.run(run_rows or xb.shape[1], slot)
             _t2 = time.perf_counter()
             _STATE["t_wait"] += _t1 - _t0
             _STATE["t_run"] += _t2 - _t1
             copied = _copy_output(lin, xb.shape[1], dtype)
             qkv_b, z_b = _split(copied)
-            rb = _gdn_rest(layer.linear_attn, xb, qkv_b, z_b, c)
+            rb = _gdn_rest(layer.linear_attn, xb, qkv_b, z_b, c, row0=half)
             hb = hb + rb
             hb = hb + layer.mlp(layer.post_attention_layernorm(hb))
     except Exception as exc:
         _disable(exc)
         raise
     _STATE["chunks"] += 1
+    if os.environ.get("MTPLX_ANE_PREFILL_MOE_TRACE") == "1":
+        print(f"[ane-prefill-moe] S={S} half={half} run={_STATE['t_run']:.3f}s wait={_STATE['t_wait']:.3f}s (cumulative)", flush=True)
     return mx.concatenate([ha, hb], axis=1)

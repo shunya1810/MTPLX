@@ -1445,6 +1445,11 @@ _M1_MOE_GDN_ENV = {
     # agreement 98.25% / mean KL 0.0034 against the GPU-only prefill. The
     # first long prompt pays the program compile (~4 s).
     "MTPLX_ANE_PREFILL_MOE": "1",
+    # Record the prompt-tail GDN boundaries inside the last wide forward instead
+    # of cutting it there (qwen35_inforward_boundary): narrow forwards pay every
+    # expert's dequantization. 35B-A3B cold prompts of 2.1K-3.6K tokens +4-17%
+    # (a3b-s7, with the ANE pipeline's 2,560-row floor).
+    "MTPLX_QWEN35_INFORWARD_BOUNDARY": "1",
 }
 # Qwen3.6-35B-A3B only (kernels written for its 256 experts / top-8 / 2048
 # hidden), on the capture_commit route: the upstream fast lane ported to fp16.
