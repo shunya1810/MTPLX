@@ -86,6 +86,7 @@ From bench 2 of [apple-silicon-llm-bench](https://github.com/shunya1810/apple-si
 - v2.12.2-m1.12 leaves these models' speed unchanged: against m1.11 on Qwen3.8-27B and Qwen3.6-35B-A3B, prefill and the time of one verify round at 1.6K tokens differed by less than 2%, so the tables were not re-measured.
 - v2.12.2-m1.13 speeds up the Qwen3.6-35B-A3B family's decode (the two A3B rows above were re-measured). It does not change the 27B models' path with the 8-bit KV cache used here, so their rows were not re-measured.
 - v2.12.3-m1.14 brings in upstream 2.12.3 and leaves these models' speed unchanged: against m1.13 on Qwen3.8-27B and Qwen3.6-35B-A3B, cold prefill and decode at 8K–128K and on short prompts differed by 1% or less, and peak memory was the same, so the tables were not re-measured. Upstream's rows were not re-measured on 2.12.3.
+- v2.12.3-m1.15 speeds up the Qwen3.6-35B-A3B family's cold prefill of prompts up to about 15K tokens and of the short follow-up turns of an agent session (A3B, servers alternated with m1.14, cold prompt per length: 2.1K 691 → 1,049 tok/s, 3.6K 889 → 1,177, 7.3K 939 → 1,088, 14.8K 925 → 1,003; 29K and longer are unchanged). A 14-turn agent session on a 19K-token system prompt spent 44.5 / 46.3 s reading new tokens on m1.14 and 39.4 / 39.7 s on m1.15. Decode is unchanged, peak memory is the same (32.6 GB through 128K, 33.8 GB at 256K), and the 64K and 256K prefill speeds are within the run-to-run spread, so the tables above were not re-measured. Greedy answers differ from m1.14 because prompts are now cut into chunks at other places.
 - Qwen3.6-35B-A3B now reads 32K–64K prompts more slowly than Ornith-1.5-35B-A3B, which has the same layout (931 against 1,026 tok/s at 32K); on v2.12.2-m1.10 the two were equal (1,028 and 1,034). m1.13 does not change prefill and was not slower than m1.12 on the same day (cold prompts of about 29K and 104K tokens: 910 and 513 tok/s against 697 and 444). The cause is being investigated.
 - The 8K–128K prompts repeat one 11K-token HTML file. Read to about 256K (22 repeats), Qwen3.8-27B predicts its own next tokens poorly from the third repeat on (upstream MTPLX too), and the draft head, which reads the model's hidden states, then rarely matches, so 256K is shown with the non-repeating text above instead.
 - MacBook Pro M1 Max 64 GB, macOS 26. Profile `turbo`, 256K context limit, 8-bit KV cache, temperature 0.6 with fixed seeds.
@@ -236,6 +237,8 @@ Each M1 default can be turned off with an environment variable; `MTPLX_M1_LONG_C
 | `MTPLX_M1_RESIDENT_DECODE=0` | on for Qwen3.6-35B-A3B family models | decode rounds queued on the GPU |
 | `MTPLX_A3B_GDN_FUSED=0` | on for Qwen3.6-35B-A3B family models | one kernel per GDN layer in verify |
 | `MTPLX_CONTEXT_COPY=0` | on for Qwen3.6-35B-A3B family models | context-copy |
+| `MTPLX_QWEN35_INFORWARD_BOUNDARY=0` | on for Qwen3.6-35B-A3B family models | prompt-tail restore points recorded inside the last wide prefill forward (off: the forward is cut at them) |
+| `MTPLX_M1_MOE_SEG_GATHER_LOW_ROWS=384` | off | opt-in: the MoE tiles also serve prefill chunks of 48–127 tokens (64 tokens 175 → 153 ms per chunk, 127 tokens 329 → 224 ms; not bit-identical, 97–99% of next tokens agree) |
 
 ## Known limitations
 
