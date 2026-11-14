@@ -47,11 +47,22 @@ _BITS = (2, 4, 8)
 #: 32 (M1 Max, 2026-10-16): 128 tokens 5.72 vs 7.15 ms, 256: 6.88 vs 7.97,
 #: 512: 9.19 vs 9.38, 768: 11.48 vs 11.06, 4,096: 43.2 vs 37.2.
 NARROW_BM = 16
-NARROW_MAX_ROWS = int(os.environ.get("MTPLX_M1_MOE_SEG_GATHER_NARROW_MAX_ROWS", "4096") or 4096)
+#: Narrow tiles take 64-deep K steps: half the loop iterations and barriers per
+#: tile, bit-identical (the MMA order inside a K step is unchanged). A3B real
+#: routing, M1 Max (a3b-s7): gate_up + down per layer at 128 tokens 3.72 -> 3.43
+#: ms, 256: 5.25 -> 4.78, 512: 7.96 -> 7.64; 16-row tiles with BK 64 also beat
+#: the 32-row tiles at 1,024 tokens (12.66 vs 13.41), so the narrow limit moved
+#: from 4,096 to 8,192 routed rows. 2,048 tokens stay on 32-row tiles.
+NARROW_BK = int(os.environ.get("MTPLX_M1_MOE_SEG_GATHER_NARROW_BK", "64") or 64)
+NARROW_MAX_ROWS = int(os.environ.get("MTPLX_M1_MOE_SEG_GATHER_NARROW_MAX_ROWS", "8192") or 8192)
 
 
 def _bm_for(rows: int) -> int:
     return NARROW_BM if int(rows) <= NARROW_MAX_ROWS else BM
+
+
+def _bk_for(bm: int, k: int) -> int:
+    return NARROW_BK if bm == NARROW_BM and NARROW_BK > 0 and int(k) % NARROW_BK == 0 else BK
 BN = 64
 BK = 32
 THREADS = 128
@@ -61,6 +72,20 @@ THREADS = 128
 #: gather wins from 1,024 routed rows: 128 tokens 5.72 vs 6.30 ms, 192: 6.36
 #: vs 7.14, 256: 6.88 vs 7.94. MTPLX_M1_MOE_SEG_GATHER_MIN_ROWS overrides.
 MIN_ROWS = int(os.environ.get("MTPLX_M1_MOE_SEG_GATHER_MIN_ROWS", "1024") or 1024)
+#: Below ``MIN_ROWS`` MLX's own sorted gather is not a tiled matmul: its result
+#: differs from the tiles' in the last fp16 bits, so the bit canary cannot hold
+#: there. From ``LOW_MIN_ROWS`` routed rows the segmented tiles still serve (a
+#: prefill of ~48-127 tokens: the MoE layer of the 35B-A3B at 96 tokens 4.52 ->
+#: 2.71 ms, 127: 5.94 -> 3.15, 64: 3.28 -> 2.37 on real routing; M1 Max, a3b-s7)
+#: after a tolerance canary instead (``LOW_TOLERANCE`` relative to the largest
+#: output). Verify and decode (a few dozen routed rows) never reach it.
+#: OPT-IN (``MTPLX_M1_MOE_SEG_GATHER_LOW_ROWS=384``): the result is not the
+#: stock op's bits. Real hidden states, 64-127 token chunks against the stock
+#: path: hidden cosine 0.9994 mean, top-1 agreement 96.9-99.0% of rows (the ANE
+#: prefill's teacher-forced figure is 98.25%), chunk time 64 tokens 175 -> 153
+#: ms, 96: 250 -> 186, 127: 329 -> 224. Off by default (0).
+LOW_MIN_ROWS = min(MIN_ROWS, int(os.environ.get("MTPLX_M1_MOE_SEG_GATHER_LOW_ROWS", "0") or 0)) or MIN_ROWS
+LOW_TOLERANCE = 1e-2
 _ENV = "MTPLX_M1_MOE_SEG_GATHER"
 
 _HEADERS = (
@@ -342,7 +367,7 @@ def applies(
     rows = int(x.shape[0])
     k = int(x.shape[2])
     n = int(w.shape[1])
-    if rows < MIN_ROWS or int(rhs_indices.size) != rows:
+    if rows < LOW_MIN_ROWS or int(rhs_indices.size) != rows:
         return False
     if k % BK or n % BN or k % int(group_size):
         return False
@@ -389,7 +414,7 @@ def _segmented(x, w, scales, biases, rhs_indices, *, group_size: int, bits: int)
         inputs=[x.reshape(rows, k), w, scales, biases, tile_start, row_start],
         template=[
             ("T", x.dtype), ("GS", int(group_size)), ("BITS", int(bits)),
-            ("KD", k), ("ND", n), ("ED", experts), ("BM", bm), ("BN", BN), ("BK", BK),
+            ("KD", k), ("ND", n), ("ED", experts), ("BM", bm), ("BN", BN), ("BK", _bk_for(bm, k)),
         ],
         grid=((n // BN) * THREADS, rows // bm + experts, 1),
         threadgroup=(THREADS, 1, 1),
@@ -426,7 +451,7 @@ def gather_rows_qmm(tokens, row_map, w, scales, biases, rhs_indices, *, group_si
         inputs=[tokens.reshape(-1, k), w, scales, biases, tile_start, row_start, row_map.astype(mx.uint32)],
         template=[
             ("T", tokens.dtype), ("GS", int(group_size)), ("BITS", int(bits)),
-            ("KD", k), ("ND", n), ("ED", experts), ("BM", bm), ("BN", BN), ("BK", BK),
+            ("KD", k), ("ND", n), ("ED", experts), ("BM", bm), ("BN", BN), ("BK", _bk_for(bm, k)),
         ],
         grid=((n // BN) * THREADS, rows // bm + experts, 1),
         threadgroup=(THREADS, 1, 1),
@@ -456,7 +481,8 @@ def gather_qmm(x, w, scales, biases, rhs_indices, *, group_size: int, bits: int)
     ``x`` [rows, 1, K]; the first call of each shape is checked bit for bit
     against the stock op (and the stock op serves that shape on a mismatch)."""
 
-    key = (tuple(int(d) for d in w.shape), str(x.dtype), int(group_size), int(bits))
+    low = int(x.shape[0]) < MIN_ROWS
+    key = (tuple(int(d) for d in w.shape), str(x.dtype), int(group_size), int(bits)) + (("low",) if low else ())
     verdict = _CANARY.get(key)
     if verdict is False:
         return None
@@ -469,7 +495,12 @@ def gather_qmm(x, w, scales, biases, rhs_indices, *, group_size: int, bits: int)
             x, w, scales, biases, rhs_indices=rhs_indices, transpose=True,
             group_size=group_size, bits=bits, sorted_indices=True,
         )
-        same = bool(mx.array_equal(y, ref).item())
+        if low:
+            err = mx.abs(y.astype(mx.float32) - ref.astype(mx.float32)).max()
+            scale = mx.abs(ref.astype(mx.float32)).max()
+            same = bool((err <= LOW_TOLERANCE * scale).item())
+        else:
+            same = bool(mx.array_equal(y, ref).item())
         _CANARY[key] = same
         if not same:
             _STATS["canary_failures"] += 1
