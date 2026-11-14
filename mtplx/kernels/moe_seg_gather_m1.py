@@ -61,8 +61,14 @@ def _bm_for(rows: int) -> int:
     return NARROW_BM if int(rows) <= NARROW_MAX_ROWS else BM
 
 
-def _bk_for(bm: int, k: int) -> int:
-    return NARROW_BK if bm == NARROW_BM and NARROW_BK > 0 and int(k) % NARROW_BK == 0 else BK
+def _bk_for(bm: int, k: int, group_size: int) -> int:
+    """The K step of a tile. 64 only for 16-row tiles and groups of 64 or more: a
+    32-wide group does not build at BK 64 (MLX's tile body; 2/4/8-bit alike), and
+    64/128 groups are bit-identical to stock at 2, 4 and 8 bits (a3b-s7)."""
+
+    if bm == NARROW_BM and NARROW_BK > 0 and int(k) % NARROW_BK == 0 and int(group_size) >= NARROW_BK:
+        return NARROW_BK
+    return BK
 BN = 64
 BK = 32
 THREADS = 128
@@ -414,7 +420,7 @@ def _segmented(x, w, scales, biases, rhs_indices, *, group_size: int, bits: int)
         inputs=[x.reshape(rows, k), w, scales, biases, tile_start, row_start],
         template=[
             ("T", x.dtype), ("GS", int(group_size)), ("BITS", int(bits)),
-            ("KD", k), ("ND", n), ("ED", experts), ("BM", bm), ("BN", BN), ("BK", _bk_for(bm, k)),
+            ("KD", k), ("ND", n), ("ED", experts), ("BM", bm), ("BN", BN), ("BK", _bk_for(bm, k, group_size)),
         ],
         grid=((n // BN) * THREADS, rows // bm + experts, 1),
         threadgroup=(THREADS, 1, 1),
@@ -451,7 +457,7 @@ def gather_rows_qmm(tokens, row_map, w, scales, biases, rhs_indices, *, group_si
         inputs=[tokens.reshape(-1, k), w, scales, biases, tile_start, row_start, row_map.astype(mx.uint32)],
         template=[
             ("T", tokens.dtype), ("GS", int(group_size)), ("BITS", int(bits)),
-            ("KD", k), ("ND", n), ("ED", experts), ("BM", bm), ("BN", BN), ("BK", _bk_for(bm, k)),
+            ("KD", k), ("ND", n), ("ED", experts), ("BM", bm), ("BN", BN), ("BK", _bk_for(bm, k, group_size)),
         ],
         grid=((n // BN) * THREADS, rows // bm + experts, 1),
         threadgroup=(THREADS, 1, 1),

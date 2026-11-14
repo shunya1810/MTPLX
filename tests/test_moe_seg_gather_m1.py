@@ -54,9 +54,10 @@ def test_narrow_tiles_take_64_deep_k_steps_and_wide_tiles_keep_32():
 
     assert seg._bm_for(1024) == seg.NARROW_BM and seg._bm_for(8192) == seg.NARROW_BM
     assert seg._bm_for(16384) == seg.BM
-    assert seg._bk_for(seg.NARROW_BM, 2048) == 64 and seg._bk_for(seg.NARROW_BM, 512) == 64
-    assert seg._bk_for(seg.NARROW_BM, 96) == seg.BK  # K not a multiple of 64
-    assert seg._bk_for(seg.BM, 2048) == seg.BK
+    assert seg._bk_for(seg.NARROW_BM, 2048, 64) == 64 and seg._bk_for(seg.NARROW_BM, 512, 128) == 64
+    assert seg._bk_for(seg.NARROW_BM, 96, 64) == seg.BK  # K not a multiple of 64
+    assert seg._bk_for(seg.NARROW_BM, 2048, 32) == seg.BK  # a 32-wide group does not build at BK 64
+    assert seg._bk_for(seg.BM, 2048, 64) == seg.BK
 
 
 def test_low_row_class_is_off_by_default():
