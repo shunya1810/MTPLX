@@ -175,6 +175,18 @@ def test_expected_value_on_a_one_depth_family_resolves_to_static_depth_3():
     assert static["demoted"] is False and static["depth"] == 5
 
 
+def test_the_rule_lifts_when_the_compiled_route_is_switched_off(monkeypatch):
+    monkeypatch.setenv("MTPLX_QWEN4_FIXED_M4_VERIFY", "0")
+    resolved = ll.resolve_depth_policy(
+        "qwen4_exp", requested_policy="expected_value", requested_depth=3
+    )
+    assert resolved["policy"] == "expected_value" and resolved["demoted"] is False
+    monkeypatch.setenv("MTPLX_QWEN4_FIXED_M4_VERIFY", "1")
+    assert ll.resolve_depth_policy(
+        "qwen4_exp", requested_policy="expected_value", requested_depth=3
+    )["demoted"] is True
+
+
 def test_the_rule_lifts_by_itself_when_more_widths_are_compiled(monkeypatch):
     from dataclasses import replace
 

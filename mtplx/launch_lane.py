@@ -169,6 +169,20 @@ def depth_policy_priors(family: str | None) -> dict[str, Any]:
     return dict(value)
 
 
+def _compiled_route_engaged(compiled: frozenset[int]) -> bool:
+    """Whether the compiled verify route behind ``compiled_verify_depths`` is on.
+
+    The only family that declares the set is Flash-Next, whose compiled
+    route is the fixed-M4 verifier (graphbank.install_fixed_m4)."""
+
+    import os
+
+    # Unset follows the family block, which stamps the route on; only an
+    # explicit off (the M1 GGUF pack's runtime override) disengages it.
+    raw = (os.environ.get("MTPLX_QWEN4_FIXED_M4_VERIFY") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
 def resolve_depth_policy(
     family: str | None,
     *,
@@ -189,6 +203,14 @@ def resolve_depth_policy(
     policy = str(requested_policy or "none").strip().lower() or "none"
     depth = int(requested_depth) if requested_depth else None
     compiled = compiled_verify_depths(family)
+    if compiled is not None and not _compiled_route_engaged(compiled):
+        # The family's only compiled verify width is switched off for this
+        # process (Flash-Next fixed-M4, MTPLX_QWEN4_FIXED_M4_VERIFY=0, which
+        # the M1 GGUF pack stamps): every depth already runs the eager
+        # verifier, so a policy costs nothing and is not demoted. Measured
+        # on that pack (flashnext-ista Step 4): depth 1 beats depth 3 on
+        # prose and Japanese, depth 3 wins on code.
+        compiled = None
     if policy == "none" or compiled is None:
         return {
             "policy": policy,
