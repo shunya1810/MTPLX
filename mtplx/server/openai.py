@@ -1207,8 +1207,18 @@ def _server_runtime_env_overrides(
                     _qwen4_port_opt_in(overrides, "MTPLX_FRSPEC_DRAFT")
                     and os.environ.get("MTPLX_FRSPEC_VOCAB") is None
                 ):
+                    # M1 family: the Japanese-aware list (the code list
+                    # covers 78-84% of Japanese text tokens; on Flash-Next
+                    # Unsloth, Japanese decode 23.0 -> 29.1 tok/s greedy,
+                    # code unchanged, English -1-2%, 2026-11-16 fn-s7).
+                    from mtplx.cache_state import m1_long_context_defaults
+                    from mtplx.frspec_draft import M1_DEFAULT_VOCAB
+
                     overrides.setdefault(
-                        "MTPLX_FRSPEC_VOCAB", "builtin:qwen38-code-64k"
+                        "MTPLX_FRSPEC_VOCAB",
+                        M1_DEFAULT_VOCAB
+                        if m1_long_context_defaults()
+                        else "builtin:qwen38-code-64k",
                     )
                 # The pre-scatter draft read serves K20 from the FR-Spec
                 # head's compact row and raises at install without that

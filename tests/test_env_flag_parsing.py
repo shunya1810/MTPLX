@@ -448,7 +448,12 @@ def test_flash_next_speed_lane_is_default_on_and_pack_gated(
         assert overrides.get(key) == "1", key
     assert overrides["MTPLX_LAZY_TARGET_DISTRIBUTIONS"] == "0"
     assert overrides["MTPLX_QSA_GATHER_MAX_ROWS"] == "32"
-    assert overrides["MTPLX_FRSPEC_VOCAB"] == "builtin:qwen38-code-64k"
+    from mtplx.cache_state import m1_long_context_defaults
+    from mtplx.frspec_draft import M1_DEFAULT_VOCAB
+
+    assert overrides["MTPLX_FRSPEC_VOCAB"] == (
+        M1_DEFAULT_VOCAB if m1_long_context_defaults() else "builtin:qwen38-code-64k"
+    )
     # The 2026-09-03 ports from PR #391 (davidtai): the decode set, the two
     # prefill overlaps, the session-bank pair and the n-gram pre-read, with
     # the load-time children derived from their resolved parents.

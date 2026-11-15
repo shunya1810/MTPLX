@@ -181,11 +181,16 @@ from .sampling import SamplerConfig, SparseDistribution, sample_from_distributio
 
 _ENV_VAR = "MTPLX_QWEN4_DRAFT_K20_PRESCATTER"
 
-#: The only ranked-table width this route admits.  The built-in artifact
-#: ``mtplx/data/qwen38_code_ranked_64k.json`` is exactly this wide; a different
-#: width means a different (unproven) artifact, so the claim refuses instead of
-#: generalising.
+#: The built-in code list ``mtplx/data/qwen38_code_ranked_64k`` is exactly this
+#: wide.
 FRSPEC_ROWS = 65_536
+
+#: The ranked-table widths this route admits: the two built-in artifacts, the
+#: code list and the Japanese-aware list (``qwen38_code64k_ja``, 103,887 rows,
+#: also row-sorted). The argument below holds for any strictly ascending table
+#: wider than the candidate superset; another width means another (unproven)
+#: artifact, so the claim refuses instead of generalising.
+ADMITTED_ROWS = frozenset({FRSPEC_ROWS, 103_887})
 
 #: ``_device_serial_support_arrays``'s candidate-superset multiplier.  Mirrored
 #: here only to prove ``m <= FRSPEC_ROWS`` at claim time.
@@ -497,10 +502,10 @@ def _claim_draft_route(
         )
     ids_np = np.asarray(ids, dtype=np.int64).reshape(-1)
     rows = int(ids_np.shape[0])
-    if rows != FRSPEC_ROWS:
+    if rows not in ADMITTED_ROWS:
         _refuse(
             f"ranked table is {rows} rows; this route is proven only at "
-            f"{FRSPEC_ROWS}"
+            f"{sorted(ADMITTED_ROWS)}"
         )
     if not bool(np.all(ids_np[1:] > ids_np[:-1])):
         _refuse(

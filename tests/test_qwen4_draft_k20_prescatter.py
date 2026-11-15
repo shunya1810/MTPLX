@@ -194,6 +194,16 @@ def test_support_matches_stock_at_production_shape(seed):
     _assert_support_equivalent(plan, compact, _config())
 
 
+@pytest.mark.parametrize("seed", [404, 505])
+def test_support_matches_stock_at_japanese_list_width(seed):
+    """The Japanese-aware built-in list (103,887 rows) is admitted too."""
+
+    assert 103_887 in prescatter.ADMITTED_ROWS
+    plan = _plan(103_887, 248_320, seed)
+    compact = _compact_row(plan.rows, seed + 7)
+    _assert_support_equivalent(plan, compact, _config())
+
+
 @pytest.mark.parametrize("top_p", [0.95, 1.0, 0.0])
 def test_support_matches_stock_across_top_p_branches(top_p):
     """``top_p`` in (0,1) takes the logsumexp branch; 1.0/0.0 take softmax."""
