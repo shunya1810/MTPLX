@@ -250,13 +250,19 @@ def gguf_routed_expert_bytes(model_path: Any) -> int:
     """Bytes of the routed experts a converted GGUF pack builds at load
     (text_config.routed_experts_gguf, scripts/convert_flashnext_ista_gguf.py).
     They live in the GGUF, not in the pack's shards, but load as wired MLX
-    affine 2-bit g64 tensors: codes plus fp16 scale and bias per 64 weights."""
+    affine 2-bit g64 tensors: codes plus fp16 scale and bias per 64 weights.
+    Mixed-type packs ("format": "mixed") keep the GGUF blocks as they are."""
     spec = _text_config(Path(str(model_path))).get("routed_experts_gguf") or {}
+    block = {"Q2_0": (64, 18), "IQ4_NL": (32, 18), "IQ2_XXS": (256, 66), "IQ2_S": (256, 82)}
     total = 0
     for projs in (spec.get("layers") or {}).values():
         for t in projs.values():
             weights = int(t["experts"]) * int(t["rows"]) * int(t["cols"])
-            total += weights // 4 + weights // 64 * 4
+            if spec.get("format") == "mixed":
+                qk, bs = block[t["type"]]
+                total += weights // qk * bs
+            else:
+                total += weights // 4 + weights // 64 * 4
     return total
 
 

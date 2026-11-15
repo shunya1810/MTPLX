@@ -51,12 +51,13 @@ from pathlib import Path
 import numpy as np
 
 GGML_TYPES = {0: "F32", 1: "F16", 2: "Q4_0", 6: "Q5_0", 8: "Q8_0", 11: "Q3_K",
-              12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 20: "IQ4_NL", 23: "IQ4_XS",
+              12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 16: "IQ2_XXS", 20: "IQ4_NL",
+              22: "IQ2_S", 23: "IQ4_XS",
               30: "BF16", 42: "Q2_0"}
 BLOCK = {"F32": (1, 4), "F16": (1, 2), "BF16": (1, 2), "Q4_0": (32, 18),
          "Q5_0": (32, 22), "Q8_0": (32, 34), "Q3_K": (256, 110), "Q4_K": (256, 144),
          "Q5_K": (256, 176), "Q6_K": (256, 210), "IQ4_NL": (32, 18),
-         "IQ4_XS": (256, 136), "Q2_0": (64, 18)}
+         "IQ4_XS": (256, 136), "Q2_0": (64, 18), "IQ2_XXS": (256, 66), "IQ2_S": (256, 82)}
 KVALUES_IQ4NL = np.array([-127, -104, -83, -65, -49, -35, -22, -10,
                           1, 13, 25, 38, 53, 69, 89, 113], dtype=np.float32)
 
@@ -375,17 +376,37 @@ def write_block(w: Writer, g: Gguf, il: int, prefix: str):
         w.q(f"{M}.shared_expert.{proj}", affine(g.float(B + t + ".weight")))
 
 
+#: Routed-expert block types the mixed loader reads (mtplx.kernels.moe_gguf_iq).
+MIXED_EXPERT_TYPES = {"gate_proj": ("IQ2_XXS", "IQ2_S"), "up_proj": ("IQ2_XXS", "IQ2_S"),
+                      "down_proj": ("Q2_0", "IQ4_NL")}
+
+
 def expert_spec(g: Gguf, il: int) -> dict:
-    """GGUF location of one layer's routed experts, for the load-time builder."""
+    """GGUF location (and block type) of one layer's routed experts, for the load-time builder."""
     spec = {}
     for proj, t in (("gate_proj", "ffn_gate_exps"), ("up_proj", "ffn_up_exps"),
                     ("down_proj", "ffn_down_exps")):
         info = g.tensors[f"blk.{il}.{t}.weight"]
-        assert info["type"] == "Q2_0", (t, info["type"])
         cols, rows, n_exp = info["dims"]
         spec[proj] = {"path": str(Path(info["path"]).resolve()), "offset": info["offset"],
-                      "experts": n_exp, "rows": rows, "cols": cols}
+                      "experts": n_exp, "rows": rows, "cols": cols, "type": info["type"]}
     return spec
+
+
+def experts_format(experts: dict) -> str:
+    """"Q2_0" when every routed expert is Q2_0 (built as MLX affine 2-bit at load),
+    else "mixed" (Unsloth UD-Q2_0: IQ2_XXS / IQ2_S gate+up, Q2_0 / IQ4_NL down,
+    read as GGUF blocks by GGUFMixedSwitchGLU)."""
+    types = {(p, t["type"]) for spec in experts.values() for p, t in spec.items()}
+    if all(typ == "Q2_0" for _, typ in types):
+        return "Q2_0"
+    for spec in experts.values():
+        for proj, t in spec.items():
+            if t["type"] not in MIXED_EXPERT_TYPES[proj]:
+                raise SystemExit(f"unsupported routed expert type {t['type']} for {proj}")
+        if spec["gate_proj"]["type"] != spec["up_proj"]["type"]:
+            raise SystemExit("gate and up expert types differ in a layer")
+    return "mixed"
 
 
 def main():
@@ -399,6 +420,10 @@ def main():
     ap.add_argument("--layers", type=int, default=N_LAYER, help="debug: convert only the first N trunk layers")
     ap.add_argument("--hc-bits", type=int, choices=(0, 8), default=0,
                     help="hyper-connection mixers: 0 = fp16, 8 = affine 8-bit g64")
+    ap.add_argument("--source", default="ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF Q2_0",
+                    help="recipe note: where the GGUF came from")
+    ap.add_argument("--model-id", default="mtplx-flash-next-ista-q2_0",
+                    help="public_model_id written to mtplx_runtime.json")
     args = ap.parse_args()
     global HC_BITS
     HC_BITS = args.hc_bits
@@ -432,7 +457,12 @@ def main():
     cfg = json.load(open(args.ref / "config.json"))
     tc = cfg["text_config"]
     tc["dtype"] = "float16"
-    tc["routed_experts_gguf"] = {"format": "Q2_0", "layers": experts}
+    fmt = experts_format(experts)
+    if fmt == "Q2_0":
+        for spec in experts.values():
+            for t in spec.values():
+                t.pop("type")
+    tc["routed_experts_gguf"] = {"format": fmt, "layers": experts}
     table = g.tensors["per_layer_token_embd.weight"]
     assert table["type"] == "IQ4_NL", table["type"]
     dim, rows = table["dims"]
@@ -447,7 +477,7 @@ def main():
              if v is False and not (HC_BITS and "hyper_connection" in k)}
     quant.update({"group_size": DENSE_GROUP, "bits": DENSE_BITS, "mode": "affine"})
     for il in range(args.layers):
-        for proj in ("gate_proj", "up_proj", "down_proj"):
+        for proj in ("gate_proj", "up_proj", "down_proj") if fmt == "Q2_0" else ():
             quant[f"{LM}.model.layers.{il}.mlp.switch_mlp.{proj}"] = {
                 "group_size": EXPERT_GROUP, "bits": EXPERT_BITS, "mode": "affine"}
         for gate in ("mlp.gate", "mlp.shared_expert_gate"):
@@ -457,9 +487,11 @@ def main():
     cfg["mlx_lm_extra_tensors"] = {"mtp_file": "mtp.safetensors"}
     cfg["language_model_only"] = True
     cfg.pop("vision_config", None)
-    cfg["mtplx_recipe"] = {"source": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF Q2_0",
+    cfg["mtplx_recipe"] = {"source": args.source,
                            "gguf": [p.name for p in args.gguf],
-                           "experts": "Q2_0 read from the GGUF at load as affine 2-bit g64 (exact)",
+                           "experts": ("Q2_0 read from the GGUF at load as affine 2-bit g64 (exact)"
+                                       if fmt == "Q2_0" else
+                                       "GGUF blocks (IQ2_XXS/IQ2_S gate+up, Q2_0/IQ4_NL down) read at load as they are"),
                            "dense": "dequantized -> affine 8-bit g64",
                            "ngram": "IQ4_NL rows read from the GGUF",
                            "mtp": "Optimized-Speed pack mtp.safetensors", "dtype": "float16"}
@@ -469,7 +501,7 @@ def main():
         if (args.ref / f).exists():
             shutil.copy(args.ref / f, args.out / f)
     runtime = json.load(open(args.ref / "mtplx_runtime.json"))
-    runtime["public_model_id"] = "mtplx-flash-next-ista-q2_0"
+    runtime["public_model_id"] = args.model_id
     runtime["artifact_role"] = "converted-local"
     runtime.pop("speed_evidence", None)
     # M1 Max, greedy, eager verify with mid-forward evals (code/prose/ja tok/s):

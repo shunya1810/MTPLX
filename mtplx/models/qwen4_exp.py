@@ -1377,6 +1377,8 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
         # (32 or 64 — the 2026-08-27 01:35 reforge moved the pack to g64);
         # anything else runs the stock chain.
         sw = self.switch_mlp
+        if isinstance(sw, GGUFMixedSwitchGLU) and getattr(self, "sharding_group", None) is None:
+            return self._gguf_mixed_call(x, sw)
         if _q2_moe_glu_applies(sw, x):
             return self._q2_glu_call(x, sw)
         if (
@@ -1494,6 +1496,35 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
             shared_gate=self.shared_expert_gate(x).reshape(rows),
         )
         return y.reshape(x.shape)
+
+    def _gguf_mixed_call(self, x: mx.array, sw: "GGUFMixedSwitchGLU") -> mx.array:
+        """Routed experts kept as GGUF blocks (Unsloth UD-Q2_0 pack): router
+        softmax/top-k in one kernel; at decode and verify widths the GLU and
+        the down pass (with the shared expert's gated add) in two more, at
+        prefill widths expert-grouped tile-dequant matmuls and a weighted sum
+        (mtplx.kernels.moe_gguf_iq)."""
+        from mtplx.kernels.moe_gguf_iq import moe_iq_glu, moe_iq_prefill_parts
+        from mtplx.kernels.moe_q2_glu import moe_route_topk
+
+        rows = x.size // x.shape[-1]
+        x2 = x.reshape(rows, x.shape[-1])
+        idx, w = moe_route_topk(
+            self.gate(x).reshape(rows, -1), self.top_k, normalize=bool(self.norm_topk_prob)
+        )
+        if rows <= _GGUF_IQ_GLU_MAX_ROWS and (os.environ.get("MTPLX_GGUF_IQ_GLU") or "1").strip() != "0":
+            y = moe_iq_glu(
+                x2,
+                sw,
+                idx,
+                w,
+                shared=self.shared_expert(x).reshape(rows, -1),
+                shared_gate=self.shared_expert_gate(x).reshape(rows),
+            )
+            return y.reshape(x.shape)
+        part = moe_iq_prefill_parts(x2, sw, idx)
+        y = (part.reshape(rows, self.top_k, -1) * w.reshape(rows, self.top_k, 1)).sum(axis=1)
+        shared = attention_gate(self.shared_expert(x), self.shared_expert_gate(x)).reshape(rows, -1)
+        return (y.astype(x.dtype) + shared).reshape(x.shape)
 
     def _verify_call(self, x: mx.array) -> mx.array:
         """The parent's forward with the shared-expert gate under the verify
@@ -2743,7 +2774,7 @@ def _fused_moe_verify_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-_LAYER_MLP_RE = re.compile(r"^(.*\.layers\.(\d+)\.mlp)\.switch_mlp\.gate_proj\.weight$")
+_LAYER_MLP_RE = re.compile(r"^(.*\.layers\.(\d+)\.mlp)\.switch_mlp\.(?:gate_proj\.weight|gate_q)$")
 
 
 def _q2_0_affine_from_gguf(spec: dict) -> tuple[mx.array, mx.array, mx.array]:
@@ -2769,6 +2800,80 @@ def _q2_0_affine_from_gguf(spec: dict) -> tuple[mx.array, mx.array, mx.array]:
     return mx.array(codes), scales, -scales
 
 
+#: Token rows the GGUF-block GLU kernels take (decode and verify widths).
+_GGUF_IQ_GLU_MAX_ROWS = 8
+
+
+class GGUFMixedSwitchGLU(nn.Module):
+    """Routed experts kept as GGUF blocks, one structure of arrays per
+    projection (``<proj>_d`` fp16 block scales [E, R, nb], ``<proj>_q`` uint32
+    payload [E, R, nb * W]; mtplx.kernels.moe_gguf_iq). Built at sanitize time
+    with placeholder arrays that strict load_weights replaces."""
+
+    def __init__(self, num_experts, hidden, n_inter, gate_type, down_type, shapes):
+        super().__init__()
+        self.num_experts = int(num_experts)
+        self.hidden = int(hidden)
+        self.n_inter = int(n_inter)
+        self.gate_type = gate_type
+        self.down_type = down_type
+        for name, (shape, dtype) in shapes.items():
+            setattr(self, name, mx.zeros(shape, dtype=dtype))
+
+    def __call__(self, x, indices) -> mx.array:
+        """SwitchGLU's contract: x [..., K], indices [..., k] -> [..., k, D]."""
+        from mtplx.kernels.moe_gguf_iq import moe_iq_prefill_parts
+
+        k = indices.shape[-1]
+        rows = indices.size // k
+        part = moe_iq_prefill_parts(
+            x.reshape(rows, x.shape[-1]), self, indices.reshape(-1).astype(mx.uint32)
+        )
+        return part.astype(x.dtype).reshape(*indices.shape, self.hidden)
+
+
+def _gguf_blocks_soa(spec: dict) -> tuple[mx.array, mx.array]:
+    """One routed-expert tensor of GGUF blocks -> (d fp16 [E, R, nb], q uint32 [E, R, nb * W])."""
+    import numpy as np
+
+    from mtplx.kernels.moe_gguf_iq import BLOCKS
+
+    qk, bs, words = BLOCKS[spec["type"]]
+    n_exp, rows, cols = int(spec["experts"]), int(spec["rows"]), int(spec["cols"])
+    blocks = np.memmap(
+        spec["path"], dtype=np.uint8, mode="r", offset=int(spec["offset"]),
+        shape=(n_exp, rows, cols // qk, bs),
+    )
+    d = np.ascontiguousarray(blocks[..., :2]).view(np.float16).reshape(n_exp, rows, cols // qk)
+    q = np.ascontiguousarray(blocks[..., 2:]).view(np.uint32).reshape(n_exp, rows, cols // qk * words)
+    return mx.array(d), mx.array(q)
+
+
+def _gguf_mixed_experts_sanitize(model, spec: dict, out: dict) -> dict:
+    """Routed experts of mixed GGUF block types ("format": "mixed",
+    scripts/build_flashnext_gguf_experts_pack.py): each layer's switch_mlp
+    becomes a GGUFMixedSwitchGLU and its block arrays go into the weights."""
+    for layer, projs in spec["layers"].items():
+        li = int(layer)
+        base = f"language_model.model.layers.{li}.mlp.switch_mlp"
+        g, u, dn = projs["gate_proj"], projs["up_proj"], projs["down_proj"]
+        if g["type"] != u["type"]:
+            raise ValueError(f"layer {li}: gate and up GGUF types differ")
+        shapes = {}
+        for name, t in (("gate", g), ("up", u), ("down", dn)):
+            d, q = _gguf_blocks_soa(t)
+            out[f"{base}.{name}_d"] = d
+            out[f"{base}.{name}_q"] = q
+            shapes[f"{name}_d"] = (d.shape, d.dtype)
+            shapes[f"{name}_q"] = (q.shape, q.dtype)
+        mlp = model.layers[li].mlp
+        mlp.switch_mlp = GGUFMixedSwitchGLU(
+            int(g["experts"]), int(g["cols"]), int(g["rows"]), g["type"], dn["type"], shapes
+        )
+    print(f"[qwen4_exp] GGUF mixed-type routed experts: {len(spec['layers'])} layers", flush=True)
+    return out
+
+
 def _gguf_q2_0_experts_sanitize(model, out: dict) -> dict:
     """Add the routed experts a converted ISTA GGUF pack leaves in the GGUF
     (text_config.routed_experts_gguf, scripts/convert_flashnext_ista_gguf.py)
@@ -2777,6 +2882,8 @@ def _gguf_q2_0_experts_sanitize(model, out: dict) -> dict:
     spec = (model.args.text_config or {}).get("routed_experts_gguf")
     if not spec:
         return out
+    if spec.get("format") == "mixed":
+        return _gguf_mixed_experts_sanitize(model, spec, out)
     if spec.get("format") != "Q2_0":
         raise ValueError(f"unsupported GGUF routed expert format {spec.get('format')}")
     for layer, projs in spec["layers"].items():
