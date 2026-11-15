@@ -3013,8 +3013,10 @@ _PREFILL_MIDLOOP_DEFAULT_LAYERS = 4
 #: step. M1 Max, Flash-Next ISTA Q2_0, greedy depth 1 (code/prose/ja): one
 #: eval at the end 31.7/30.2/23.8 tok/s, every 12 layers 36.0/33.7/26.6,
 #: every 6 35.8/34.5/27.3 (the host builds a step in ~5-9 ms, which the GPU
-#: otherwise waits out before the first kernel).
-_DECODE_MIDLOOP_DEFAULT_LAYERS = 6
+#: otherwise waits out before the first kernel). Every 2 (2026-11-15, streak
+#: depth policy, two interleaved runs): round 49.1 -> 48.3 ms Japanese,
+#: 49.8 -> 49.2 prose, 81.2 -> 80.0 code (m1max-longctx-bench-work/fn-s5).
+_DECODE_MIDLOOP_DEFAULT_LAYERS = 2
 
 
 def _decode_midloop_eval_layers() -> int:
