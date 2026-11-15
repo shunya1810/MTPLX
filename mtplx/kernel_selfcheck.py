@@ -606,15 +606,20 @@ def _check_qwen4_hc_prefill_read(mx) -> float:
     mx.random.seed(29)
     rows, streams, hidden = _FLASH_NEXT_ROWS, hc._HC, hc._HIDDEN
     grouped = (1, rows, streams, hidden)
-    x = (mx.random.normal((1, rows, streams * hidden)) * 3.0).astype(mx.bfloat16)
-    weight = (1.0 + 0.1 * mx.random.normal((streams * hidden,))).astype(mx.bfloat16)
-    up = (mx.random.normal(x.shape) * 12.0).astype(mx.bfloat16)
-    want_norm = mx.fast.rms_norm(x.reshape(grouped), None, 1e-6).reshape(x.shape) * weight
-    want_mix = mx.mean(mx.sigmoid(up).reshape(grouped) * want_norm.reshape(grouped), axis=-2)
-    return max(
-        _bitwise_worst(mx, hc._normalize(x, weight, 1e-6), want_norm),
-        _bitwise_worst(mx, hc._mix(up, want_norm), want_mix),
-    )
+    worst = 0.0
+    # bf16 packs and the fp16 ones the M1 family loads
+    for dtype in (mx.bfloat16, mx.float16):
+        x = (mx.random.normal((1, rows, streams * hidden)) * 3.0).astype(dtype)
+        weight = (1.0 + 0.1 * mx.random.normal((streams * hidden,))).astype(dtype)
+        up = (mx.random.normal(x.shape) * 12.0).astype(dtype)
+        want_norm = mx.fast.rms_norm(x.reshape(grouped), None, 1e-6).reshape(x.shape) * weight
+        want_mix = mx.mean(mx.sigmoid(up).reshape(grouped) * want_norm.reshape(grouped), axis=-2)
+        worst = max(
+            worst,
+            _bitwise_worst(mx, hc._normalize(x, weight, 1e-6), want_norm),
+            _bitwise_worst(mx, hc._mix(up, want_norm), want_mix),
+        )
+    return worst
 
 
 def _check_qwen4_gdn_gated_norm(mx) -> float:

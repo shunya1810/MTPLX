@@ -86,7 +86,7 @@ def test_cpu_unsupported_contract_declines_before_any_tensor_work(
     monkeypatch, unsupported
 ):
     mlx, mx, nn = ModuleType("mlx"), ModuleType("mlx.core"), ModuleType("mlx.nn")
-    mx.bfloat16, mx.gpu = object(), object()
+    mx.bfloat16, mx.float16, mx.gpu = object(), object(), object()
     mx.metal = SimpleNamespace(is_available=lambda: True)
     mx.default_device = lambda: mx.gpu
     mlx.core, mlx.nn = mx, nn

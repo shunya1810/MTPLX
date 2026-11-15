@@ -36,6 +36,9 @@ MAX_ROWS = 4
 _NSG = 8          # simdgroups per threadgroup
 _NR = int(os.environ.get("MTPLX_HC_Q8_NR", "4"))   # D1 output rows per simdgroup
 _ND = int(os.environ.get("MTPLX_HC_Q8_ND", "4"))   # D2 hidden positions per simdgroup
+#: D1 column splits of each stream (more threadgroups; partials summed in D2):
+#: 1 by default (M1 Max: 2-8 splits measured slower at 1-4 rows).
+_KS = int(os.environ.get("MTPLX_HC_Q8_KS", "1"))
 
 _D1_SRC = r"""
     // Threadgroup = one stream g x NSG * NR output rows. The stream's rows
@@ -44,22 +47,25 @@ _D1_SRC = r"""
     // NR pack rows against them.
     constexpr uint NOUT = R + HC;
     constexpr uint HCD = HC * D;
-    constexpr uint NV = D / 16;                // 16-element vectors per stream row
+    constexpr uint DS = D / KS;                // columns of this split
+    constexpr uint NV = DS / 16;               // 16-element vectors per split row
     constexpr uint RPT = NSG * NR;             // output rows per threadgroup
-    threadgroup T xg[S * D];
+    threadgroup T xg[S * DS];
     threadgroup float xsum[S * NV];
     threadgroup float ssp[S * NSG];
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint t = thread_index_in_threadgroup;
-    const uint g = threadgroup_position_in_grid.y;
+    const uint gk = threadgroup_position_in_grid.y;   // stream * KS + split
+    const uint g = gk / KS;
+    const uint ks = gk % KS;
     const uint blk = threadgroup_position_in_grid.x;
 
     float ss[S];
     for (int s = 0; s < S; ++s) ss[s] = 0.0f;
     for (uint u = t; u < (uint)(S * NV); u += NSG * 32) {
         const uint s = u / NV;
-        const uint e0 = (u % NV) * 16;
+        const uint e0 = ks * DS + (u % NV) * 16;
         const uint col = g * D + e0;
         const device vec<T, 4>* xv4 = (const device vec<T, 4>*)(x + (size_t)s * HCD + col);
         const device vec<T, 4>* gv4 = (const device vec<T, 4>*)(gamma + col);
@@ -77,7 +83,7 @@ _D1_SRC = r"""
             const float4 f = float4(v);
             sq += dot(f, f);
             const vec<T, 4> gv = vec<T, 4>(f * float4(gv4[q]));
-            ((threadgroup vec<T, 4>*)(xg + s * D + e0))[q] = gv;
+            ((threadgroup vec<T, 4>*)(xg + s * DS + (e0 - ks * DS)))[q] = gv;
             const float4 gf = float4(gv);
             sum += gf.x + gf.y + gf.z + gf.w;
         }
@@ -94,7 +100,7 @@ _D1_SRC = r"""
     if (blk == 0 && t < (uint)S) {
         float a = 0.0f;
         for (uint i = 0; i < (uint)NSG; ++i) a += ssp[t * NSG + i];
-        sumsq[g * S + t] = a;
+        sumsq[gk * S + t] = a;
     }
 
     const uint row0 = blk * RPT + sg * NR;
@@ -102,28 +108,32 @@ _D1_SRC = r"""
     for (int r = 0; r < NR; ++r)
         for (int s = 0; s < S; ++s) acc[r][s] = 0.0f;
     for (uint v = lane; v < NV; v += 32) {
-        const uint col = g * D + v * 16;
+        const uint col = g * D + ks * DS + v * 16;
+        uint4 wv[NR];
+        float sc[NR], bi[NR];
         for (int r = 0; r < NR; ++r) {
-            const uint n = row0 + r;
-            if (n >= NOUT) break;
-            const uint4 wv = ((device const uint4*)(wq + (size_t)n * (HCD / 4)))[col / 16];
-            const float sc = (float)wsc[(size_t)n * (HCD / 64) + col / 64];
-            const float bi = (float)wbi[(size_t)n * (HCD / 64) + col / 64];
-            const thread uchar* q = (const thread uchar*)&wv;
-            for (int s = 0; s < S; ++s) {
-                const threadgroup T* xv = xg + s * D + v * 16;
-                float d_ = 0.0f;
-                for (int k = 0; k < 16; ++k) d_ = metal::fma((float)q[k], (float)xv[k], d_);
-                acc[r][s] += sc * d_ + bi * xsum[s * NV + v];
+            const uint n = min(row0 + r, NOUT - 1);   // rows past NOUT compute a copy, never stored
+            wv[r] = ((device const uint4*)(wq + (size_t)n * (HCD / 4)))[col / 16];
+            sc[r] = (float)wsc[(size_t)n * (HCD / 64) + col / 64];
+            bi[r] = (float)wbi[(size_t)n * (HCD / 64) + col / 64];
+        }
+        for (int s = 0; s < S; ++s) {
+            // the stream's 16 staged x * gamma values, read once for all NR rows
+            const threadgroup vec<T, 4>* xv4 = (const threadgroup vec<T, 4>*)(xg + s * DS + v * 16);
+            const float4 x0 = float4(xv4[0]), x1 = float4(xv4[1]), x2 = float4(xv4[2]), x3 = float4(xv4[3]);
+            const float xs = xsum[s * NV + v];
+            for (int r = 0; r < NR; ++r) {
+                const float d_ = dot(float4(as_type<uchar4>(wv[r].x)), x0) + dot(float4(as_type<uchar4>(wv[r].y)), x1)
+                               + dot(float4(as_type<uchar4>(wv[r].z)), x2) + dot(float4(as_type<uchar4>(wv[r].w)), x3);
+                acc[r][s] += sc[r] * d_ + bi[r] * xs;
             }
         }
     }
     for (int r = 0; r < NR; ++r) {
         const uint n = row0 + r;
-        if (n >= NOUT) break;
         for (int s = 0; s < S; ++s) {
             const float a = simd_sum(acc[r][s]);
-            if (lane == 0) partial[((size_t)g * S + s) * NOUT + n] = a;
+            if (lane == 0 && n < NOUT) partial[((size_t)gk * S + s) * NOUT + n] = a;
         }
     }
 """
@@ -137,16 +147,25 @@ _D2_SRC = r"""
     const uint sg = simdgroup_index_in_threadgroup;
     const uint t = thread_index_in_threadgroup;
     threadgroup float scale_s[HC * S];
-    threadgroup float mixs[S * R];
+    threadgroup float4 mixs4[S * R / 4];
+    threadgroup float msum[S * RV];
+    threadgroup float* mixs = (threadgroup float*)mixs4;
     if (t < (uint)(HC * S)) {
-        scale_s[t] = metal::rsqrt(sumsq[t] / (float)D + eps_arr[0]);
+        const uint g = t / S, s = t % S;
+        float a = 0.0f;
+        for (uint k = 0; k < (uint)KS; ++k) a += sumsq[(g * KS + k) * S + s];
+        scale_s[t] = metal::rsqrt(a / (float)D + eps_arr[0]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = t; i < (uint)(S * NOUT); i += NSG * 32) {
         const uint s = i / NOUT;
         const uint n = i % NOUT;
         float a = 0.0f;
-        for (uint g = 0; g < (uint)HC; ++g) a += scale_s[g * S + s] * partial[((size_t)g * S + s) * NOUT + n];
+        for (uint g = 0; g < (uint)HC; ++g) {
+            float pg = 0.0f;
+            for (uint k = 0; k < (uint)KS; ++k) pg += partial[((size_t)(g * KS + k) * S + s) * NOUT + n];
+            a += scale_s[g * S + s] * pg;
+        }
         const float lin = (float)((T)a);
         const float div = (float)((T)(lin / (float)HC));
         const float sig = 1.0f / (1.0f + metal::exp(-div));
@@ -155,6 +174,13 @@ _D2_SRC = r"""
         } else if (threadgroup_position_in_grid.x == 0) {
             inject[(size_t)s * HC + (n - R)] = (T)(2.0f * (float)((T)sig));
         }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // per (row, 8-wide vector) sums of the mixes: the bias term of the affine pack
+    for (uint i = t; i < (uint)(S * RV); i += NSG * 32) {
+        const threadgroup float4* m4 = mixs4 + i * 2;
+        const float4 a = m4[0] + m4[1];
+        msum[i] = (a.x + a.y) + (a.z + a.w);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint g = lane / 8;                   // stream of this lane
@@ -171,15 +197,11 @@ _D2_SRC = r"""
             const uint2 wv = ((device const uint2*)(uq + row * (R / 4)))[v];
             const float sc = (float)usc[row * (R / 64) + (v * 8) / 64];
             const float bi = (float)ubi[row * (R / 64) + (v * 8) / 64];
-            const thread uchar* q = (const thread uchar*)&wv;
+            const float4 q0 = float4(as_type<uchar4>(wv.x)), q1 = float4(as_type<uchar4>(wv.y));
             for (int s = 0; s < S; ++s) {
-                threadgroup const float* m = mixs + s * R + v * 8;
-                float qd = 0.0f, ms = 0.0f;
-                for (int k = 0; k < 8; ++k) {
-                    qd = metal::fma((float)q[k], m[k], qd);
-                    ms += m[k];
-                }
-                acc[s] += sc * qd + bi * ms;
+                const threadgroup float4* m4 = mixs4 + (s * R + v * 8) / 4;
+                const float qd = dot(q0, m4[0]) + dot(q1, m4[1]);
+                acc[s] += sc * qd + bi * msum[s * RV + v];
             }
         }
         float out[S];
@@ -213,7 +235,7 @@ def _eps(eps: float) -> mx.array:
 @lru_cache(maxsize=None)
 def _d1_kernel(write: bool):
     return mx.fast.metal_kernel(
-        name=f"mtplx_hc_q8_d1_{'w' if write else 'r'}",
+        name=f"mtplx_hc_q8v_d1_{'w' if write else 'r'}",
         input_names=["x", "gamma", "bo", "inj", "wq", "wsc", "wbi"],
         output_names=["partial", "sumsq", "hyper_out"],
         source=_D1_SRC,
@@ -223,7 +245,7 @@ def _d1_kernel(write: bool):
 @lru_cache(maxsize=None)
 def _d2_kernel(write: bool):
     return mx.fast.metal_kernel(
-        name=f"mtplx_hc_q8_d2_{'w' if write else 'r'}",
+        name=f"mtplx_hc_q8v_d2_{'w' if write else 'r'}",
         input_names=["partial", "sumsq", "x", "hyper_out", "gamma", "uq", "usc", "ubi", "eps_arr"],
         output_names=["mixed", "inject"],
         source=_D2_SRC,
@@ -295,20 +317,21 @@ def hc_read_q8(module, hyper_input: mx.array, pending=None):
         bo2 = inj2 = x2  # unused
     gamma = module.hc_norm.weight
     rpt = _NSG * _NR
+    ks = _KS if _KS > 0 and d % (16 * _KS) == 0 else 1
     partial, sumsq, hyper_out = _d1_kernel(write)(
         inputs=[x2, gamma, bo2, inj2, wq, wsc, wbi],
         template=[("T", dt), ("HC", hc), ("D", d), ("R", r), ("S", rows), ("NSG", _NSG),
-                  ("NR", _NR), ("WRITE", int(write))],
-        grid=(32 * _NSG * ((n_out + rpt - 1) // rpt), hc, 1),
+                  ("NR", _NR), ("WRITE", int(write)), ("KS", ks)],
+        grid=(32 * _NSG * ((n_out + rpt - 1) // rpt), hc * ks, 1),
         threadgroup=(32 * _NSG, 1, 1),
-        output_shapes=[(hc * rows * n_out,), (hc * rows,), (rows, hcd) if write else (1,)],
+        output_shapes=[(hc * ks * rows * n_out,), (hc * ks * rows,), (rows, hcd) if write else (1,)],
         output_dtypes=[mx.float32, mx.float32, dt],
     )
     per_tg = _NSG * _ND
     mixed, inject = _d2_kernel(write)(
         inputs=[partial, sumsq, x2, hyper_out, gamma, uq, usc, ubi, _eps(float(module.hc_norm.eps))],
         template=[("T", dt), ("HC", hc), ("D", d), ("R", r), ("S", rows), ("NSG", _NSG),
-                  ("ND", _ND), ("WRITE", int(write))],
+                  ("ND", _ND), ("WRITE", int(write)), ("KS", ks)],
         grid=(32 * _NSG * ((d + per_tg - 1) // per_tg), 1, 1),
         threadgroup=(32 * _NSG, 1, 1),
         output_shapes=[(rows, d), (rows, hc)],

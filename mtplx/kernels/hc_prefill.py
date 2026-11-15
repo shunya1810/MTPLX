@@ -154,14 +154,16 @@ def _kernels():
     return norm, mix
 
 
-@lru_cache(maxsize=1)
-def _sigmoid_table():
+@lru_cache(maxsize=None)
+def _sigmoid_table(dtype=None):
     import mlx.core as mx
 
-    # One shared 128 KiB array. Lazy native evaluation uses this MLX build's
-    # sigmoid for every BF16 bit pattern, including infinities and NaNs.
+    # One shared 128 KiB array per dtype. Lazy native evaluation uses this MLX
+    # build's sigmoid for every 16-bit pattern (bf16, or fp16 for the M1 packs
+    # that carry the model in float16), including infinities and NaNs.
+    dtype = mx.bfloat16 if dtype is None else dtype
     bits = mx.arange(65536, dtype=mx.uint32).astype(mx.uint16)
-    return mx.sigmoid(bits.view(mx.bfloat16), stream=mx.gpu)
+    return mx.sigmoid(bits.view(dtype), stream=mx.gpu)
 
 
 def _normalize(x, weight, eps, *, hc=_HC, hidden=_HIDDEN):
@@ -170,11 +172,11 @@ def _normalize(x, weight, eps, *, hc=_HC, hidden=_HIDDEN):
     groups = x.size // hidden
     return _kernels()[0](
         inputs=[x, weight, eps],
-        template=[("T", mx.bfloat16), ("HC", hc), ("H", hidden)],
+        template=[("T", x.dtype), ("HC", hc), ("H", hidden)],
         grid=(groups * (hidden // 4), 1, 1),
         threadgroup=(hidden // 4, 1, 1),
         output_shapes=[x.shape],
-        output_dtypes=[mx.bfloat16],
+        output_dtypes=[x.dtype],
     )[0]
 
 
@@ -183,12 +185,12 @@ def _mix(up, normed, *, hc=_HC, hidden=_HIDDEN):
 
     rows = up.size // (hc * hidden)
     return _kernels()[1](
-        inputs=[up, normed, _sigmoid_table(), rows],
-        template=[("T", mx.bfloat16), ("HC", hc), ("H", hidden)],
+        inputs=[up, normed, _sigmoid_table(up.dtype), rows],
+        template=[("T", up.dtype), ("HC", hc), ("H", hidden)],
         grid=(rows * hidden, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(*up.shape[:-1], hidden)],
-        output_dtypes=[mx.bfloat16],
+        output_dtypes=[up.dtype],
     )[0]
 
 
@@ -204,10 +206,10 @@ def hc_prefill_read(owner, hyper_input):
     import mlx.nn as nn
 
     if (
-        hyper_input.dtype != mx.bfloat16
+        hyper_input.dtype not in (mx.bfloat16, mx.float16)
         or not mx.metal.is_available()
         or mx.default_device() != mx.gpu
-        or owner.hc_norm.weight.dtype != mx.bfloat16
+        or owner.hc_norm.weight.dtype != hyper_input.dtype
         or owner.hc_norm.weight.shape != (_WIDTH,)
         or owner.hc_norm.group_size != _HIDDEN
     ):
@@ -221,7 +223,7 @@ def hc_prefill_read(owner, hyper_input):
         projections.append((owner.block_inject_weight, (_HC, _WIDTH)))
     if any(
         hasattr(proj, "scales")
-        or proj.weight.dtype != mx.bfloat16
+        or proj.weight.dtype != hyper_input.dtype
         or proj.weight.shape != shape
         or getattr(proj, "bias", None) is not None
         for proj, shape in projections
