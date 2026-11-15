@@ -1989,11 +1989,11 @@ def _apply_backend_serve_defaults(args: Any, inspection: dict[str, Any]) -> None
 
     # An artifact may declare its measured best depth policy
     # (``adaptive_policy_default`` in mtplx_runtime.json); an explicit
-    # --adaptive-policy wins. The M1 Flash-Next ISTA pack declares "streak"
-    # starting at depth 3 (``adaptive_start_depth_default``): depth 3 is
-    # fastest on code, depth 1 on prose and Japanese, and the policy tracks
-    # both (m1max-longctx-bench-work/fn-s5: temperature 1.0, code 45.0 vs
-    # 48.7 at static depth 3, prose 32.2 vs 31.1, Japanese 27.9 vs 24.4).
+    # --adaptive-policy wins, and so does --adaptive-start-depth over
+    # ``adaptive_start_depth_default``. The converted Flash-Next packs declare
+    # none: "streak" from depth 3 helped short non-thinking Japanese answers
+    # (27.9 vs 24.4 tok/s) but lost to static depth 3 with thinking on
+    # (llm-bench b3 agent 2K, M1 Max: 36.0 vs 42.8 tok/s).
     meta = _artifact_runtime_metadata(inspection)
     if "adaptive-policy" not in cli_flags:
         declared = str(meta.get("adaptive_policy_default") or "").strip().lower()

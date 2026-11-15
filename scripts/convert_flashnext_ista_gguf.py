@@ -511,10 +511,9 @@ def main():
     # no mid-forward evals, so the pack turns it off (an operator export wins).
     runtime["mtp_depth_default"] = 3
     runtime["runtime_env_overrides"] = {"MTPLX_QWEN4_FIXED_M4_VERIFY": "0"}
-    # Measured on M1 Max (fn-s5): the streak depth policy starting at depth 3
-    # keeps code near static depth 3 and prose / Japanese near depth 1.
-    runtime["adaptive_policy_default"] = "streak"
-    runtime["adaptive_start_depth_default"] = 3
+    # No adaptive depth policy: with thinking on (llm-bench b3, M1 Max) static
+    # depth 3 decodes faster than the streak policy (agent 2K 42.8 vs 36.0
+    # tok/s), though streak wins on short non-thinking Japanese answers.
     json.dump(runtime, open(args.out / "mtplx_runtime.json", "w"), indent=2)
     if not (args.out / "mtp.safetensors").exists():
         print("NOTE: copy the Optimized-Speed pack's mtp.safetensors into the output dir")
