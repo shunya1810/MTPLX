@@ -1,8 +1,55 @@
-# v2.12.3-m1.15 / m1.14 / v2.12.2-m1.13 / m1.12 / m1.11 / m1.10 / m1.9 / m1.8 / m1.7 / m1.6 / m1.5 / m1.4 / m1.3 / m1.2 / m1.1 / v2.12.2-m1 / v2.12.0-m1 〜 m1.3 変更内容まとめ
+# v2.12.3-m1.16 / m1.15 / m1.14 / v2.12.2-m1.13 / m1.12 / m1.11 / m1.10 / m1.9 / m1.8 / m1.7 / m1.6 / m1.5 / m1.4 / m1.3 / m1.2 / m1.1 / v2.12.2-m1 / v2.12.0-m1 〜 m1.3 変更内容まとめ
 
 - **ベースリポジトリ：** MTPLX 2.12.3（本家 `youssofal/MTPLX` の v2.12.3）。`v2.12.2-m1.4`〜`m1.13` は 2.12.2、`v2.12.0-m1.3` までは 2.12.0 がベースです
-- **対象：** タグ `v2.12.3-m1.15`（ブランチ `m1max-longctx`）。下の「変更点一覧」の M1 向けの変更はそのまま引き継いでいます
+- **対象：** タグ `v2.12.3-m1.16`（ブランチ `m1max-longctx`）。下の「変更点一覧」の M1 向けの変更はそのまま引き継いでいます
 - **本家との差分：** コード、テストコード、各種ドキュメント（`docs/m1max-longctx/`）、起動・検証スクリプト
+
+## v2.12.3-m1.16 での変更（2026-11-16）
+
+Qwen3.8-Flash-Next を、Unsloth の UD-Q2_0 の GGUF で動かせるようにしました（64 GB の Mac 向け）。ISTA の Q2_0 の GGUF より perplexity がずっと低く、こちらを勧めます。ほかのモデルの経路は変わりません。ネイティブ拡張は m1.12 から変わっていないので、作り直す必要はありません。
+
+- **Unsloth の GGUF の expert を、block のまま読むようにしました**（`mtplx/kernels/moe_gguf_iq.py`、`qwen4_exp.GGUFMixedSwitchGLU`）。Unsloth は層ごとに、routed の expert の gate / up を IQ2_XXS か IQ2_S、down を Q2_0 か IQ4_NL で量子化しています。どれも MLX の affine の格子では表せないので、読み込み時に block の scale（fp16）と本体（uint32）に分けるだけで、そのまま kernel で読みます。
+  - decode と verify（1〜8 行）: gate / up は 2 つの kernel で計算します。grid の値と符号を half8 の表にして、8 重みを XOR 1 回で展開します。down は、重み付きの和と shared expert の足し込みまで 1 つの kernel で計算します。
+  - prefill: expert ごとに token をまとめ、重みの tile を threadgroup のメモリに展開して simdgroup の行列積で計算します。次の K step の重みと activation を register に先読みし、expert の平均の token 数で tile を 16 / 32 token に切り替えます。
+  - 表と block の形式は ggml（llama.cpp、MIT）から取りました（`mtplx/kernels/gguf_iq_tables.py`、`NOTICE`、`mtplx/kernels/GGML_LICENSE.txt`）。
+- **dense の重みも Unsloth の GGUF から変換します。** ISTA の GGUF は dense も低精度で（shared expert が Q2_0、attention や ssm_out が Q3_K / IQ4_XS / Q4_K）、Unsloth は Q5_K〜Q8_0 です。どちらも 8bit に量子化し直すので、メモリは増えません。`scripts/convert_flashnext_ista_gguf.py` は、expert の型を見て ISTA（`"format": "Q2_0"`）と Unsloth（`"format": "mixed"`）を書き分けます。
+- **準備のスクリプト `scripts/setup_flashnext_unsloth.py`。** GGUF（3 分割、70.5 GB、途中から再開できます）と、Youssofal の Optimized-Speed パックの設定・tokenizer・MTP ヘッドをダウンロードし、変換します（CPU で数分）。使い方は [USAGE.ja.md](USAGE.ja.md#qwen38-flash-nextunsloth-ud-q2_0) にあります。この Mac で最初から通して実行し、できたフォルダが計測に使ったものとバイト単位で同じことを確かめました（GGUF の 3 ファイルも Hugging Face の SHA-256 と一致）。
+- **パックが MTP の深さの方針を `mtplx_runtime.json` で宣言できるようにしました**（`adaptive_policy_default`、`adaptive_start_depth_default`。明示したフラグが優先）。Flash-Next はこれまで、深さ 3 だけ compile 済みの verify があるという理由で、どの方針も深さ 3 に固定していました。M1 のパックはその verify を切っているので、固定はしないようにしました。ただし変換したパックの既定は固定の深さ 3 のままです。streak（深さ 3 から始めて、外れが続くと浅くする）は思考なしの短い日本語の答えでは速い（27.9 vs 24.4 tok/s）ものの、思考ありでは遅かったためです（llm-bench の b3、エージェント 2K で 36.0 vs 42.8 tok/s、2 round とも同じ）。
+- **Flash-Next の decode で、途中の非同期 eval を 6 層ごとから 2 層ごとにしました**（`_DECODE_MIDLOOP_DEFAULT_LAYERS`）。1 round が 1〜1.6% 短くなります。
+- **品質**（`ppl_fn.py`、4 つの文章 × 4 か所 × 1,024 トークン、teacher forcing）
+
+  | | 英語の小説 | 日本語の小説 | コード | エージェントのログ |
+  |---|---|---|---|---|
+  | ISTA Q2_0 | 7.30 | 34.6 | 2.77 | 2.65 |
+  | Unsloth UD-Q2_0 | 6.77 | 20.2 | 2.47 | 1.94 |
+  | 参考: Qwen3.8-27B の Optimized-Speed パック | 6.97 | 21.8 | 2.50 | 2.23 |
+
+  4 つとも差は誤差の範囲を超えています（ΔNLL −0.08 〜 −0.54、95% 区間 ±0.02〜0.09）。expert だけを Unsloth にしたパックは 7.15 / 22.3 / 2.64 / 2.35 で、残りの差は dense の精度の分です。
+- **速さ**（M1 Max 64 GB、[apple-silicon-llm-bench](https://github.com/shunya1810/apple-silicon-llm-bench) の bench 3 と同じ課題、思考あり、8bit の KV。同じビルドで ISTA と Unsloth のサーバーを交互に起動。ISTA → Unsloth）
+
+  | | 長さ | prompt の読み込み（秒、cold） | decode、思考あり（tok/s） | 事実の質問 |
+  |---|---|---|---|---|
+  | コード | 2K | 5.95 → 6.64 | 42.6 → 40.9 | 4/4 → 4/4 |
+  | コード | 8K | 21.4 → 24.3 | 43.3 → 41.6 | 4/4 → 4/4 |
+  | コード | 32K | 97.9 → 102.5 | 39.6 → 37.4 | 4/4 → 4/4 |
+  | 英語の文章 | 2K | 5.67 → 6.54 | 39.9 → 37.3 | 4/4 → 4/4 |
+  | 英語の文章 | 8K | 21.3 → 23.8 | 36.2 → 34.4 | 4/4 → 4/4 |
+  | 英語の文章 | 32K | 96.1 → 101.7 | 34.6 → 32.7 | 4/4 → 4/4 |
+  | 日本語の文章 | 2K | 5.64 → 6.44 | 29.9 → 28.1 | 4/4 → 4/4 |
+  | 日本語の文章 | 8K | 20.6 → 24.2 | 27.6 → 25.6 | 4/4 → 4/4 |
+  | 日本語の文章 | 32K | 95.6 → 101.7 | 25.2 → 23.8 | 4/4 → 4/4 |
+  | エージェントのログ | 2K | 5.94 → 6.65 | 42.8 → 40.9 | 4/4 → 4/4 |
+  | エージェントのログ | 8K | 21.5 → 24.6 | 39.0 → 40.4 | 4/4 → 4/4 |
+  | エージェントのログ | 32K | 98.7 → 106.9 | 40.0 → 41.3 | 2/4 → 4/4 |
+
+  - decode はおおむね 4〜7% 遅く、prompt の読み込みは 2K〜8K で 11〜17%、32K で 5〜8% 遅くなります。1 round で確定するトークン数は同じ程度で、差は GPU の時間です。IQ2 の展開は 2bit の affine より命令が多く、1 層の routed expert は decode で約 1.3 倍、2,048 トークンの prefill で 55 ms（ISTA は M1 の seg gather で 40 ms）かかります。
+  - 事実の質問（長い文章の中の値を答えさせる）は、Unsloth が 12 条件すべてで正解し、ISTA はエージェントのログ 32K で 4 問中 2 問を外しました。
+  - ピークのメモリは同じです（2K で約 50 GB、32K で約 53 GB。サーバーは文脈の上限 262,144 を指定して起動し、64 GB の Mac では 65,536 に下がります）。
+  - 日本語の文章 2K の Unsloth は、1 回目の計測が 23.6 tok/s、prompt の読み込みが 9.0 秒と外れていたので、この条件だけ 2 round 測り直しました（28.1 / 28.0 tok/s、6.44 / 6.42 秒。ISTA は 29.9 / 29.9 tok/s）。表は測り直した値です。
+  - 結果は llm-bench の `results/2026-11-flashnext-unsloth/`（`SUMMARY.md`）にあります。
+
+- **試して採用しなかったもの。** prefill の kernel では K step 32、B の tile を行優先にする、tile の padding、1 simdgroup に 16 行、dequant を half で計算する（結果は float と同じ値で、速さも同じ）。decode では、同じ expert を引く token をまとめて計算する版（x の読み直しで 2〜3 倍遅い）。8bit の n-gram 表（公式 BF16 から作成、57.6 GB）は perplexity が IQ4_NL と誤差の範囲で同じでした。公式の BF16 / 8bit の MTP ヘッドも、受理率は今の MTP ヘッドと同じでした。
+- **テスト。** 失敗するのは m1.15 でも失敗する 84 件だけです（全体を m1.15 と m1.16 で同じ条件で実行し、失敗するテストの名前が一致しました）。追加したテストは 8 件です（4 種の block の dequant を llama.cpp の式と比べる、decode の GLU と prefill の行列積を参照と比べる、SwitchGLU と同じ入出力、深さの方針の固定を外す条件）。
 
 ## v2.12.3-m1.15 での変更（2026-11-14）
 

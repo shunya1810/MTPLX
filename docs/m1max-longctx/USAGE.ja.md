@@ -99,6 +99,29 @@ PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/pyth
 | `--max-tokens` | サーバーの既定 | 1回の応答の上限 |
 | `--port` | 8000 | |
 
+## Qwen3.8-Flash-Next（Unsloth UD-Q2_0）
+
+Qwen3.8-Flash-Next（全体 125B、1 トークンあたり 6B を使う MoE、48 層、51B の n-gram 埋め込み表つき）は、Unsloth の UD-Q2_0 の GGUF なら 64 GB の M1 Mac に載ります。このフォークは、GGUF の expert と n-gram 表をその場で読み、残りをモデルのフォルダに変換します。アプリのモデル画面には出ないので、サーバーだけで使います。
+
+必要なもの: 64 GB の Mac、約 78 GB の空きディスク（GGUF 70.5 GB、変換後のフォルダ 6 GB、MTP ヘッド 1.7 GB）、上のネイティブ拡張。準備は次の 1 行です（途中で止まっても続きからダウンロードし、そのあと CPU で数分かけて変換します）。
+
+```bash
+PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" scripts/setup_flashnext_unsloth.py
+```
+
+`~/models/Qwen3.8-Flash-Next-UD-Q2_0-GGUF` と `~/models/Qwen3.8-Flash-Next-UD-Q2_0-MTPLX` ができます。モデルのフォルダは expert と n-gram 表を GGUF から読むので、GGUF は消さないでください。置き場所は `--models-dir` で変えられます。メモリを多く使うアプリを閉じてから起動します。
+
+```bash
+PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli serve \
+  --model "$HOME/models/Qwen3.8-Flash-Next-UD-Q2_0-MTPLX" \
+  --profile turbo --host 127.0.0.1 --port 8000 --no-auth --yes
+```
+
+- MTP の深さの既定は 3 です。64 GB の Mac では文脈の上限が 65,536 トークンになります。
+- ピークのメモリは 2K で約 50 GB、3.2 万トークンで約 53 GB です。n-gram 表（26.8 GB）は SSD から読み、この数字には入りません。
+- M1 Max 64 GB での実測（思考あり、コード / 英語 / 日本語 / エージェントのログ）: decode は 2K のプロンプトの後で 40.9 / 37.3 / 28.1 / 40.9 tok/s、3.2 万トークンの後で 37.4 / 32.7 / 23.8 / 41.3 tok/s です。cold なプロンプトの読み込みは 2K で約 6.5 秒、8K で約 24 秒、3.2 万トークンで約 102 秒です。
+- Unsloth のファイルを勧める理由: ISTA の Q2_0 の GGUF（Splash が使うもの。こちらも使えます）と比べて、perplexity が英語の小説 / 日本語の小説 / コード / エージェントのログで 7.30 / 34.6 / 2.77 / 2.65 から 6.77 / 20.2 / 2.47 / 1.94 に下がります。その代わり decode は 4〜7%、プロンプトの読み込みは 5〜17% 遅くなります。プロンプトの中の事実を答える質問は 48 問すべて正解でした（ISTA は 3.2 万トークンで 2 問を外しました）。Unsloth は routed の expert を IQ2_XXS / IQ2_S（gate、up）と Q2_0 / IQ4_NL（down）で、dense の層を Q5_K〜Q8_0 で量子化しています。ISTA の dense は Q2_0〜Q4_K です。
+
 ## 使う
 
 - ブラウザのチャット画面: <http://127.0.0.1:8000/>

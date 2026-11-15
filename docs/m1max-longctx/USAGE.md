@@ -98,6 +98,29 @@ Main options:
 | `--max-tokens` | server default | cap per response |
 | `--port` | 8000 | |
 
+## Qwen3.8-Flash-Next (Unsloth UD-Q2_0)
+
+Qwen3.8-Flash-Next (125B total, 6B active, 48 layers of MoE with a 51B n-gram embedding table) fits a 64 GB M1 Mac as Unsloth's UD-Q2_0 GGUF. This fork reads that GGUF's experts and n-gram table in place and converts the rest into a model folder. It is a server-only model: the app's model screen does not list it.
+
+Needs: a 64 GB Mac, about 78 GB of free disk (70.5 GB GGUF + 6 GB converted folder + 1.7 GB MTP head), the native extensions above. Setup (download with resume, then a few minutes of conversion on the CPU):
+
+```bash
+PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" scripts/setup_flashnext_unsloth.py
+```
+
+It writes `~/models/Qwen3.8-Flash-Next-UD-Q2_0-GGUF` (keep it: the model folder reads the experts and the n-gram table from it) and `~/models/Qwen3.8-Flash-Next-UD-Q2_0-MTPLX`; `--models-dir` puts both elsewhere. Then quit other memory-heavy apps and serve:
+
+```bash
+PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli serve \
+  --model "$HOME/models/Qwen3.8-Flash-Next-UD-Q2_0-MTPLX" \
+  --profile turbo --host 127.0.0.1 --port 8000 --no-auth --yes
+```
+
+- MTP depth 3 is the default. The context window is capped at 65,536 tokens on a 64 GB Mac.
+- Peak memory is about 50 GB at 2K and 53 GB at 32K; the n-gram table (26.8 GB) streams from the SSD and is not counted.
+- Measured on an M1 Max 64 GB with thinking on (code / English / Japanese / agent log): decode 40.9 / 37.3 / 28.1 / 40.9 tok/s after a 2K prompt and 37.4 / 32.7 / 23.8 / 41.3 after 32K; a cold 2K prompt takes about 6.5 s, 8K about 24 s, 32K about 102 s.
+- Why Unsloth's file: against ISTA's Q2_0 GGUF (the one Splash serves, also supported), perplexity on English prose / Japanese prose / code / an agent log is 6.77 / 20.2 / 2.47 / 1.94 instead of 7.30 / 34.6 / 2.77 / 2.65, for about 4–7% slower decode and 5–17% slower prompt reading; on facts buried in the prompt it answered all 48 questions (ISTA missed 2 at 32K). Unsloth quantizes the routed experts as IQ2_XXS / IQ2_S (gate, up) and Q2_0 / IQ4_NL (down), and the dense layers at Q5_K–Q8_0 where ISTA's are Q2_0–Q4_K.
+
 ## Use
 
 - Browser chat: <http://127.0.0.1:8000/>
