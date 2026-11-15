@@ -2082,10 +2082,22 @@ def _qsa_gather_min_context() -> int:
     receipt measured the copy overhead at -5.25% on short contexts). The
     break-even for verify widths lands in the tens of thousands of tokens,
     where the dense mask chain is also the within-request growth term."""
+    default = 0 if _qsa_rows_mma_enabled() else 16384
     try:
-        return max(0, int(os.environ.get("MTPLX_QSA_GATHER_MIN_CONTEXT") or 16384))
+        return max(0, int(os.environ.get("MTPLX_QSA_GATHER_MIN_CONTEXT") or default))
     except ValueError:
-        return 16384
+        return default
+
+
+def _qsa_rows_mma_enabled() -> bool:
+    """Verify-width QSA attention reads each row's token list in place
+    (mtplx.kernels.qsa_rows_mma) instead of a dense-mask SDPA over the whole
+    context or gathered K/V copies: 0.10-0.17 vs 0.77-4.7 ms a layer for 4
+    rows on M1 Max (8K-60K). With it on, rows-gather engages at every context
+    length. ``MTPLX_QSA_ROWS_MMA=0`` restores both stock routes."""
+
+    raw = (os.environ.get("MTPLX_QSA_ROWS_MMA") or "1").strip().lower()
+    return raw not in {"0", "off", "false", "no"}
 
 
 def _qsa_gather_max_rows() -> int:
@@ -5167,6 +5179,23 @@ class Attention(nn.Module):
             return False
         return _glue.qsa_rope_installed()
 
+    def _rows_mma(self, q, cache, tok_idx, tok_ok, fixed):
+        """Attention of each verify row over its token list, read in place
+        from the KV backing (mtplx.kernels.qsa_rows_mma), or None when the
+        lane is off or does not fit (the caller then takes its stock route)."""
+
+        if fixed or not _qsa_rows_mma_enabled():
+            return None
+        keys = getattr(cache.kv, "keys", None)
+        values = getattr(cache.kv, "values", None)
+        if not isinstance(keys, mx.array) or not isinstance(values, mx.array):
+            return None
+        from mtplx.kernels.qsa_rows_mma import qsa_rows_attention, supported
+
+        if not supported(q, keys, tok_idx):
+            return None
+        return qsa_rows_attention(q, keys, values, tok_idx, tok_ok, self.scale)
+
     def __call__(self, x: mx.array, cache: QSACache) -> mx.array:
         B, S, _ = x.shape
         pos_start = cache.offset
@@ -5430,6 +5459,9 @@ class Attention(nn.Module):
             # through a dense [S, T] mask. See _qsa_rows_gather_attention
             # (adapting community PR #380 by @maceip).
             _, tok_idx, tok_ok = sel_mask
+            out = self._rows_mma(q, cache, tok_idx, tok_ok, fixed)
+            if out is not None:
+                return self.o_proj(attention_gate(out.transpose(0, 2, 1, 3).reshape(B, S, -1), gate))
             out = _qsa_rows_gather_attention(
                 q,
                 k,
@@ -5456,6 +5488,13 @@ class Attention(nn.Module):
         elif S > 1:
             qpos = pos_start + mx.arange(S, dtype=mx.int32)
             tpos = mx.arange(T, dtype=mx.int32)
+            if S <= _qsa_gather_max_rows() and current_attention_phase() != "prefill":
+                # Dense == sparse below the selection budget: every row sees
+                # its causal prefix; the in-place kernel takes it as a list.
+                ok = tpos[None, :] <= qpos[:, None]
+                out = self._rows_mma(q, cache, mx.broadcast_to(tpos[None, :], ok.shape), ok, fixed)
+                if out is not None:
+                    return _linear(self.o_proj, attention_gate(out.transpose(0, 2, 1, 3).reshape(B, S, -1), gate))
             mask = (tpos[None, :] <= qpos[:, None])[None, None]
         else:
             mask = None
