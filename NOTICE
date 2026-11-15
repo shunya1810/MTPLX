@@ -56,3 +56,11 @@ rows, the affine 2-bit group-128 container) is adapted from the Apache-2.0
 licensed reference runtime that Prism ML ships inside those packs
 (runtime/runtime.py, runtime/artifact.py, runtime/vision_artifact.py),
 Copyright 2026 Prism ML, Inc. Created using Bonsai by Prism ML.
+
+This product includes lookup tables and block layouts of the GGUF quant
+types IQ2_XXS, IQ2_S, IQ4_NL and Q2_0 from ggml (llama.cpp,
+https://github.com/ggml-org/llama.cpp, ggml/src/ggml-common.h), MIT
+License, Copyright (c) 2023-2026 The ggml authors, under
+mtplx/kernels/gguf_iq_tables.py, mtplx/kernels/moe_gguf_iq.py and the
+Flash-Next GGUF loaders in mtplx/models/qwen4_exp.py (license text:
+mtplx/kernels/GGML_LICENSE.txt).
