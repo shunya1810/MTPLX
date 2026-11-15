@@ -1521,7 +1521,14 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
                 shared_gate=self.shared_expert_gate(x).reshape(rows),
             )
             return y.reshape(x.shape)
-        part = moe_iq_prefill_parts(x2, sw, idx)
+        from mtplx.kernels import moe_gguf_qmm
+
+        if moe_gguf_qmm.available(x2.dtype):
+            # MLX's quantized-matmul tile with a GGUF weight loader (M1 Max,
+            # 2,048-token chunk: 53-55 -> 42-47 ms a layer).
+            part = moe_gguf_qmm.prefill_parts(x2, sw, idx)
+        else:
+            part = moe_iq_prefill_parts(x2, sw, idx)
         y = (part.reshape(rows, self.top_k, -1) * w.reshape(rows, self.top_k, 1)).sum(axis=1)
         shared = attention_gate(self.shared_expert(x), self.shared_expert_gate(x)).reshape(rows, -1)
         return (y.astype(x.dtype) + shared).reshape(x.shape)

@@ -145,3 +145,25 @@ def test_switch_call_keeps_switchglu_contract(tmp_path):
     idx = mx.array(np.stack([rng.choice(6, 2, replace=False) for _ in range(5)])[None], mx.uint32)
     y = sw(x, idx)
     assert y.shape == (1, 5, 2, 512) and y.dtype == mx.float16
+
+
+@pytest.mark.parametrize("gate_type,down_type", [("IQ2_XXS", "IQ4_NL"), ("IQ2_S", "Q2_0"), ("IQ2_S", "IQ4_NL")])
+@pytest.mark.parametrize("bm", ["16", "32"])
+def test_prefill_on_mlx_qmm_tile_matches_reference(tmp_path, monkeypatch, gate_type, down_type, bm):
+    """moe_gguf_qmm: GGUF loader inside MLX's quantized-matmul tile."""
+    from mtplx.kernels import moe_gguf_qmm as G
+
+    if not G.available(mx.float16):
+        pytest.skip("MLX kernel headers unavailable")
+    monkeypatch.setenv("MTPLX_GGUF_QMM_BM", bm)
+    rng = np.random.default_rng(7)
+    sw, refs = _module(tmp_path, rng, gate_type, down_type)
+    dtype = mx.float16
+    for m in (40, 200):
+        x = mx.array(rng.normal(0, 0.5, size=(m, 512)).astype(np.float32)).astype(dtype)
+        idx = np.stack([rng.choice(6, 2, replace=False) for _ in range(m)])
+        w = rng.dirichlet([1, 1], size=m).astype(np.float32)
+        want = _glu_reference(refs, x, idx, w, dtype)
+        part = G.prefill_parts(x, sw, mx.array(idx.reshape(-1), mx.uint32))
+        got = np.array((part.reshape(m, 2, -1) * mx.array(w)[..., None]).sum(axis=1).astype(mx.float32))
+        np.testing.assert_allclose(got, want, atol=4e-3 * np.abs(want).max() + 1e-4)
