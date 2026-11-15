@@ -46,7 +46,6 @@ Qwen3.8-Flash-Next を、Unsloth の UD-Q2_0 の GGUF で動かせるように�
   - 事実の質問（長い文章の中の値を答えさせる）は、Unsloth が 12 条件すべてで正解し、ISTA はエージェントのログ 32K で 4 問中 2 問を外しました。
   - ピークのメモリは同じです（2K で約 50 GB、32K で約 53 GB。サーバーは文脈の上限 262,144 を指定して起動し、64 GB の Mac では 65,536 に下がります）。
   - 日本語の文章 2K の Unsloth は、1 回目の計測が 23.6 tok/s、prompt の読み込みが 9.0 秒と外れていたので、この条件だけ 2 round 測り直しました（28.1 / 28.0 tok/s、6.44 / 6.42 秒。ISTA は 29.9 / 29.9 tok/s）。表は測り直した値です。
-  - 結果は llm-bench の `results/2026-11-flashnext-unsloth/`（`SUMMARY.md`）にあります。
 
 - **試して採用しなかったもの。** prefill の kernel では K step 32、B の tile を行優先にする、tile の padding、1 simdgroup に 16 行、dequant を half で計算する（結果は float と同じ値で、速さも同じ）。decode では、同じ expert を引く token をまとめて計算する版（x の読み直しで 2〜3 倍遅い）。8bit の n-gram 表（公式 BF16 から作成、57.6 GB）は perplexity が IQ4_NL と誤差の範囲で同じでした。公式の BF16 / 8bit の MTP ヘッドも、受理率は今の MTP ヘッドと同じでした。
 - **テスト。** 失敗するのは m1.15 でも失敗する 84 件だけです（全体を m1.15 と m1.16 で同じ条件で実行し、失敗するテストの名前が一致しました）。追加したテストは 8 件です（4 種の block の dequant を llama.cpp の式と比べる、decode の GLU と prefill の行列積を参照と比べる、SwitchGLU と同じ入出力、深さの方針の固定を外す条件）。
