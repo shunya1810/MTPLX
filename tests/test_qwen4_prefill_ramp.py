@@ -51,3 +51,32 @@ def test_ramp_respects_mandatory_edges(wide):
     spans = G._iter_prefill_chunk_spans(100000, chunk_size=1024, mandatory_edges=(5000,))
     _check_cover(spans, 100000)
     assert any(e == 5000 for _s, e in spans)
+
+
+def test_lean_long_prefill_scope_drops_hc_packs_and_restores_pool(monkeypatch):
+    import mlx.core as mx
+
+    class M:
+        pass
+
+    a, b = M(), M()
+    object.__setattr__(a, "_hc_q8_pack", (mx.zeros((4,)),))
+    b._hc_q8_pack = None
+
+    class Model:
+        def named_modules(self):
+            return [("a", a), ("b", b)]
+
+    class RT:
+        model = Model()
+
+    before = mx.set_cache_limit(1 << 30)
+    try:
+        with G._lean_long_prefill_scope(RT(), 1000):  # short prompt: untouched
+            assert a._hc_q8_pack is not None
+        with G._lean_long_prefill_scope(RT(), 200000):
+            assert a._hc_q8_pack is None
+            assert mx.set_cache_limit(128 << 20) == 128 << 20
+        assert mx.set_cache_limit(1 << 30) == 1 << 30
+    finally:
+        mx.set_cache_limit(before)

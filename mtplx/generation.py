@@ -2555,6 +2555,40 @@ def _iter_prefill_chunk_spans(
     )
 
 
+@contextmanager
+def _lean_long_prefill_scope(rt: Any, prompt_tokens: int):
+    """Hold less memory through a very long prompt's prefill.
+
+    From ``MTPLX_LONG_PREFILL_LEAN_TOKENS`` prompt tokens (default 131,072;
+    0 turns it off), for the length of the prefill: the decode-only 8-bit
+    hyper-connection packs (``hc_read_q8``, 0.69 GB on Flash-Next; rebuilt by
+    the first decode read, about 50 ms) are dropped, and the MLX allocator
+    keeps at most ``MTPLX_LONG_PREFILL_LEAN_POOL_MB`` (default 128) of freed
+    buffers instead of the serve default (1 GiB on M1). A 256K prompt on a
+    64 GB M1 Max ends its prefill within a few GB of macOS's free-page floor,
+    where those 1.6 GB decide whether the prefill completes.
+    """
+
+    threshold = _env_int("MTPLX_LONG_PREFILL_LEAN_TOKENS", 131072)
+    if threshold <= 0 or int(prompt_tokens) < threshold:
+        yield
+        return
+    import mlx.core as mx
+
+    model = getattr(rt, "model", None)
+    if model is not None and hasattr(model, "named_modules"):
+        for _name, module in model.named_modules():
+            if getattr(module, "_hc_q8_pack", None) is not None:
+                object.__setattr__(module, "_hc_q8_pack", None)
+    pool = max(0, _env_int("MTPLX_LONG_PREFILL_LEAN_POOL_MB", 128)) * 2**20
+    previous = int(mx.set_cache_limit(pool))
+    mx.clear_cache()
+    try:
+        yield
+    finally:
+        mx.set_cache_limit(previous)
+
+
 def _wide_prefill_ramp_spans(token_count: int, chunk: int) -> list[tuple[int, int]] | None:
     """Wider forwards while the prompt's KV is still unwritten (Flash-Next).
 
@@ -11677,7 +11711,7 @@ def generate_mtpk(
     one_copy_rows_target = prefill_rows_target(
         rt, len(prompt_ids), fixed_m4_capacity_plan
     )
-    with prefill_rows_scope(one_copy_rows_target):
+    with prefill_rows_scope(one_copy_rows_target), _lean_long_prefill_scope(rt, len(prompt_ids)):
         prompt_state = restore_or_prefill_prompt_state(
             rt,
             prompt_ids,
