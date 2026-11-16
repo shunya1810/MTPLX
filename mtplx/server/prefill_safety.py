@@ -156,7 +156,10 @@ def settle_wide_prefill_chunk(
         from mtplx.demotions import note
 
         note("qwen4_wide_prefill_chunk_refused", _WIDE_CHUNK_ADMISSION_REFUSED_REASON)
-        return None
+        # The admission priced the width it settled on (the Flash-Next ladder
+        # includes the powers of two between the wide chunk and the
+        # long-context floor): run that, not the profile's capped chunk.
+        return int(width) if width is not None else None
     return int(width)
 
 

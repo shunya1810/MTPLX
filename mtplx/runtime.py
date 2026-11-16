@@ -741,6 +741,10 @@ def load(
                 "[proj-quant] requantized %d trunk *_proj modules to %s",
                 len(touched), proj_requant,
             )
+    if str((config or {}).get("model_type") or "").lower() == "qwen4_exp":
+        from .models.qwen4_exp import requant_dense_trunk
+
+        requant_dense_trunk(model)
     deepseek_v4_attn_proj_wide_m3_report = None
     if str((config or {}).get("model_type") or "").lower() == "deepseek_v4":
         from .models.deepseek_v4 import configure_deepseek_v4_moe_tail

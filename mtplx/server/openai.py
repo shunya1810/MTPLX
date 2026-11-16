@@ -23833,6 +23833,26 @@ def _run_prefill_admission(
         # at 2,048 rows because the wide gate refused before a reclamation
         # that left room for 4,096).
         widths = sorted({*(int(rung) for rung in wide_prefill_rungs), *widths}, reverse=True)
+    if (
+        not prompt_scoring
+        and widths
+        and None not in widths
+        and _runtime_has_qsa_indexer(runtime)
+    ):
+        # Flash-Next: the long-context caps (512 rows past 163,840 tokens, the
+        # rows x context key budget) leave the ladder as {wide, 512}, so a
+        # prompt that misses the wide chunk by a few hundred MB fell to 512
+        # rows for the whole prompt end (192K, 64 GB M1 Max: 4,096 short by
+        # 1.3 GB, 1,024 fitting). The powers of two between join the ladder;
+        # the pricing below still takes the widest that fits.
+        lo, hi = int(min(widths)), int(max(widths))
+        step = 1 << (hi.bit_length() - 1)
+        extra = set()
+        while step > lo:
+            if step < hi:
+                extra.add(step)
+            step //= 2
+        widths = sorted({*widths, *extra}, reverse=True)
     # The narrower chunks a tight Mac may fall back to (the 27B, Bonsai, the
     # 4B and 9B); ``cheapest`` below keeps them from running slower for
     # nothing.
@@ -32485,6 +32505,20 @@ def _run_generation(
                 "draft_head_identity": session_draft_head_identity,
                 "policy_fingerprint": session_policy_fingerprint,
             }
+            # A very long prompt runs its prefill without the decode-only
+            # hyper-connection packs (generation._lean_long_prefill_scope);
+            # dropping them before the pricing hands those 0.69 GB to the
+            # prefill width the admission settles on.
+            try:
+                from mtplx.generation import (
+                    lean_long_prefill_applies as _lean_applies,
+                    release_decode_only_packs as _release_packs,
+                )
+
+                if _lean_applies(len(prompt_ids)):
+                    _release_packs(state.runtime)
+            except Exception:
+                pass
             admission_shed = _prefill_admission_shed(
                 state,
                 prompt_ids=prompt_ids,

@@ -2983,6 +2983,59 @@ def _gguf_q2_0_experts_sanitize(model, out: dict) -> dict:
     return out
 
 
+_DENSE_REQUANT_SCOPE = re.compile(r"\.layers\.\d+\.(linear_attn|self_attn|mlp\.shared_expert)(\.|$)")
+
+
+def requant_dense_trunk(model) -> int:
+    """MTPLX_QWEN4_DENSE_BITS=4: the 8-bit trunk projections re-quantized to
+    4-bit g64 after load (the GDN input/output projections, the QSA attention
+    projections and the shared experts, fused or not). The router, the QSA
+    indexer, embeddings, the LM head, hyper-connection mixes, the routed
+    experts and the draft head keep their packed precision. The ISTA GGUF's
+    own dense tensors are Q3_K / IQ4_XS / Q4_K (3.4-4.5 bits a weight).
+    Experimental, off: on the ISTA pack (M1 Max, 2026-11-17 fn-s8) 4-bit
+    raised perplexity 4-10% (en/ja/code/agent 7.29/34.7/2.77/2.62 ->
+    7.57/38.2/3.02/2.88) and 6-bit (+0.4-1.6%) verified slower (48.3 ->
+    50.7 ms a round; MLX's 6-bit unpack outweighs the bytes it saves).
+    Returns the number of modules converted."""
+
+    raw = (os.environ.get("MTPLX_QWEN4_DENSE_BITS") or "").strip()
+    if raw not in ("4", "6"):
+        return 0
+    bits = int(raw)
+    done = 0
+    for path, module in model.named_modules():
+        parts = path.split(".")
+        if "mtp" in parts or "switch_mlp" in path or "indexer" in path:
+            continue
+        if not _DENSE_REQUANT_SCOPE.search(path):
+            continue
+        old_bits = getattr(module, "bits", None)
+        old_gs = getattr(module, "group_size", None)
+        if old_bits is None or old_gs is None or int(old_bits) <= bits:
+            continue
+        converted = False
+        for prefix in ("", "gu_"):
+            w = getattr(module, prefix + "weight", None)
+            sc = getattr(module, prefix + "scales", None)
+            bi = getattr(module, prefix + "biases", None)
+            if w is None or sc is None or bi is None or w.dtype != mx.uint32:
+                continue
+            dense = mx.dequantize(w, sc, bi, group_size=int(old_gs), bits=int(old_bits))
+            nw, ns, nb = mx.quantize(dense, group_size=64, bits=bits)
+            mx.eval(nw, ns, nb)
+            setattr(module, prefix + "weight", nw)
+            setattr(module, prefix + "scales", ns)
+            setattr(module, prefix + "biases", nb)
+            converted = True
+        if converted:
+            module.bits, module.group_size = bits, 64
+            done += 1
+    if done:
+        print(f"[qwen4_exp] dense trunk projections re-quantized to {bits}-bit g64: {done} modules", flush=True)
+    return done
+
+
 def _fuse_gate_up_sanitize(model, out: dict) -> dict:
     """Sanitize-time MoE gate+up fusion (MTPLX_FUSED_GATE_UP=1).
 

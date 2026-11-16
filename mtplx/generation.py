@@ -2555,6 +2555,26 @@ def _iter_prefill_chunk_spans(
     )
 
 
+def lean_long_prefill_applies(prompt_tokens: int) -> bool:
+    threshold = _env_int("MTPLX_LONG_PREFILL_LEAN_TOKENS", 131072)
+    return threshold > 0 and int(prompt_tokens) >= threshold
+
+
+def release_decode_only_packs(rt: Any) -> int:
+    """Drop the decode-only 8-bit hyper-connection packs (hc_read_q8; the
+    first decode read rebuilds them). Returns the bytes released."""
+
+    released = 0
+    model = getattr(rt, "model", None)
+    if model is not None and hasattr(model, "named_modules"):
+        for _name, module in model.named_modules():
+            pack = getattr(module, "_hc_q8_pack", None)
+            if pack is not None:
+                released += sum(int(getattr(a, "nbytes", 0)) for a in pack)
+                object.__setattr__(module, "_hc_q8_pack", None)
+    return released
+
+
 @contextmanager
 def _lean_long_prefill_scope(rt: Any, prompt_tokens: int):
     """Hold less memory through a very long prompt's prefill.
@@ -2569,17 +2589,12 @@ def _lean_long_prefill_scope(rt: Any, prompt_tokens: int):
     where those 1.6 GB decide whether the prefill completes.
     """
 
-    threshold = _env_int("MTPLX_LONG_PREFILL_LEAN_TOKENS", 131072)
-    if threshold <= 0 or int(prompt_tokens) < threshold:
+    if not lean_long_prefill_applies(prompt_tokens):
         yield
         return
     import mlx.core as mx
 
-    model = getattr(rt, "model", None)
-    if model is not None and hasattr(model, "named_modules"):
-        for _name, module in model.named_modules():
-            if getattr(module, "_hc_q8_pack", None) is not None:
-                object.__setattr__(module, "_hc_q8_pack", None)
+    release_decode_only_packs(rt)
     pool = max(0, _env_int("MTPLX_LONG_PREFILL_LEAN_POOL_MB", 128)) * 2**20
     previous = int(mx.set_cache_limit(pool))
     mx.clear_cache()

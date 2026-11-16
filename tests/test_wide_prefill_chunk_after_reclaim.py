@@ -123,7 +123,7 @@ def test_the_settled_width_is_the_one_that_runs():
         None, prompt_tokens=40_000, rungs=rungs,
         pricing={"growth": {"prefill_chunk_tokens": 2048, "growth_bytes": 7}},
         receipt=receipt,
-    ) is None
+    ) == 2048  # the priced narrower width runs (not the capped profile chunk)
     assert receipt["granted"] is False
 
 
@@ -200,10 +200,11 @@ def test_the_request_runs_the_width_the_admission_settled_after_reclaim(monkeypa
 
 def test_the_profile_plan_runs_when_the_admission_settles_narrow(monkeypatch):
     # The gate would grant 4,096, but the admission's full bill says it does
-    # not fit: the admission's answer stands.
+    # not fit: the admission's answer stands, and the width it priced runs
+    # (not the profile's own chunk, which past 163,840 tokens is capped).
     seen = _serve_one(monkeypatch, settled_width=2048, gate_width=4096)
 
-    assert seen["chunk"] is None
+    assert seen["chunk"] == 2048
     assert seen["rungs"] == [4096]
 
 
