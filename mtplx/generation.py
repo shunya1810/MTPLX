@@ -2555,6 +2555,56 @@ def _iter_prefill_chunk_spans(
     )
 
 
+_DEFERRED_ROWS_TARGET: "ContextVar[int]" = ContextVar(
+    "mtplx_deferred_rows_target", default=0
+)
+
+
+@contextmanager
+def _deferred_rows_target_scope(rows: int):
+    token = _DEFERRED_ROWS_TARGET.set(max(0, int(rows or 0)))
+    try:
+        yield
+    finally:
+        _DEFERRED_ROWS_TARGET.reset(token)
+
+
+def _enter_deferred_rows_target(stack: Any, spans: list[tuple[int, int]], start: int, end: int, state: dict) -> None:
+    """At the first span narrower than the prompt's first one (the ramp's
+    narrow tail), size the QSA buffers once to the deferred target for the
+    rest of the prefill: the copy happens while the KV is still short of its
+    end size, and no later forward reallocates it."""
+
+    rows = _DEFERRED_ROWS_TARGET.get()
+    if not rows or state.get("entered") or not spans:
+        return
+    first = int(spans[0][1]) - int(spans[0][0])
+    if int(end) - int(start) < first:
+        from .one_copy import prefill_rows_scope
+
+        stack.enter_context(prefill_rows_scope(rows))
+        state["entered"] = True
+
+
+def _long_prompt_rows_target(prompt_tokens: int, max_tokens: int, depth: int) -> int:
+    """QSA buffer rows a very long prompt allocates once (0 = stock growth).
+
+    Stock growth reallocates and copies every QSA layer's keys and values a
+    chunk larger on every prefill forward; at 256K that is a 0.5 GB transient
+    per layer on top of 9 GB of KV, at the 55.8 GB Metal limit of a 64 GB M1
+    Max (the 256K prefill failed its allocation there at 85%). Past the lean
+    long-prefill threshold the buffers are sized once to the prompt plus the
+    answer (capped at 8,192 tokens; a longer answer grows the stock way after)
+    inside the existing ``qsa_rows_target`` scope.
+    ``MTPLX_LONG_PROMPT_PREALLOC=0`` keeps stock growth.
+    """
+
+    if _env_falsey("MTPLX_LONG_PROMPT_PREALLOC") or not lean_long_prefill_applies(prompt_tokens):
+        return 0
+    rows = int(prompt_tokens) + min(max(0, int(max_tokens or 0)), 8192) + max(0, int(depth or 0)) + 64
+    return ((rows + 255) // 256) * 256
+
+
 def lean_long_prefill_applies(prompt_tokens: int) -> bool:
     threshold = _env_int("MTPLX_LONG_PREFILL_LEAN_TOKENS", 131072)
     return threshold > 0 and int(prompt_tokens) >= threshold
@@ -5108,8 +5158,10 @@ def _prefill_restored_prompt_suffix(
     # is the lane's by-design decline, counted, never a raise.
     with _ple_prefill_lookahead_scope(
         rt, *_lookahead_plan(spans or [(0, len(suffix))])
-    ):
+    ), contextlib.ExitStack() as _rows_stack:
+        _rows_state: dict = {}
         for start, end in spans:
+            _enter_deferred_rows_target(_rows_stack, spans, start, end, _rows_state)
             _check_postcommit_abort(abort_check)
             chunk_array = body_array[:, start:end]
             chunk_embeddings = _suffix_chunk_embeddings(chunk_array)
@@ -9089,9 +9141,11 @@ def _prefill_committed_mtp_history_streaming(
     # hash and page-warm chunk k+1's 32,768 sidecar rows while chunk k's
     # forward owns the GPU. The census measures those gathers as 8 host-late
     # stalls totalling 2,313 ms with the GPU fully idle.
-    with _ple_prefill_lookahead_scope(rt, body, mtp_streaming_spans):
+    with _ple_prefill_lookahead_scope(rt, body, mtp_streaming_spans), contextlib.ExitStack() as _rows_stack:
         _chunk_trace = _prefill_chunk_trace_enabled()
+        _rows_state: dict = {}
         for start, end in mtp_streaming_spans:
+            _enter_deferred_rows_target(_rows_stack, mtp_streaming_spans, start, end, _rows_state)
             _iter_started = time.perf_counter()
             _check_postcommit_abort(abort_check)
             chunk_array = body_array[:, start:end]
@@ -11726,7 +11780,8 @@ def generate_mtpk(
     one_copy_rows_target = prefill_rows_target(
         rt, len(prompt_ids), fixed_m4_capacity_plan
     )
-    with prefill_rows_scope(one_copy_rows_target), _lean_long_prefill_scope(rt, len(prompt_ids)):
+    _deferred_rows = 0 if one_copy_rows_target else _long_prompt_rows_target(len(prompt_ids), max_tokens, speculative_depth)
+    with prefill_rows_scope(one_copy_rows_target), _lean_long_prefill_scope(rt, len(prompt_ids)), _deferred_rows_target_scope(_deferred_rows):
         prompt_state = restore_or_prefill_prompt_state(
             rt,
             prompt_ids,
