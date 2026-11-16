@@ -2543,6 +2543,9 @@ def _iter_prefill_chunk_spans(
     resolved_chunk_size = (
         _prefill_chunk_size() if chunk_size is None else max(1, int(chunk_size))
     )
+    ramp = _wide_prefill_ramp_spans(token_count, resolved_chunk_size)
+    if ramp is not None:
+        return _split_spans_at(ramp, mandatory_edges)
     return _split_spans_at(
         [
             (start, min(token_count, start + resolved_chunk_size))
@@ -2550,6 +2553,53 @@ def _iter_prefill_chunk_spans(
         ],
         mandatory_edges,
     )
+
+
+def _wide_prefill_ramp_spans(token_count: int, chunk: int) -> list[tuple[int, int]] | None:
+    """Wider forwards while the prompt's KV is still unwritten (Flash-Next).
+
+    The memory admission prices a prompt at its END state: all of its KV plus
+    the transient of one ``chunk``-row forward, and narrows the chunk until
+    that fits (512 rows for a cold 192K prompt on a 64 GB M1 Max, where 4,096
+    rows run the routed experts about 2x faster per token).  Early in the
+    prompt most of that KV does not exist yet, so a forward of ``w > chunk``
+    rows at position ``p`` stays under the admitted peak as long as its extra
+    transient, (w - chunk) x the forward's bytes a row
+    (``_WIDE_PREFILL_FORWARD_BYTES_PER_ROW``), is covered by the KV still to
+    be written after it, (token_count - p - w) x the KV bytes a token.  Each
+    forward takes the widest power-of-two width from the family's wide chunk
+    (``MTPLX_QWEN4_PREFILL_WIDE_CHUNK``) down to ``chunk`` that satisfies it.
+
+    ``MTPLX_QWEN4_PREFILL_RAMP=0`` restores the flat grid;
+    ``MTPLX_QWEN4_PREFILL_RAMP_KV_BYTES`` overrides the KV bytes a token
+    (default 36,864: Flash-Next's 12 QSA layers, indexer keys, the draft
+    head's layer and the hidden row, as the wide-chunk bill charges them).
+    """
+
+    if _env_falsey("MTPLX_QWEN4_PREFILL_RAMP") or _prefill_chunk_env_is_pinned():
+        return None
+    wide = _env_int("MTPLX_QWEN4_PREFILL_WIDE_CHUNK", 0)
+    if wide <= chunk or token_count <= chunk:
+        return None
+    kv_bytes = max(1, _env_int("MTPLX_QWEN4_PREFILL_RAMP_KV_BYTES", 36864))
+    widths = []
+    w = 1 << (int(wide).bit_length() - 1)
+    while w > chunk:
+        widths.append(w)
+        w //= 2
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while start < token_count:
+        width = chunk
+        for cand in widths:
+            remaining_after = token_count - start - cand
+            if remaining_after >= 0 and remaining_after * kv_bytes >= (cand - chunk) * _WIDE_PREFILL_FORWARD_BYTES_PER_ROW:
+                width = cand
+                break
+        end = min(token_count, start + width)
+        spans.append((start, end))
+        start = end
+    return spans
 
 
 def _release_restored_entry_applies(restored: Any, session_id: str | None) -> bool:
