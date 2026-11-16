@@ -2110,8 +2110,13 @@ def _qsa_rows_mma_enabled() -> bool:
     rows on M1 Max (8K-60K). With it on, rows-gather engages at every context
     length. ``MTPLX_QSA_ROWS_MMA=0`` restores both stock routes."""
 
-    raw = (os.environ.get("MTPLX_QSA_ROWS_MMA") or "1").strip().lower()
-    return raw not in {"0", "off", "false", "no"}
+    raw = (os.environ.get("MTPLX_QSA_ROWS_MMA") or "").strip().lower()
+    if raw:
+        return raw not in {"0", "off", "false", "no"}
+    # The fixed-M4 compiled verifier replays the stock attention and promises
+    # its eager reference the same bits: that lane keeps the stock routes.
+    fixed = (os.environ.get("MTPLX_QWEN4_FIXED_M4_VERIFY") or "0").strip().lower()
+    return fixed not in {"1", "true", "yes", "on"}
 
 
 def _qsa_gather_max_rows() -> int:

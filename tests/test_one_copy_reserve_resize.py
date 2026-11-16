@@ -53,6 +53,15 @@ from mtplx.sampling import SamplerConfig
 from mtplx.session_bank import SessionBank
 from test_qwen4_fixed_m4_capacity_bucket import _bits, _recorded_rounds
 
+
+@pytest.fixture(autouse=True)
+def _stock_qsa_rows_route(monkeypatch):
+    """These receipts compare the compiled bank with the STOCK eager verifier
+    (and price the stock rows-gather switch); the in-place rows kernel
+    (mtplx.kernels.qsa_rows_mma) is a different eager spelling."""
+    monkeypatch.setenv("MTPLX_QSA_ROWS_MMA", "0")
+
+
 GB = 1_000_000_000
 # Qwen 3.8's native sampler (Flash-Next's own).
 FLASH = SamplerConfig(temperature=1.0, top_p=0.95, top_k=20)
@@ -615,6 +624,7 @@ def lane(monkeypatch):
     monkeypatch.setenv("MTPLX_QSA_GATHER", "1")
     monkeypatch.setenv("MTPLX_QSA_GATHER_MIN_CONTEXT", "16")
     monkeypatch.setenv("MTPLX_QWEN4_FIXED_M4_CAPACITY_BUCKET", "512")
+    monkeypatch.setenv("MTPLX_QSA_ROWS_MMA", "0")  # the stock eager rows route (parity with the bank)
     monkeypatch.setattr(runtime_options, "_QWEN4_OPDIET", False)
     monkeypatch.setattr(runtime_options, "_QWEN4_VERIFY_GLUE", False)
     monkeypatch.setattr(graphbank, "_compiled_verify_bits_gate_ok", lambda _rt: True)

@@ -42,6 +42,15 @@ import mtplx.graphbank as graphbank
 from mtplx import demotions
 from mtplx.sampling import SamplerConfig
 
+
+@pytest.fixture(autouse=True)
+def _stock_qsa_rows_route(monkeypatch):
+    """These receipts compare the compiled bank with the STOCK eager verifier
+    (and price the stock rows-gather switch); the in-place rows kernel
+    (mtplx.kernels.qsa_rows_mma) is a different eager spelling."""
+    monkeypatch.setenv("MTPLX_QSA_ROWS_MMA", "0")
+
+
 pytestmark = pytest.mark.skipif(
     not mx.metal.is_available(), reason="the compiled verifier's parity is a GPU property"
 )

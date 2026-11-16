@@ -60,6 +60,15 @@ from test_qwen4_fixed_m4_verify_exactness import (
     _runtime,
 )
 
+
+@pytest.fixture(autouse=True)
+def _stock_qsa_rows_route(monkeypatch):
+    """These receipts compare the compiled bank with the STOCK eager verifier
+    (and price the stock rows-gather switch); the in-place rows kernel
+    (mtplx.kernels.qsa_rows_mma) is a different eager spelling."""
+    monkeypatch.setenv("MTPLX_QSA_ROWS_MMA", "0")
+
+
 gpu = pytest.mark.skipif(
     not mx.metal.is_available(), reason="bfloat16 expert gathers need the GPU"
 )
@@ -93,6 +102,7 @@ def lane(monkeypatch):
             monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MTPLX_CONTEXT_COPY", "0")
     # Import-frozen switches of the serve lane: off unless a test arms them.
+    monkeypatch.setenv("MTPLX_QSA_ROWS_MMA", "0")  # the stock eager rows route (parity with the bank)
     monkeypatch.setattr(runtime_options, "_QWEN4_OPDIET", False)
     monkeypatch.setattr(runtime_options, "_QWEN4_VERIFY_GLUE", False)
     monkeypatch.setattr(qwen4_exp, "ArraysCache", cache_module.ArraysCache)
