@@ -6026,6 +6026,18 @@ def _gdn_boundary_capture_enabled() -> bool:
     return raw not in {"0", "false", "off", "no"}
 
 
+def _long_prompt_skips_boundaries(prompt_tokens: int) -> bool:
+    """A cold prompt of ``MTPLX_LONG_PROMPT_BOUNDARY_MAX_TOKENS`` tokens or
+    more (default 200,000; 0 never skips) records no interior recurrent
+    boundaries. Those snapshots (115 MB each on Flash-Next, most of them in
+    the tail ladder at the prompt's end) are taken where a 256K prefill on a
+    64 GB M1 Max has no memory left, for restores that diverge inside a prompt
+    already near the context window. The prompt's end state is still banked."""
+
+    limit = _env_int("MTPLX_LONG_PROMPT_BOUNDARY_MAX_TOKENS", 200000)
+    return limit > 0 and int(prompt_tokens) >= limit
+
+
 def _gdn_boundary_tail_interval() -> int:
     """Sub-chunk capture grid for the final prefill chunk (0 disables).
 
@@ -8941,7 +8953,9 @@ def _prefill(
     target_forward_time = 0.0
     final_logits_only = _final_logits_prefill_enabled()
     capture_boundaries = (
-        gdn_boundary_sink is not None and _cache_has_recurrent_entries(cache)
+        gdn_boundary_sink is not None
+        and _cache_has_recurrent_entries(cache)
+        and not _long_prompt_skips_boundaries(len(prompt_ids))
     )
     # An image prompt's sink records only at the plain chunk ends (see
     # _sink_cuts_forwards): no ladder, no stable edge, no in-forward capture.
@@ -9078,7 +9092,9 @@ def _prefill_committed_mtp_history_streaming(
     prompt_history_time = 0.0
     final_logits_only = _final_logits_prefill_enabled()
     capture_boundaries = (
-        gdn_boundary_sink is not None and _cache_has_recurrent_entries(cache)
+        gdn_boundary_sink is not None
+        and _cache_has_recurrent_entries(cache)
+        and not _long_prompt_skips_boundaries(len(prompt_ids))
     )
     # An image prompt's sink records only at the plain chunk ends (see
     # _sink_cuts_forwards): no ladder, no stable edge, no in-forward capture.
