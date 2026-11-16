@@ -116,10 +116,11 @@ PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/pyth
   --profile turbo --host 127.0.0.1 --port 8000 --no-auth --yes
 ```
 
-- MTP depth 3 is the default. The context window is capped at 65,536 tokens on a 64 GB Mac.
-- Peak memory is about 50 GB at 2K and 53 GB at 32K; the n-gram table (26.8 GB) streams from the SSD and is not counted.
-- Measured on an M1 Max 64 GB with thinking on (code / English / Japanese / agent log): decode 40.9 / 37.3 / 28.1 / 40.9 tok/s after a 2K prompt and 37.4 / 32.7 / 23.8 / 41.3 after 32K; a cold 2K prompt takes about 6.5 s, 8K about 24 s, 32K about 102 s.
-- Why Unsloth's file: against ISTA's Q2_0 GGUF (the one Splash serves, also supported), perplexity on English prose / Japanese prose / code / an agent log is 6.77 / 20.2 / 2.47 / 1.94 instead of 7.30 / 34.6 / 2.77 / 2.65, for about 4–7% slower decode and 5–17% slower prompt reading; on facts buried in the prompt it answered all 48 questions (ISTA missed 2 at 32K). Unsloth quantizes the routed experts as IQ2_XXS / IQ2_S (gate, up) and Q2_0 / IQ4_NL (down), and the dense layers at Q5_K–Q8_0 where ISTA's are Q2_0–Q4_K.
+- MTP depth 3 is the default. The context window defaults to 65,536 tokens on a 64 GB Mac; for longer prompts start the server with `--context-window 262144`. On an M1 Max 64 GB every 128K run completed (follow-up turns restore from the cache in under a second); 160K and 192K completed only when the rest of the Mac left enough free memory (2 of 4 and 1 of 4 runs; the others were stopped by the memory guard near the end of the prompt, the server stays up); 256K does not fit.
+- KV is fp16: Flash-Next's QSA attention has no quantized-cache path, so `--kv-quant q8` falls back to fp16 (about 24 KB per token).
+- Peak memory is about 50 GB at 2K, 53–54 GB at 32K and 55 GB at 128K; the n-gram table (26.8 GB) streams from the SSD and is not counted.
+- Measured on an M1 Max 64 GB with thinking on (code / English / Japanese / agent log): decode 47.8 / 42.0 / 43.7 / 45.3 tok/s after a 2K prompt, 44.2 / 41.6 / 38.4 / 48.6 after 32K and 37.5 / 37.2 / 34.8 / 42.8 after 128K; a cold 2K prompt takes about 5.4 s, 8K about 20.5 s, 32K about 83 s, 128K about 440 s.
+- Why Unsloth's file: against ISTA's Q2_0 GGUF (the one Splash serves, also supported), perplexity on English prose / Japanese prose / code / an agent log is 6.77 / 20.2 / 2.47 / 1.94 instead of 7.30 / 34.6 / 2.77 / 2.65, for a few percent slower decode and prompt reading (measured in v2.12.3-m1.16); on facts buried in the prompt it answered all 48 questions (ISTA missed 2 at 32K). Unsloth quantizes the routed experts as IQ2_XXS / IQ2_S (gate, up) and Q2_0 / IQ4_NL (down), and the dense layers at Q5_K–Q8_0 where ISTA's are Q2_0–Q4_K.
 
 ## Use
 
