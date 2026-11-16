@@ -246,6 +246,22 @@ def _text_config(root: Path) -> dict:
     return cfg.get("text_config") or cfg
 
 
+def q2_0_gguf_blocks_enabled() -> bool:
+    """Whether ISTA Q2_0 routed experts load as their GGUF blocks (2.25 bits a
+    weight) instead of MLX affine 2-bit g64 with a bias plane that is always
+    -scale (2.5 bits). ``MTPLX_GGUF_Q2_0_BLOCKS`` 1/0 decides; unset, on for
+    the M1 family (-3.8 GB, decode kernel bit-identical, 2026-11-16 fn-s8)."""
+
+    raw = (os.environ.get("MTPLX_GGUF_Q2_0_BLOCKS") or "").strip().lower()
+    if raw in ("1", "true", "on", "yes"):
+        return True
+    if raw in ("0", "false", "off", "no"):
+        return False
+    from mtplx.cache_state import m1_long_context_defaults
+
+    return m1_long_context_defaults()
+
+
 def gguf_routed_expert_bytes(model_path: Any) -> int:
     """Bytes of the routed experts a converted GGUF pack builds at load
     (text_config.routed_experts_gguf, scripts/convert_flashnext_ista_gguf.py).
@@ -256,9 +272,7 @@ def gguf_routed_expert_bytes(model_path: Any) -> int:
     block = {"Q2_0": (64, 18), "IQ4_NL": (32, 18), "IQ2_XXS": (256, 66), "IQ2_S": (256, 82)}
     # MTPLX_GGUF_Q2_0_BLOCKS=1 keeps Q2_0 experts as their GGUF blocks too
     # (qwen4_exp._q2_0_gguf_blocks_enabled): no bias plane.
-    q2_blocks = spec.get("format") == "Q2_0" and (
-        os.environ.get("MTPLX_GGUF_Q2_0_BLOCKS") or "0"
-    ).strip().lower() in ("1", "true", "on", "yes")
+    q2_blocks = spec.get("format") == "Q2_0" and q2_0_gguf_blocks_enabled()
     total = 0
     for projs in (spec.get("layers") or {}).values():
         for t in projs.values():

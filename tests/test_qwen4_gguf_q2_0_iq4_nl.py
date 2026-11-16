@@ -84,8 +84,12 @@ def test_ngram_table_gathers_iq4_nl_rows_from_gguf(tmp_path, monkeypatch):
     np.testing.assert_array_equal(np.array(got), want)
 
 
-def test_memory_plan_counts_gguf_experts_and_table(tmp_path):
+def test_memory_plan_counts_gguf_experts_and_table(tmp_path, monkeypatch):
     import json
+
+    # the affine form (MTPLX_GGUF_Q2_0_BLOCKS=0; the M1 default keeps blocks,
+    # test_qwen4_gguf_mixed_experts.test_q2_0_blocks_weight_estimate)
+    monkeypatch.setenv("MTPLX_GGUF_Q2_0_BLOCKS", "0")
 
     from mtplx.engine_session import model_weights_bytes, ngram_table_bytes
 

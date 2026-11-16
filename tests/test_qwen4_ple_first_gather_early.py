@@ -447,6 +447,9 @@ def _predict(**stubs):
         "_gdn_boundary_tail_layout": lambda: "geometric",
         "_gdn_boundary_tail_min_rung": lambda: 1024,
         "_gdn_boundary_tail_backoff": lambda: 64,
+        # the Flash-Next prefill ramp only widens forwards past a narrowed
+        # chunk; these predictions run at the full 4,096-row chunk
+        "_wide_prefill_ramp_spans": lambda token_count, chunk: None,
     }
     namespace.update(stubs)
     exec(compile(module, "<generation>", "exec"), namespace)

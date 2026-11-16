@@ -2836,10 +2836,22 @@ def _fused_moe_verify_enabled() -> bool:
 _LAYER_MLP_RE = re.compile(r"^(.*\.layers\.(\d+)\.mlp)\.switch_mlp\.(?:gate_proj\.weight|gate_q)$")
 
 
-def _q2_0_gguf_blocks_enabled() -> bool:
-    """MTPLX_GGUF_Q2_0_BLOCKS=1: ISTA Q2_0 routed experts stay GGUF blocks."""
+def _ngram_hot_default_mb() -> int:
+    """Hot-row cache default: 256 MB on the M1 family (64 GB machines run
+    256K prompts within a few GB of macOS's free-page floor; the 2026-11-16
+    A/B at 64K/128K read no decode change against 1024), 1024 elsewhere."""
 
-    return (os.environ.get("MTPLX_GGUF_Q2_0_BLOCKS") or "0").strip().lower() in ("1", "true", "on", "yes")
+    from mtplx.cache_state import m1_long_context_defaults
+
+    return 256 if m1_long_context_defaults() else 1024
+
+
+def _q2_0_gguf_blocks_enabled() -> bool:
+    """ISTA Q2_0 routed experts stay GGUF blocks (engine_session.q2_0_gguf_blocks_enabled)."""
+
+    from mtplx.engine_session import q2_0_gguf_blocks_enabled
+
+    return q2_0_gguf_blocks_enabled()
 
 
 def _q2_0_affine_from_gguf(spec: dict) -> tuple[mx.array, mx.array, mx.array]:
@@ -5820,9 +5832,9 @@ class _SidecarGather:
         self._hot = OrderedDict()
         self._hot_row_bytes = max(1, sum(rb for _, rb in self._row_meta))
         try:
-            hot_mb = int(os.environ.get("MTPLX_NGRAM_HOT_MB", "1024"))
+            hot_mb = int(os.environ.get("MTPLX_NGRAM_HOT_MB") or _ngram_hot_default_mb())
         except ValueError:
-            hot_mb = 1024
+            hot_mb = _ngram_hot_default_mb()
         self._hot_cap_rows = (max(0, hot_mb) * 2**20) // self._hot_row_bytes
         self.hot_hits = 0
         self.hot_misses = 0

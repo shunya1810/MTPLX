@@ -1200,6 +1200,15 @@ def _server_runtime_env_overrides(
             # rows-gather engage floor and under MTPLX_QSA_GATHER=0.
             if os.environ.get("MTPLX_QSA_GATHER_MAX_ROWS") is None:
                 overrides.setdefault("MTPLX_QSA_GATHER_MAX_ROWS", "32")
+            # S=1 forwards (the draft head's attention every draft step) read
+            # only the selected blocks + tail instead of a dense mask over the
+            # whole KV: draft 13.0 -> 10.9 ms a round at 128K, decode
+            # 37.9 -> 39.8 tok/s (M1 Max, 2026-11-16 fn-s8).
+            if os.environ.get("MTPLX_QSA_FLASH") is None:
+                from mtplx.cache_state import m1_long_context_defaults as _m1_defaults
+
+                if _m1_defaults():
+                    overrides.setdefault("MTPLX_QSA_FLASH", "1")
             if mtp_head_loads and _served_model_lm_head_is_q8_g64(args):
                 if os.environ.get("MTPLX_FRSPEC_DRAFT") is None:
                     overrides.setdefault("MTPLX_FRSPEC_DRAFT", "1")

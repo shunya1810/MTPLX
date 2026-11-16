@@ -201,7 +201,7 @@ def test_q2_0_blocks_weight_estimate(tmp_path, monkeypatch):
     (tmp_path / "config.json").write_text(json.dumps(
         {"text_config": {"routed_experts_gguf": {"format": "Q2_0", "layers": {"0": {"gate_proj": t}}}}}))
     n = 4 * 64 * 128
-    monkeypatch.delenv("MTPLX_GGUF_Q2_0_BLOCKS", raising=False)
+    monkeypatch.setenv("MTPLX_GGUF_Q2_0_BLOCKS", "0")
     assert gguf_routed_expert_bytes(tmp_path) == n // 4 + n // 64 * 4
     monkeypatch.setenv("MTPLX_GGUF_Q2_0_BLOCKS", "1")
     assert gguf_routed_expert_bytes(tmp_path) == n // 64 * 18
