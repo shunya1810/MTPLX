@@ -117,7 +117,7 @@ def _glu_reference(refs, x, idx, w, dtype):
     return out
 
 
-@pytest.mark.parametrize("gate_type,down_type", [("IQ2_XXS", "IQ4_NL"), ("IQ2_S", "Q2_0")])
+@pytest.mark.parametrize("gate_type,down_type", [("IQ2_XXS", "IQ4_NL"), ("IQ2_S", "Q2_0"), ("Q2_0", "Q2_0")])
 def test_decode_glu_and_prefill_matmul_match_reference(tmp_path, gate_type, down_type):
     rng = np.random.default_rng(3)
     sw, refs = _module(tmp_path, rng, gate_type, down_type)
@@ -147,7 +147,7 @@ def test_switch_call_keeps_switchglu_contract(tmp_path):
     assert y.shape == (1, 5, 2, 512) and y.dtype == mx.float16
 
 
-@pytest.mark.parametrize("gate_type,down_type", [("IQ2_XXS", "IQ4_NL"), ("IQ2_S", "Q2_0"), ("IQ2_S", "IQ4_NL")])
+@pytest.mark.parametrize("gate_type,down_type", [("IQ2_XXS", "IQ4_NL"), ("IQ2_S", "Q2_0"), ("IQ2_S", "IQ4_NL"), ("Q2_0", "Q2_0")])
 @pytest.mark.parametrize("bm", ["16", "32"])
 def test_prefill_on_mlx_qmm_tile_matches_reference(tmp_path, monkeypatch, gate_type, down_type, bm):
     """moe_gguf_qmm: GGUF loader inside MLX's quantized-matmul tile."""
@@ -167,3 +167,41 @@ def test_prefill_on_mlx_qmm_tile_matches_reference(tmp_path, monkeypatch, gate_t
         part = G.prefill_parts(x, sw, mx.array(idx.reshape(-1), mx.uint32))
         got = np.array((part.reshape(m, 2, -1) * mx.array(w)[..., None]).sum(axis=1).astype(mx.float32))
         np.testing.assert_allclose(got, want, atol=4e-3 * np.abs(want).max() + 1e-4)
+
+
+def test_q2_0_blocks_decode_is_the_affine_kernel_bit_for_bit(tmp_path):
+    """All-Q2_0 blocks (ISTA pack, MTPLX_GGUF_Q2_0_BLOCKS) at decode/verify
+    widths: moe_q2_blocks_glu equals moe_q2_glu over the affine form the
+    default load builds (scale = d, bias = -d, gate+up fused)."""
+    from mtplx.kernels.moe_q2_glu import moe_q2_blocks_glu, moe_q2_glu
+
+    rng = np.random.default_rng(11)
+    sw, _ = _module(tmp_path, rng, "Q2_0", "Q2_0", n=128)  # the 2-bit kernels take N % 128 == 0
+    gu_w = mx.concatenate([sw.gate_q, sw.up_q], axis=1)
+    gu_s = mx.concatenate([sw.gate_d, sw.up_d], axis=1)
+    for m in (1, 4):
+        x = mx.array(rng.normal(0, 0.5, size=(m, 512)).astype(np.float32)).astype(mx.float16)
+        flat = mx.array(np.stack([rng.choice(6, 2, replace=False) for _ in range(m)]).reshape(-1), mx.uint32)
+        w = mx.array(rng.dirichlet([1, 1], size=m).astype(np.float32).reshape(-1))
+        shared = mx.array(rng.normal(0, 0.1, size=(m, 512)).astype(np.float32)).astype(mx.float16)
+        gate = mx.array(rng.normal(size=(m,)).astype(np.float32)).astype(mx.float16)
+        want = moe_q2_glu(x, gu_w, gu_s, -gu_s, sw.down_q, sw.down_d, -sw.down_d, flat, w, shared=shared, shared_gate=gate)
+        got = moe_q2_blocks_glu(x, sw, flat, w, shared=shared, shared_gate=gate)
+        assert np.array_equal(np.array(got), np.array(want))
+
+
+def test_q2_0_blocks_weight_estimate(tmp_path, monkeypatch):
+    """The memory plan prices Q2_0 experts at 18 bytes a 64-weight block when
+    they stay blocks, at codes + fp16 scale and bias otherwise."""
+    import json
+
+    from mtplx.engine_session import gguf_routed_expert_bytes
+
+    t = {"path": "x", "offset": 0, "experts": 4, "rows": 64, "cols": 128}
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"text_config": {"routed_experts_gguf": {"format": "Q2_0", "layers": {"0": {"gate_proj": t}}}}}))
+    n = 4 * 64 * 128
+    monkeypatch.delenv("MTPLX_GGUF_Q2_0_BLOCKS", raising=False)
+    assert gguf_routed_expert_bytes(tmp_path) == n // 4 + n // 64 * 4
+    monkeypatch.setenv("MTPLX_GGUF_Q2_0_BLOCKS", "1")
+    assert gguf_routed_expert_bytes(tmp_path) == n // 64 * 18

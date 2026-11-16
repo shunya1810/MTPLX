@@ -338,6 +338,85 @@ def _rows_a() -> int:
     return r if r > 0 and r % 32 == 0 else 32
 
 
+# GGUF Q2_0 blocks kept as they are (MTPLX_GGUF_Q2_0_BLOCKS, the ISTA pack
+# on qwen4_exp.GGUFMixedSwitchGLU): the payload [E, R, K/16] and the block
+# scales d [E, R, K/64] are the affine pack's weight and scales word for word,
+# and w = d (q - 1) is the affine contract with bias = -scale, so the same two
+# kernels run with the bias read replaced by -scale and gate and up as two
+# arrays instead of the sanitize-fused [E, 2N] pack.
+_SRC_A_BLOCKS = (
+    _SRC_A.replace(
+        "const size_t row = (size_t)e * 2 * n_inter + hh * n_inter + j;\n"
+        "        const device uint* wrow = gw + row * NW;\n"
+        "        const device T* srow = gs + row * NG;\n"
+        "        const device T* brow = gb + row * NG;",
+        "const size_t row = (size_t)e * n_inter + j;\n"
+        "        const device uint* wrow = (hh == 0 ? gw : uw) + row * NW;\n"
+        "        const device half* srow = (hh == 0 ? gs : us) + row * NG;",
+    ).replace("bi[i] = (float)brow[w / 4];", "bi[i] = -sc[i];")
+)
+_SRC_B_BLOCKS = _SRC_B.replace("bi[i] = (float)db[row * NG + w / 4];", "bi[i] = -sc[i];").replace(
+    "sc[i] = (float)ds[row * NG + w / 4];", "sc[i] = (float)ds[row * NG + w / 4];"
+)
+assert _SRC_A_BLOCKS != _SRC_A and "brow" not in _SRC_A_BLOCKS and "db[" not in _SRC_B_BLOCKS
+
+
+@lru_cache(maxsize=4)
+def _kernel_a_blocks():
+    return mx.fast.metal_kernel(
+        name="mtplx_moe_q2_blocks_glu_h",
+        input_names=["x", "gw", "gs", "uw", "us", "experts"],
+        output_names=["h"],
+        header=_HEADER,
+        source=_SRC_A_BLOCKS,
+    )
+
+
+@lru_cache(maxsize=4)
+def _kernel_b_blocks():
+    return mx.fast.metal_kernel(
+        name="mtplx_moe_q2_blocks_down_y",
+        input_names=["h", "dw", "ds", "experts", "rw", "shared", "sgate"],
+        output_names=["y"],
+        header=_HEADER,
+        source=_SRC_B_BLOCKS,
+    )
+
+
+def moe_q2_blocks_glu(x2, sw, experts, route_w, shared=None, shared_gate=None):
+    """moe_q2_glu for a GGUFMixedSwitchGLU whose gate, up and down are all
+    Q2_0 blocks (``<proj>_q`` uint32 [E, R, K/16], ``<proj>_d`` fp16 [E, R, K/64])."""
+    m_rows, k = int(x2.shape[0]), int(x2.shape[1])
+    n_inter = int(sw.n_inter)
+    dmodel = int(sw.hidden)
+    topk = int(experts.shape[0]) // m_rows
+    if k % 64 or n_inter % 64:
+        raise ValueError("moe_q2_blocks_glu needs dot lengths that are multiples of 64")
+    pairs = m_rows * topk
+    rows_a = _rows_a()
+    (h,) = _kernel_a_blocks()(
+        inputs=[x2, sw.gate_q, sw.gate_d, sw.up_q, sw.up_d, experts],
+        template=[("T", x2.dtype), ("K_C", k), ("n_inter_c", n_inter), ("topk_c", topk), ("CHUNK_A", _chunk_a(k)), ("ROWS_A", rows_a)],
+        grid=(((n_inter + rows_a - 1) // rows_a) * 256, pairs, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(pairs, n_inter)],
+        output_dtypes=[x2.dtype],
+    )
+    with_shared = shared is not None
+    if not with_shared:
+        shared = shared_gate = x2  # unused
+    (y,) = _kernel_b_blocks()(
+        inputs=[h, sw.down_q, sw.down_d, experts, route_w, shared, shared_gate],
+        template=[("T", x2.dtype), ("N_C", n_inter), ("TOPK_C", topk), ("dmodel_c", dmodel),
+                  ("SHARED", int(with_shared))],
+        grid=(((dmodel + 31) // 32) * 256, m_rows, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(m_rows, dmodel)],
+        output_dtypes=[x2.dtype],
+    )
+    return y
+
+
 def moe_q2_glu(x2, gu_w, gu_s, gu_b, dn_w, dn_s, dn_b, experts, route_w, shared=None, shared_gate=None):
     """x2 [M, K]; gate+up pack [E, 2N, K/16] uint32 (2-bit g64) with scales and
     biases [E, 2N, K/64]; down pack [E, D, N/16] with [E, D, N/64];

@@ -254,12 +254,17 @@ def gguf_routed_expert_bytes(model_path: Any) -> int:
     Mixed-type packs ("format": "mixed") keep the GGUF blocks as they are."""
     spec = _text_config(Path(str(model_path))).get("routed_experts_gguf") or {}
     block = {"Q2_0": (64, 18), "IQ4_NL": (32, 18), "IQ2_XXS": (256, 66), "IQ2_S": (256, 82)}
+    # MTPLX_GGUF_Q2_0_BLOCKS=1 keeps Q2_0 experts as their GGUF blocks too
+    # (qwen4_exp._q2_0_gguf_blocks_enabled): no bias plane.
+    q2_blocks = spec.get("format") == "Q2_0" and (
+        os.environ.get("MTPLX_GGUF_Q2_0_BLOCKS") or "0"
+    ).strip().lower() in ("1", "true", "on", "yes")
     total = 0
     for projs in (spec.get("layers") or {}).values():
         for t in projs.values():
             weights = int(t["experts"]) * int(t["rows"]) * int(t["cols"])
-            if spec.get("format") == "mixed":
-                qk, bs = block[t["type"]]
+            if spec.get("format") == "mixed" or q2_blocks:
+                qk, bs = block[t.get("type", "Q2_0")]
                 total += weights // qk * bs
             else:
                 total += weights // 4 + weights // 64 * 4

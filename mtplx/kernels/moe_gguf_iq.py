@@ -329,8 +329,10 @@ _MID_SRC = r"""
     const uint pair = threadgroup_position_in_grid.y;
     const uint t = pair / TOPK;
     const uint e = experts[pair];
-    for (uint i = tid; i < (uint)NGRID; i += 256) tgrid[i] = ((const device uint4*)gridh)[i];
-    for (uint i = tid; i < (uint)NSIGN; i += 256) tsign[i] = ((const device uint4*)signh)[i];
+    if (TY != 0) {
+        for (uint i = tid; i < (uint)NGRID; i += 256) tgrid[i] = ((const device uint4*)gridh)[i];
+        for (uint i = tid; i < (uint)NSIGN; i += 256) tsign[i] = ((const device uint4*)signh)[i];
+    }
     if (XTG) {
         for (uint i = tid; i < (uint)(K / 4); i += 256) {
             const device T* src = x + (ulong)t * K + 4 * i;
@@ -350,9 +352,31 @@ _MID_SRC = r"""
             const uint blk = sb / 8, s = sb % 8;
             float4 xv[8];
             for (uint i = 0; i < 8; ++i) xv[i] = XTG ? xs[sb * 8 + i] : float4(xd[sb * 8 + i]);
+            float xsum = 0.0f;
+            if (TY == 0)
+                for (uint i = 0; i < 8; ++i) xsum += xv[i].x + xv[i].y + xv[i].z + xv[i].w;
             for (uint rp = 0; rp < 2 * NR; ++rp) {
                 const uint r = rp / 2, hh = rp % 2;
                 const ulong row = (ulong)e * N + j0 + r;
+                if (TY == 0) {
+                    // Q2_0 gate/up (the ISTA pack): 64-value blocks, so this
+                    // 32-weight sub-block is half a block, two payload words;
+                    // w = d (q - 1), element j in bits 2 (j % 16) of word j / 16.
+                    const uint qblk = sb / 2;
+                    const float d = (float)(hh == 0 ? gd : ud)[row * (K / 64) + qblk];
+                    const device uint* qw = (hh == 0 ? gq_ : uq) + (row * (K / 64) + qblk) * 4 + (sb % 2) * 2;
+                    float sq = 0.0f;
+                    for (uint wi = 0; wi < 2; ++wi) {
+                        const uint wv = qw[wi];
+                        for (uint b4 = 0; b4 < 4; ++b4) {
+                            const uint by = (wv >> (8 * b4)) & 0xFFu;
+                            const float4 qv = float4(by & 3u, (by >> 2) & 3u, (by >> 4) & 3u, by >> 6);
+                            sq += dot(qv, xv[wi * 4 + b4]);
+                        }
+                    }
+                    acc[rp] += d * (sq - xsum);
+                    continue;
+                }
                 const float d = (float)(hh == 0 ? gd : ud)[row * NB + blk];
                 const device uint* qb = (hh == 0 ? gq_ : uq) + (row * NB + blk) * W;
                 if (TY == 2) {

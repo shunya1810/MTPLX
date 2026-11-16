@@ -1518,6 +1518,27 @@ class SparseMoeBlock(_Qwen3NextSparseMoeBlock):
         idx, w = moe_route_topk(
             self.gate(x).reshape(rows, -1), self.top_k, normalize=bool(self.norm_topk_prob)
         )
+        if (
+            rows <= _GGUF_IQ_GLU_MAX_ROWS
+            and sw.gate_type == "Q2_0"
+            and sw.down_type == "Q2_0"
+            # the 2-bit kernels' per-lane word loops need K, N % 128 == 0
+            and sw.hidden % 128 == 0
+            and sw.n_inter % 128 == 0
+        ):
+            # All-Q2_0 blocks (ISTA pack, MTPLX_GGUF_Q2_0_BLOCKS): the affine
+            # 2-bit decode kernels with bias = -scale.
+            from mtplx.kernels.moe_q2_glu import moe_q2_blocks_glu
+
+            y = moe_q2_blocks_glu(
+                x2,
+                sw,
+                idx,
+                w,
+                shared=self.shared_expert(x).reshape(rows, -1),
+                shared_gate=self.shared_expert_gate(x).reshape(rows),
+            )
+            return y.reshape(x.shape)
         if rows <= _GGUF_IQ_GLU_MAX_ROWS and (os.environ.get("MTPLX_GGUF_IQ_GLU") or "1").strip() != "0":
             y = moe_iq_glu(
                 x2,
@@ -2815,6 +2836,12 @@ def _fused_moe_verify_enabled() -> bool:
 _LAYER_MLP_RE = re.compile(r"^(.*\.layers\.(\d+)\.mlp)\.switch_mlp\.(?:gate_proj\.weight|gate_q)$")
 
 
+def _q2_0_gguf_blocks_enabled() -> bool:
+    """MTPLX_GGUF_Q2_0_BLOCKS=1: ISTA Q2_0 routed experts stay GGUF blocks."""
+
+    return (os.environ.get("MTPLX_GGUF_Q2_0_BLOCKS") or "0").strip().lower() in ("1", "true", "on", "yes")
+
+
 def _q2_0_affine_from_gguf(spec: dict) -> tuple[mx.array, mx.array, mx.array]:
     """One routed-expert tensor stored as GGUF Q2_0 -> MLX affine 2-bit g64.
 
@@ -2924,6 +2951,15 @@ def _gguf_q2_0_experts_sanitize(model, out: dict) -> dict:
         return _gguf_mixed_experts_sanitize(model, spec, out)
     if spec.get("format") != "Q2_0":
         raise ValueError(f"unsupported GGUF routed expert format {spec.get('format')}")
+    if _q2_0_gguf_blocks_enabled():
+        # Keep the Q2_0 blocks as they are (fp16 d + 2-bit codes, 2.25 bits a
+        # weight) on the GGUF-block kernels the Unsloth pack runs: the affine
+        # form below carries bias = -scale, 3.8 GB of the 37.7 GB of experts.
+        blocks = {
+            layer: {proj: {**tensor, "type": "Q2_0"} for proj, tensor in projs.items()}
+            for layer, projs in spec["layers"].items()
+        }
+        return _gguf_mixed_experts_sanitize(model, {**spec, "format": "mixed", "layers": blocks}, out)
     for layer, projs in spec["layers"].items():
         base = f"language_model.model.layers.{int(layer)}.mlp.switch_mlp"
         for proj, tensor in projs.items():
