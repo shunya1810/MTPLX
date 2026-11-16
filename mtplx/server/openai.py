@@ -25825,11 +25825,29 @@ def _dynamic_paged_kv_env(
     )["env"]
 
 
+#: Anonymous prompts at least this long keep a live reference too
+#: (MTPLX_SESSIONBANK_LIVE_REF_MIN_PROMPT_TOKENS, 0 = off). Past the bank's
+#: per-session cap a snapshot is refused outright, and without the live
+#: reference every turn of a long anonymous chat prefilled cold: Flash-Next on
+#: a 64 GB M1 Max, 131K-token prompt, 5.08 GB snapshot vs a 3.6 GB cap, the
+#: same question again took 423 s instead of a restore (2026-11-16, fn-s7).
+_LIVE_REF_MIN_PROMPT_TOKENS_DEFAULT = 32768
+
+
+def _live_ref_min_prompt_tokens() -> int:
+    raw = (os.environ.get("MTPLX_SESSIONBANK_LIVE_REF_MIN_PROMPT_TOKENS") or "").strip()
+    try:
+        return max(0, int(raw)) if raw else _LIVE_REF_MIN_PROMPT_TOKENS_DEFAULT
+    except ValueError:
+        return _LIVE_REF_MIN_PROMPT_TOKENS_DEFAULT
+
+
 def _session_keep_live_refs_for_request(
     *,
     session_source: str | None,
     session_id: str | None,
     tool_names: list[str] | tuple[str, ...] | None = None,
+    prompt_tokens: int | None = None,
 ) -> bool:
     if os.environ.get(
         "MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS", ""
@@ -25841,6 +25859,13 @@ def _session_keep_live_refs_for_request(
     if source in {"user", "chat_id", "conversation_id"}:
         return True
     if _anonymous_coding_agent_tool_request(tool_names):
+        return True
+    floor = _live_ref_min_prompt_tokens()
+    if floor and prompt_tokens is not None and int(prompt_tokens) >= floor:
+        # A long prompt: the live cache is the only copy a follow-up can
+        # restore from once its snapshot outgrows the per-session cap, and
+        # the buffers it pins are the prompt's own, not a request's unused
+        # max_tokens capacity (the concern below).
         return True
     # Anonymous auto sessions are useful as cloneable prefix snapshots, but
     # retaining their live paged-KV containers preserves the full request
@@ -39909,6 +39934,7 @@ def create_app(state: ServerState) -> FastAPI:
             session_source=session_source,
             session_id=session_id,
             tool_names=_tool_names(tool_specs) if tools_active else None,
+            prompt_tokens=len(prompt_ids) if prompt_ids is not None else None,
         )
         live_frontier_policy = "none"
         if agent_transcript_tools_active:

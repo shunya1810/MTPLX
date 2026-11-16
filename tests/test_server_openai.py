@@ -1704,6 +1704,17 @@ def test_anonymous_non_tool_benchmark_sessions_stay_cold(monkeypatch):
     )
 
 
+def test_long_anonymous_prompts_keep_live_refs(monkeypatch):
+    monkeypatch.delenv("MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS", raising=False)
+    monkeypatch.delenv("MTPLX_SESSIONBANK_LIVE_REF_MIN_PROMPT_TOKENS", raising=False)
+    kw = dict(session_source="new", session_id="anon-long", tool_names=[])
+    assert openai._session_keep_live_refs_for_request(**kw, prompt_tokens=131_117) is True
+    assert openai._session_keep_live_refs_for_request(**kw, prompt_tokens=2_000) is False
+    assert openai._session_keep_live_refs_for_request(**kw) is False
+    monkeypatch.setenv("MTPLX_SESSIONBANK_LIVE_REF_MIN_PROMPT_TOKENS", "0")
+    assert openai._session_keep_live_refs_for_request(**kw, prompt_tokens=131_117) is False
+
+
 def test_explicit_sessions_keep_live_refs(monkeypatch):
     monkeypatch.delenv(
         "MTPLX_SESSIONBANK_LIVE_REFS_FOR_IMPLICIT_SESSIONS",
