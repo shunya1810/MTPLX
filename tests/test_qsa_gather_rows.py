@@ -124,10 +124,15 @@ def test_rows_gather_stays_dense_above_max_rows(attn, monkeypatch):
     assert isinstance(sel, mx.array) and sel.ndim == 4, "copy-block widths stay dense"
 
 
-def test_qsa_gather_fence_defaults():
+def test_qsa_gather_fence_defaults(monkeypatch):
     """The shipped fences behind the family default (founder release call
     2026-08-28): rows-gather engages only at KV >= 16384 and serves 2..8
-    rows. Pins the release notes' 'bit-identical dense below 16k' claim —
-    no monkeypatching, these are the values a stranger's Mac gets."""
+    rows when the stock rows-gather attention serves it. With the in-place
+    rows kernel (mtplx.kernels.qsa_rows_mma, default on) rows-gather is the
+    faster route at every context, so its floor drops to 0."""
+    monkeypatch.delenv("MTPLX_QSA_GATHER_MIN_CONTEXT", raising=False)
+    monkeypatch.setenv("MTPLX_QSA_ROWS_MMA", "0")
     assert _qsa_gather_min_context() == 16384
+    monkeypatch.delenv("MTPLX_QSA_ROWS_MMA")
+    assert _qsa_gather_min_context() == 0
     assert _qsa_gather_max_rows() == 8

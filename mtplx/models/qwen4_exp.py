@@ -787,7 +787,14 @@ class GatedDeltaNet(_Qwen3_5GatedDeltaNet):
 
         fused_in = getattr(self, "in_proj_fused", None)
         if fused_in is not None:
-            qkv, z, b, a = fused_in(inputs)
+            outs = None
+            if S >= 512 and mask is None and current_attention_phase() == "prefill":
+                # GPU + Neural Engine split of the projection (opt-in,
+                # mtplx/ane_prefill_qwen4.py); None keeps the stock matmul.
+                from mtplx import ane_prefill_qwen4
+
+                outs = ane_prefill_qwen4.gdn_in_proj(fused_in, inputs)
+            qkv, z, b, a = outs if outs is not None else fused_in(inputs)
             z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
         else:
             qkv = self.in_proj_qkv(inputs)
@@ -2265,6 +2272,13 @@ def _sdpa_head_chunked(q, k, v, *, scale, mask, heads_per_chunk: int):
 #: Prefill forwards at least this wide take the fused masked-softmax route
 #: for their dense-band attention.
 _QSA_DENSE_BAND_SDPA_MIN_ROWS = 32
+
+#: Causal prefill chunks (selection == the causal prefix) at least this wide
+#: run on the MMA prefill kernel; its query-block shape (GQA 12 x QL rows per
+#: threadgroup, NSG simdgroups).
+_QSA_CAUSAL_MMA_MIN_ROWS = 32
+_QSA_CAUSAL_MMA_QL = int(os.environ.get("MTPLX_QSA_CAUSAL_MMA_QL", "2") or 2)
+_QSA_CAUSAL_MMA_NSG = int(os.environ.get("MTPLX_QSA_CAUSAL_MMA_NSG", "4") or 4)
 
 
 def _qsa_dense_band_sdpa_applies(q: mx.array, k: mx.array, mask) -> bool:
@@ -5203,6 +5217,34 @@ class Attention(nn.Module):
             return None
         return qsa_rows_attention(q, keys, values, tok_idx, tok_ok, self.scale)
 
+    def _causal_prefill_mma(self, q, cache, pos_start, S, fixed):
+        """Causal prefill attention over the KV backing (the fork's MMA prefill
+        kernel, sdpa_gqa_mma_prefill) when the selection is the full causal
+        prefix, instead of MLX's unfused head-dim-256 SDPA with a [S, T]
+        mask; None when off or out of contract."""
+
+        if fixed or S < _QSA_CAUSAL_MMA_MIN_ROWS or current_attention_phase() != "prefill":
+            return None
+        raw = (os.environ.get("MTPLX_QSA_CAUSAL_PREFILL_MMA") or "1").strip().lower()
+        if raw in {"0", "off", "false", "no"}:
+            return None
+        keys = getattr(cache.kv, "keys", None)
+        values = getattr(cache.kv, "values", None)
+        if not isinstance(keys, mx.array) or not isinstance(values, mx.array):
+            return None
+        from mtplx.kernels.sdpa_gqa_mma import sdpa_gqa_mma_prefill
+
+        return sdpa_gqa_mma_prefill(
+            queries=q,
+            keys=keys,
+            values=values,
+            prefix=int(pos_start),
+            scale=self.scale,
+            num_kv_heads=self.n_kv_heads,
+            block_positions=_QSA_CAUSAL_MMA_QL,
+            simdgroups=_QSA_CAUSAL_MMA_NSG,
+        )
+
     def __call__(self, x: mx.array, cache: QSACache) -> mx.array:
         B, S, _ = x.shape
         pos_start = cache.offset
@@ -5222,7 +5264,13 @@ class Attention(nn.Module):
             # pack precision matches; the v2.10 artifact's 4-bit group-64
             # indexer can therefore join this dispatch). Row-concat is
             # bit-exact per row; MTPLX_FUSED_QSA_QKV sanitize fusion.
-            outs = fused(x)
+            outs = None
+            if S >= 512 and current_attention_phase() == "prefill":
+                from mtplx import ane_prefill_qwen4  # GPU + Neural Engine split (opt-in)
+
+                outs = ane_prefill_qwen4.attn_qkv(fused, x)
+            if outs is None:
+                outs = fused(x)
             if len(outs) == 4:
                 q, k, v, idx_rows = outs
             else:
@@ -5502,6 +5550,9 @@ class Attention(nn.Module):
                 out = self._rows_mma(q, cache, mx.broadcast_to(tpos[None, :], ok.shape), ok, fixed)
                 if out is not None:
                     return _linear(self.o_proj, attention_gate(out.transpose(0, 2, 1, 3).reshape(B, S, -1), gate))
+            out = self._causal_prefill_mma(q, cache, pos_start, S, fixed)
+            if out is not None:
+                return _linear(self.o_proj, attention_gate(out.transpose(0, 2, 1, 3).reshape(B, S, -1), gate))
             mask = (tpos[None, :] <= qpos[:, None])[None, None]
         else:
             mask = None
