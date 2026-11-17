@@ -46,7 +46,7 @@ from mtplx.kernels.qsa_indexer_select import (
 )
 
 QSAPrefillMode = Literal["blocks", "dense_mask", "row_tokens"]
-QSAPrefillScoreProducer = Literal["mpp", "mlx"]
+QSAPrefillScoreProducer = Literal["mpp", "mlx", "simd"]
 
 _SUPPORTED_DTYPES = (mx.float16, mx.bfloat16, mx.float32)
 _MAX_TOPK = 512
@@ -134,7 +134,7 @@ def qsa_indexer_prefill_score_chunk_rows(
     blocks = int(backing_blocks)
     budget = int(workspace_bytes)
     alignment = int(row_alignment)
-    if producer not in ("mpp", "mlx"):
+    if producer not in ("mpp", "mlx", "simd"):
         raise ValueError(f"unknown score producer {producer!r}")
     if query_rows <= 0:
         raise ValueError(f"rows must be positive, got {query_rows}")
@@ -147,7 +147,7 @@ def qsa_indexer_prefill_score_chunk_rows(
     if alignment <= 0:
         raise ValueError(f"row_alignment must be positive, got {alignment}")
 
-    score_planes = 1 if producer == "mpp" else query_heads + 1
+    score_planes = 1 if producer in ("mpp", "simd") else query_heads + 1
     bytes_per_row = blocks * 4 * score_planes
     chunk = min(query_rows, max(1, budget // bytes_per_row))
     if chunk >= alignment and chunk < query_rows:
@@ -191,6 +191,120 @@ def qsa_indexer_prefill_scores(
     per_head = mx.matmul(q_chunk.astype(mx.float32), pooled_t_float32)
     scores = mx.maximum(per_head, 0.0).sum(axis=2) / math.sqrt(dim)
     return scores[0]
+
+
+# ---------------------------------------------------------------------------
+# Fused simdgroup-matrix score kernel (Apple7+, no tensor ops needed).
+#
+# ``out[c, n] = sum_h relu(q[c, h, :] . pooled[n, :]) / sqrt(D)`` in one pass:
+# the per-head float32 planes of the MLX expression never reach memory.  q and
+# pooled are float16, so every product is exact in float32 and the accumulation
+# differs from the float32 matmul only in summation order (max |diff| ~1e-7 on
+# scores of order 1; the selected top-k sets are identical in the receipts).
+# Eight query rows by NF*8 keys per simdgroup; heads are four fragments with
+# the same element mapping, so relu + head sum happen in registers.
+# ---------------------------------------------------------------------------
+
+_SIMD_SCORE_NF = 4
+_SIMD_SCORE_SGS = 4
+_SIMD_SCORE_SOURCE = """
+    uint sg = simdgroup_index_in_threadgroup;
+    uint col0 = (threadgroup_position_in_grid.x * SGS + sg) * (NF * 8);
+    uint row0 = threadgroup_position_in_grid.y * 8;
+    uint n = (uint)p_shape[0];
+    if (col0 >= n) return;
+    simdgroup_float8x8 acc[H_][NF];
+    #pragma clang loop unroll(full)
+    for (int h = 0; h < H_; ++h) {
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < NF; ++j) acc[h][j] = simdgroup_float8x8(0.0f);
+    }
+    for (int k = 0; k < D_; k += 8) {
+        simdgroup_half8x8 a[H_];
+        #pragma clang loop unroll(full)
+        for (int h = 0; h < H_; ++h)
+            simdgroup_load(a[h], q + ((ulong)row0 * H_ + h) * D_ + k, (ulong)H_ * D_);
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < NF; ++j) {
+            if (col0 + (uint)j * 8 < n) {
+                simdgroup_half8x8 b;
+                simdgroup_load(b, p + (ulong)(col0 + j * 8) * D_ + k, (ulong)D_, ulong2(0, 0), true);
+                #pragma clang loop unroll(full)
+                for (int h = 0; h < H_; ++h) simdgroup_multiply_accumulate(acc[h][j], a[h], b, acc[h][j]);
+            }
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (int j = 0; j < NF; ++j) {
+        if (col0 + (uint)j * 8 < n) {
+            float v0 = 0.0f, v1 = 0.0f;
+            #pragma clang loop unroll(full)
+            for (int h = 0; h < H_; ++h) {
+                auto e = acc[h][j].thread_elements();
+                v0 += metal::max(e[0], 0.0f);
+                v1 += metal::max(e[1], 0.0f);
+            }
+            simdgroup_float8x8 o = simdgroup_float8x8(0.0f);
+            o.thread_elements()[0] = v0 / 11.313708498984761f;
+            o.thread_elements()[1] = v1 / 11.313708498984761f;
+            simdgroup_store(o, out + (ulong)row0 * n + col0 + j * 8, (ulong)n);
+        }
+    }
+"""
+
+
+def _simd_scores_enabled() -> bool:
+    raw = (os.environ.get("MTPLX_QSA_PREFILL_SIMD_SCORES") or "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
+
+
+def qsa_indexer_prefill_scores_simd_supported(q_chunk: mx.array, pooled: mx.array) -> bool:
+    """float16 [1,C,4,128] x [1,N,128] with N a multiple of 8 on a Metal device."""
+
+    if not _simd_scores_enabled() or not hasattr(mx, "metal") or not mx.metal.is_available():
+        return False
+    if q_chunk.dtype != mx.float16 or pooled.dtype != mx.float16:
+        return False
+    if q_chunk.ndim != 4 or int(q_chunk.shape[0]) != 1 or int(q_chunk.shape[2]) != 4:
+        return False
+    if int(q_chunk.shape[3]) != 128 or pooled.ndim != 3 or int(pooled.shape[0]) != 1:
+        return False
+    blocks = int(pooled.shape[1])
+    return int(pooled.shape[2]) == 128 and blocks > 0 and blocks % 8 == 0
+
+
+@lru_cache(maxsize=1)
+def _prefill_simd_score_kernel():
+    return mx.fast.metal_kernel(
+        name="mtplx_qsa_prefill_simd_scores_h4d128",
+        input_names=["q", "p"],
+        output_names=["out"],
+        source=_SIMD_SCORE_SOURCE,
+    )
+
+
+def qsa_indexer_prefill_scores_simd(q_chunk: mx.array, pooled: mx.array) -> mx.array:
+    """Fused float32 scores ``[C,N]`` for a supported ``q_chunk``/``pooled`` pair."""
+
+    if not qsa_indexer_prefill_scores_simd_supported(q_chunk, pooled):
+        raise ValueError("QSA simd prefill scores called for an unsupported signature")
+    rows = int(q_chunk.shape[1])
+    blocks = int(pooled.shape[1])
+    padded = (rows + 7) // 8 * 8
+    q = q_chunk[0]
+    if padded != rows:
+        q = mx.concatenate([q, mx.zeros((padded - rows, 4, 128), dtype=q.dtype)], axis=0)
+    span = _SIMD_SCORE_NF * 8 * _SIMD_SCORE_SGS
+    (scores,) = _prefill_simd_score_kernel()(
+        inputs=[q, pooled[0]],
+        template=[("H_", 4), ("D_", 128), ("NF", _SIMD_SCORE_NF), ("SGS", _SIMD_SCORE_SGS)],
+        grid=(((blocks + span - 1) // span) * 32 * _SIMD_SCORE_SGS, padded // 8, 1),
+        threadgroup=(32 * _SIMD_SCORE_SGS, 1, 1),
+        output_shapes=[(padded, blocks)],
+        output_dtypes=[mx.float32],
+    )
+    return scores if padded == rows else scores[:rows]
+
 
 
 def _mpp_score_geometry_supported(
@@ -1272,7 +1386,12 @@ def qsa_indexer_prefill_metal(
         )
 
     use_mpp_scores = qsa_indexer_prefill_scores_mpp_supported(q, pooled)
-    score_producer: QSAPrefillScoreProducer = "mpp" if use_mpp_scores else "mlx"
+    use_simd_scores = (
+        not use_mpp_scores and qsa_indexer_prefill_scores_simd_supported(q[:, :1], pooled)
+    )
+    score_producer: QSAPrefillScoreProducer = (
+        "mpp" if use_mpp_scores else "simd" if use_simd_scores else "mlx"
+    )
     chunk_rows = qsa_indexer_prefill_score_chunk_rows(
         rows,
         heads,
@@ -1287,6 +1406,8 @@ def qsa_indexer_prefill_metal(
         q_chunk = q[:, row_start:row_stop]
         if use_mpp_scores:
             scores = qsa_indexer_prefill_scores_mpp(q_chunk, pooled)
+        elif use_simd_scores:
+            scores = qsa_indexer_prefill_scores_simd(q_chunk, pooled)
         else:
             if pooled_t is None:
                 pooled_t = mx.swapaxes(pooled.astype(mx.float32), 1, 2)[:, None]
