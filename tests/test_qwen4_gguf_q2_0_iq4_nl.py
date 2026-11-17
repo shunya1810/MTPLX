@@ -179,3 +179,56 @@ def test_route_topk_matches_softmax_topk():
         want = np.argsort(-p[t])[:10]
         assert list(idx[t]) == list(want)
         np.testing.assert_allclose(w[t], p[t][want] / p[t][want].sum(), rtol=1e-5)
+
+
+def _hc_module():
+    import types
+
+    from mtplx.models.qwen4_exp import GatedResidual
+
+    args = types.SimpleNamespace(hc_count=4, hidden_size=512, rms_norm_eps=1e-6, hc_lowrank=128)
+    m = GatedResidual(args)
+    m.input_mix_weight_down.weight = (mx.random.normal((128, 2048)) * 0.03).astype(mx.float16)
+    m.input_mix_weight_up.weight = (mx.random.normal((2048, 128)) * 0.1).astype(mx.float16)
+    m.block_inject_weight.weight = (mx.random.normal((4, 2048)) * 0.03).astype(mx.float16)
+    m.hc_norm.weight = (1 + mx.random.normal((2048,)) * 0.1).astype(mx.float16)
+    return m
+
+
+def test_hc_read_q8_takes_up_to_eight_rows_and_a_row_never_depends_on_the_others():
+    """Rows 5..8 run D1 as two row groups (threadgroup memory); each row's
+    arithmetic is the same whatever the group, so a row alone, in a 4-row call
+    and in an 8-row call are the same bytes, and all of them match the generic chain."""
+    from mtplx.kernels.hc_read_q8 import MAX_ROWS, hc_read_q8, supports
+
+    assert MAX_ROWS == 8
+    m = _hc_module()
+    for rows in (4, 5, 6, 7, 8):
+        x = mx.random.normal((1, rows, 2048)).astype(mx.float16)
+        pending = (mx.random.normal((1, rows, 512)).astype(mx.float16),
+                   mx.random.uniform(shape=(1, rows, 4)).astype(mx.float16))
+        assert supports(m, x)
+        full = [np.array(a.astype(mx.float32)) for a in hc_read_q8(m, x, pending)]
+        for i in range(rows):
+            one = hc_read_q8(m, x[:, i:i + 1], (pending[0][:, i:i + 1], pending[1][:, i:i + 1]))
+            for a, b in zip(one, full):
+                np.testing.assert_array_equal(np.array(a.astype(mx.float32))[0, 0], b[0, i])
+    x9 = mx.random.normal((1, 9, 2048)).astype(mx.float16)
+    assert not supports(m, x9)
+
+
+def test_hc_read_q8_wide_rows_match_the_generic_chain(monkeypatch):
+    from mtplx.kernels.hc_read_q8 import hc_read_q8
+
+    m = _hc_module()
+    monkeypatch.setenv("MTPLX_HC_READ_Q8", "0")
+    monkeypatch.setenv("MTPLX_HC_READ_ROWS", "0")
+    for rows in (5, 8):
+        x = mx.random.normal((1, rows, 2048)).astype(mx.float16)
+        pending = (mx.random.normal((1, rows, 512)).astype(mx.float16),
+                   mx.random.uniform(shape=(1, rows, 4)).astype(mx.float16))
+        ref = m(x, pending)
+        got = hc_read_q8(m, x, pending)
+        for a, b in zip(ref, got):
+            a = np.array(a.astype(mx.float32)); b = np.array(b.astype(mx.float32))
+            assert np.abs(a - b).max() <= 1e-2 * np.abs(a).max()

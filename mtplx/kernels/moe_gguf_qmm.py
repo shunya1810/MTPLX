@@ -46,10 +46,29 @@ NARROW_MAX_ROWS = 16384
 
 
 def _shape(pairs: int):
-    """(BM, BK) of the tiles: MTPLX_GGUF_QMM_BM (16/32/64), _BK (32/64)."""
-    bm = _env_int("MTPLX_GGUF_QMM_BM", 16 if pairs <= NARROW_MAX_ROWS else BM)
+    """(BM, BK, BMS) of the tiles: MTPLX_GGUF_QMM_BM (16/32/64), _BK (32/64).
+
+    BMS is the size of the small tile of the hybrid layout (0 = single size):
+    full 32-row tiles, and each expert's last tile as a 16-row tile when 16 or
+    fewer of its rows are left (hybrid_enabled; an explicit MTPLX_GGUF_QMM_BM
+    keeps one size, which is what the shape tests and sweeps ask for)."""
     bk = _env_int("MTPLX_GGUF_QMM_BK", BK)
-    return (bm if bm in (16, 32, 64) else BM), (bk if bk in (32, 64) else BK)
+    bk = bk if bk in (32, 64) else BK
+    if hybrid_enabled() and not (os.environ.get("MTPLX_GGUF_QMM_BM") or "").strip():
+        return BM, bk, HYBRID_SMALL
+    bm = _env_int("MTPLX_GGUF_QMM_BM", 16 if pairs <= NARROW_MAX_ROWS else BM)
+    return (bm if bm in (16, 32, 64) else BM), bk, 0
+
+
+HYBRID_SMALL = 16
+
+
+def hybrid_enabled() -> bool:
+    """MTPLX_GGUF_QMM_HYBRID (default on): 32-row expert tiles with a 16-row
+    tile for each expert's remainder of 16 rows or fewer, in one dispatch."""
+    raw = (os.environ.get("MTPLX_GGUF_QMM_HYBRID") or "").strip().lower()
+    return raw not in {"0", "off", "false", "no"}
+
 
 _LOADER = r"""
 // [BROWS output rows, BCOLS K] weight tile decoded from GGUF blocks into the
@@ -203,8 +222,10 @@ _SRC_GU = r"""
         if (tile_start[mid] <= tile) lo = mid; else hi = mid - 1;
     }
     const int expert = lo;
-    const int row0 = row_start[expert] + (tile - tile_start[expert]) * BM;
-    const int tile_rows = min(BM, row_start[expert + 1] - row0);
+    const int local = tile - tile_start[expert];
+    const int rem_rows = row_start[expert + 1] - row_start[expert] - local * BM;   // rows from this tile on
+    const int row0 = row_start[expert] + local * BM;
+    const int tile_rows = min(BM, rem_rows);
     const int col = int(threadgroup_position_in_grid.x) * BN;
     constexpr int NB = KD / gq_qk(TY);
     const bool is_up = col >= ND;
@@ -212,9 +233,16 @@ _SRC_GU = r"""
     const size_t wrow = size_t(expert) * ND + r0;
     const device half* wd = (is_up ? ud : gd) + wrow * NB;
     const device uint* wq = (is_up ? uq : gq_) + wrow * NB * gq_w(TY);
-    mtplx_qmm_t_gguf<T, TY, BM, BK, BN, HALF8>(
-        wd, wq, NB, tgrid, tgrid8, x + size_t(row0) * KD, y + size_t(row0) * (2 * ND) + col, Xs, Ws,
-        KD, 2 * ND, tile_rows, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+    if (BMS > 0 && rem_rows <= BMS) {
+        // an expert's last tile with BMS rows or fewer left: the small tile (same dot products, same order)
+        mtplx_qmm_t_gguf<T, TY, (BMS > 0 ? BMS : BM), BK, BN, HALF8>(
+            wd, wq, NB, tgrid, tgrid8, x + size_t(row0) * KD, y + size_t(row0) * (2 * ND) + col, Xs, Ws,
+            KD, 2 * ND, tile_rows, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+    } else {
+        mtplx_qmm_t_gguf<T, TY, BM, BK, BN, HALF8>(
+            wd, wq, NB, tgrid, tgrid8, x + size_t(row0) * KD, y + size_t(row0) * (2 * ND) + col, Xs, Ws,
+            KD, 2 * ND, tile_rows, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+    }
 """
 
 _SRC_DOWN = r"""
@@ -230,15 +258,24 @@ _SRC_DOWN = r"""
         if (tile_start[mid] <= tile) lo = mid; else hi = mid - 1;
     }
     const int expert = lo;
-    const int row0 = row_start[expert] + (tile - tile_start[expert]) * BM;
-    const int tile_rows = min(BM, row_start[expert + 1] - row0);
+    const int local = tile - tile_start[expert];
+    const int rem_rows = row_start[expert + 1] - row_start[expert] - local * BM;
+    const int row0 = row_start[expert] + local * BM;
+    const int tile_rows = min(BM, rem_rows);
     const int col = int(threadgroup_position_in_grid.x) * BN;
     constexpr int NB = KD / gq_qk(TY);
     const size_t wrow = size_t(expert) * ND + col;
-    mtplx_qmm_t_gguf<T, TY, BM, BK, BN, 0>(
-        dd + wrow * NB, dq + wrow * NB * gq_w(TY), NB, tgrid, tgrid8, x + size_t(row0) * KD,
-        y + size_t(row0) * ND + col, Xs, Ws, KD, ND, tile_rows,
-        simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+    if (BMS > 0 && rem_rows <= BMS) {
+        mtplx_qmm_t_gguf<T, TY, (BMS > 0 ? BMS : BM), BK, BN, 0>(
+            dd + wrow * NB, dq + wrow * NB * gq_w(TY), NB, tgrid, tgrid8, x + size_t(row0) * KD,
+            y + size_t(row0) * ND + col, Xs, Ws, KD, ND, tile_rows,
+            simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+    } else {
+        mtplx_qmm_t_gguf<T, TY, BM, BK, BN, 0>(
+            dd + wrow * NB, dq + wrow * NB * gq_w(TY), NB, tgrid, tgrid8, x + size_t(row0) * KD,
+            y + size_t(row0) * ND + col, Xs, Ws, KD, ND, tile_rows,
+            simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+    }
 """
 
 
@@ -400,7 +437,7 @@ def prefill_sorted(x2, sw, idx):
     flat = idx.reshape(-1).astype(mx.int32)
     order = mx.argsort(flat).astype(mx.uint32)
     counts = mx.zeros((n_exp,), dtype=mx.int32).at[flat].add(1)
-    bm, bk = _shape(pairs)
+    bm, bk, bms = _shape(pairs)
     tile_start, row_start = _tables(counts, n_exp, bm)
     xs = mx.take(x2, order // topk, axis=0)
     ty_g = K.TYPE_CODES[sw.gate_type]
@@ -413,7 +450,7 @@ def prefill_sorted(x2, sw, idx):
     (gu,) = gu_k(
         inputs=[xs, sw.gate_d, sw.gate_q, sw.up_d, sw.up_q, gridb, tile_start, row_start],
         template=[("T", x2.dtype), ("TY", ty_g), ("HALF8", int(bool(half8))), ("KD", kd), ("ND", ni), ("ED", n_exp),
-                  ("BM", bm), ("BN", BN), ("BK", bk)],
+                  ("BM", bm), ("BMS", bms), ("BN", BN), ("BK", bk)],
         grid=((2 * ni // BN) * THREADS, n_tiles, 1),
         threadgroup=(THREADS, 1, 1),
         output_shapes=[(pairs, 2 * ni)],
@@ -428,7 +465,7 @@ def prefill_sorted(x2, sw, idx):
     (y,) = dn_k(
         inputs=[h, sw.down_d, sw.down_q, tile_start, row_start],
         template=[("T", x2.dtype), ("TY", ty_d), ("KD", ni), ("ND", dm), ("ED", n_exp),
-                  ("BM", bm), ("BN", BN), ("BK", bk)],
+                  ("BM", bm), ("BMS", bms), ("BN", BN), ("BK", bk)],
         grid=((dm // BN) * THREADS, n_tiles, 1),
         threadgroup=(THREADS, 1, 1),
         output_shapes=[(pairs, dm)],

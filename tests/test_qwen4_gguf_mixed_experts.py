@@ -255,3 +255,57 @@ def test_epilogue_switches_default_on(monkeypatch):
     monkeypatch.setenv("MTPLX_GGUF_QMM_FUSED_EPILOGUE", "0")
     monkeypatch.setenv("MTPLX_GGUF_QMM_FUSED_MID", "0")
     assert not G.fused_epilogue_enabled() and not G.fused_mid_enabled()
+
+
+@pytest.mark.parametrize("counts", [
+    [32, 48, 49, 1, 0, 16],      # exact tile, 32 + 16, 32 + 17, a single row, an empty expert, exactly 16
+    [15, 16, 17, 31, 32, 33],    # either side of the small-tile limit and of one full tile
+    [64, 65, 80, 81, 0, 2],
+])
+def test_hybrid_tiles_match_the_single_size_tiles_bit_for_bit(tmp_path, monkeypatch, counts):
+    """moe_gguf_qmm's hybrid layout (32-row tiles, each expert's last tile as a
+    16-row tile when 16 rows or fewer are left, one dispatch) computes the same
+    dot products in the same order as the single-size layouts: identical bytes."""
+    from mtplx.kernels import moe_gguf_qmm as G
+
+    if not G.available(mx.float16):
+        pytest.skip("MLX kernel headers unavailable")
+    rng = np.random.default_rng(31)
+    sw, _refs = _module(tmp_path, rng, "Q2_0", "Q2_0")
+    picks = np.concatenate([np.full(c, e, dtype=np.uint32) for e, c in enumerate(counts)])
+    rng.shuffle(picks)
+    topk = 2
+    assert picks.size % topk == 0
+    rows = picks.size // topk
+    x = mx.array(rng.normal(0, 0.5, size=(rows, 512)).astype(np.float32)).astype(mx.float16)
+    idx = mx.array(picks)
+
+    def run(env):
+        for key in ("MTPLX_GGUF_QMM_BM", "MTPLX_GGUF_QMM_HYBRID"):
+            monkeypatch.delenv(key, raising=False)
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        y, order = G.prefill_sorted(x, sw, idx)
+        mx.eval(y, order)
+        return np.array(y.astype(mx.float32)), np.array(order)
+
+    hybrid = run({})
+    assert G._shape(picks.size)[2] == G.HYBRID_SMALL
+    for single in ({"MTPLX_GGUF_QMM_BM": "32"}, {"MTPLX_GGUF_QMM_BM": "16"}, {"MTPLX_GGUF_QMM_HYBRID": "0"}):
+        other = run(single)
+        assert np.array_equal(hybrid[1], other[1])
+        assert np.array_equal(hybrid[0], other[0]), single
+
+
+def test_hybrid_switch_and_explicit_tile_size(monkeypatch):
+    from mtplx.kernels import moe_gguf_qmm as G
+
+    for key in ("MTPLX_GGUF_QMM_BM", "MTPLX_GGUF_QMM_HYBRID", "MTPLX_GGUF_QMM_BK"):
+        monkeypatch.delenv(key, raising=False)
+    assert G.hybrid_enabled() and G._shape(10_000) == (32, 32, 16) and G._shape(60_000) == (32, 32, 16)
+    monkeypatch.setenv("MTPLX_GGUF_QMM_HYBRID", "0")
+    assert not G.hybrid_enabled()
+    assert G._shape(10_000) == (16, 32, 0) and G._shape(60_000) == (32, 32, 0)   # the shipped single sizes
+    monkeypatch.setenv("MTPLX_GGUF_QMM_HYBRID", "1")
+    monkeypatch.setenv("MTPLX_GGUF_QMM_BM", "64")
+    assert G._shape(10_000) == (64, 32, 0)   # an explicit tile size is one size

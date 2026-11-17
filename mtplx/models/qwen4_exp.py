@@ -3271,6 +3271,17 @@ _PREFILL_MIDLOOP_DEFAULT_LAYERS = 4
 _DECODE_MIDLOOP_DEFAULT_LAYERS = 2
 
 
+def _decode_compile_max_rows() -> int:
+    """Widest forward the compiled GDN decode runs take
+    (``MTPLX_QWEN4_DECODE_COMPILE_MAX_ROWS``, default 8; 4 was the MTP depth
+    ceiling's width)."""
+
+    try:
+        return max(1, int(os.environ.get("MTPLX_QWEN4_DECODE_COMPILE_MAX_ROWS") or 8))
+    except ValueError:
+        return 8
+
+
 def _decode_midloop_eval_layers() -> int:
     """Layers between mid-forward async evals of a decode/verify step
     (``MTPLX_QWEN4_DECODE_MIDLOOP_EVAL``; ``0`` restores one eval at the end)."""
@@ -7052,12 +7063,13 @@ class Qwen4ExpTextModel(nn.Module):
             ple.ple_embedding.stage(inputs, cache[self._ple_stage_idx], ple.NGRAM_IDX)
         h = mx.tile(h, (1, 1, self.args.hc_count))
         if (
-            # S<=4 covers AR decode (S=1) and MTP verify widths (S=2..4,
-            # depth ceiling 3): mx.compile keys its trace cache on input
-            # shapes, so each S gets one retrace then C++ replay, and the
-            # GDN states are S-invariant so the same run fns serve all
-            # widths. Prefill and masked/padded forwards stay eager.
-            1 <= h.shape[1] <= 4
+            # S<=8 covers AR decode (S=1) and verify widths (S=2..8; MTP's
+            # depth ceiling is 3, a longer block draft verifies more rows):
+            # mx.compile keys its trace cache on input shapes, so each S gets
+            # one retrace then C++ replay, and the GDN states are S-invariant
+            # so the same run fns serve all widths. Prefill and masked/padded
+            # forwards stay eager.
+            1 <= h.shape[1] <= _decode_compile_max_rows()
             and ssm_mask is None
             and not self._gdn_compile_explicit_off
             and self._gdn_compiled_env

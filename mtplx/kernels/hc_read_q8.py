@@ -1,4 +1,4 @@
-"""Hyper-connection (GatedResidual) read for 1..4 decode/verify rows in two
+"""Hyper-connection (GatedResidual) read for 1..8 decode/verify rows in two
 dispatches over a kernel-private 8-bit pack of the mixer weights.
 
 mtplx/kernels/hc_read_rows.py reads the fp16 mixes in four dependent
@@ -32,7 +32,7 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-MAX_ROWS = 4
+MAX_ROWS = 8
 _NSG = 8          # simdgroups per threadgroup
 _NR = int(os.environ.get("MTPLX_HC_Q8_NR", "4"))   # D1 output rows per simdgroup
 _ND = int(os.environ.get("MTPLX_HC_Q8_ND", "4"))   # D2 hidden positions per simdgroup
@@ -41,18 +41,18 @@ _ND = int(os.environ.get("MTPLX_HC_Q8_ND", "4"))   # D2 hidden positions per sim
 _KS = int(os.environ.get("MTPLX_HC_Q8_KS", "1"))
 
 _D1_SRC = r"""
-    // Threadgroup = one stream g x NSG * NR output rows. The stream's rows
-    // (pending write applied, written out by the first row block) are staged
-    // once as x * gamma with their 16-element sums; simdgroups then dot their
-    // NR pack rows against them.
+    // Threadgroup = one stream g x NSG * NR output rows x one group of SG rows
+    // (grid z). The group's rows of the stream (pending write applied, written
+    // out by the first row block) are staged once as x * gamma with their
+    // 16-element sums; simdgroups then dot their NR pack rows against them.
     constexpr uint NOUT = R + HC;
     constexpr uint HCD = HC * D;
     constexpr uint DS = D / KS;                // columns of this split
     constexpr uint NV = DS / 16;               // 16-element vectors per split row
     constexpr uint RPT = NSG * NR;             // output rows per threadgroup
-    threadgroup T xg[S * DS];
-    threadgroup float xsum[S * NV];
-    threadgroup float ssp[S * NSG];
+    threadgroup T xg[SG * DS];
+    threadgroup float xsum[SG * NV];
+    threadgroup float ssp[SG * NSG];
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint t = thread_index_in_threadgroup;
@@ -60,17 +60,20 @@ _D1_SRC = r"""
     const uint g = gk / KS;
     const uint ks = gk % KS;
     const uint blk = threadgroup_position_in_grid.x;
+    const uint rbase = threadgroup_position_in_grid.z * (uint)SG;      // first row of this group
+    const uint srows = min((uint)SG, (uint)S - rbase);                 // rows in this group
 
-    float ss[S];
-    for (int s = 0; s < S; ++s) ss[s] = 0.0f;
-    for (uint u = t; u < (uint)(S * NV); u += NSG * 32) {
+    float ss[SG];
+    for (int s = 0; s < SG; ++s) ss[s] = 0.0f;
+    for (uint u = t; u < srows * NV; u += NSG * 32) {
         const uint s = u / NV;
+        const uint grow = rbase + s;                                   // row of the call
         const uint e0 = ks * DS + (u % NV) * 16;
         const uint col = g * D + e0;
-        const device vec<T, 4>* xv4 = (const device vec<T, 4>*)(x + (size_t)s * HCD + col);
+        const device vec<T, 4>* xv4 = (const device vec<T, 4>*)(x + (size_t)grow * HCD + col);
         const device vec<T, 4>* gv4 = (const device vec<T, 4>*)(gamma + col);
-        const device vec<T, 4>* bv4 = (const device vec<T, 4>*)(bo + (size_t)s * D + e0);
-        const float ij = WRITE ? (float)inj[s * HC + g] : 0.0f;
+        const device vec<T, 4>* bv4 = (const device vec<T, 4>*)(bo + (size_t)grow * D + e0);
+        const float ij = WRITE ? (float)inj[grow * HC + g] : 0.0f;
         float sum = 0.0f;
         float sq = 0.0f;
         for (int q = 0; q < 4; ++q) {
@@ -78,7 +81,7 @@ _D1_SRC = r"""
             if (WRITE) {
                 const vec<T, 4> prod = vec<T, 4>(float4(bv4[q]) * ij);
                 v = vec<T, 4>(float4(v) + float4(prod));
-                if (blk == 0) ((device vec<T, 4>*)(hyper_out + (size_t)s * HCD + col))[q] = v;
+                if (blk == 0) ((device vec<T, 4>*)(hyper_out + (size_t)grow * HCD + col))[q] = v;
             }
             const float4 f = float4(v);
             sq += dot(f, f);
@@ -87,26 +90,26 @@ _D1_SRC = r"""
             const float4 gf = float4(gv);
             sum += gf.x + gf.y + gf.z + gf.w;
         }
-        for (int s2 = 0; s2 < S; ++s2) if (s2 == (int)s) ss[s2] += sq;
+        for (int s2 = 0; s2 < SG; ++s2) if (s2 == (int)s) ss[s2] += sq;
         xsum[u] = sum;
     }
     if (blk == 0) {
-        for (int s = 0; s < S; ++s) {
+        for (int s = 0; s < SG; ++s) {
             const float a = simd_sum(ss[s]);
             if (lane == 0) ssp[s * NSG + sg] = a;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (blk == 0 && t < (uint)S) {
+    if (blk == 0 && t < srows) {
         float a = 0.0f;
         for (uint i = 0; i < (uint)NSG; ++i) a += ssp[t * NSG + i];
-        sumsq[gk * S + t] = a;
+        sumsq[gk * S + rbase + t] = a;
     }
 
     const uint row0 = blk * RPT + sg * NR;
-    float acc[NR][S];
+    float acc[NR][SG];
     for (int r = 0; r < NR; ++r)
-        for (int s = 0; s < S; ++s) acc[r][s] = 0.0f;
+        for (int s = 0; s < SG; ++s) acc[r][s] = 0.0f;
     for (uint v = lane; v < NV; v += 32) {
         const uint col = g * D + ks * DS + v * 16;
         uint4 wv[NR];
@@ -117,7 +120,8 @@ _D1_SRC = r"""
             sc[r] = (float)wsc[(size_t)n * (HCD / 64) + col / 64];
             bi[r] = (float)wbi[(size_t)n * (HCD / 64) + col / 64];
         }
-        for (int s = 0; s < S; ++s) {
+        for (int s = 0; s < SG; ++s) {
+            if ((uint)s >= srows) break;               // the last group may hold fewer rows
             // the stream's 16 staged x * gamma values, read once for all NR rows
             const threadgroup vec<T, 4>* xv4 = (const threadgroup vec<T, 4>*)(xg + s * DS + v * 16);
             const float4 x0 = float4(xv4[0]), x1 = float4(xv4[1]), x2 = float4(xv4[2]), x3 = float4(xv4[3]);
@@ -131,9 +135,9 @@ _D1_SRC = r"""
     }
     for (int r = 0; r < NR; ++r) {
         const uint n = row0 + r;
-        for (int s = 0; s < S; ++s) {
+        for (int s = 0; s < SG; ++s) {
             const float a = simd_sum(acc[r][s]);
-            if (lane == 0 && n < NOUT) partial[((size_t)gk * S + s) * NOUT + n] = a;
+            if (lane == 0 && n < NOUT && (uint)s < srows) partial[((size_t)gk * S + rbase + s) * NOUT + n] = a;
         }
     }
 """
@@ -259,7 +263,7 @@ def enabled() -> bool:
 
 
 def supports(module, hyper_input: mx.array) -> bool:
-    """The geometry the two kernels compile: rows 1..4, stream width a multiple
+    """The geometry the two kernels compile: rows 1..8, stream width a multiple
     of 512 (whole 16-byte vectors per lane), low rank a multiple of 64."""
     if "block_inject_weight" not in module:
         return False
@@ -296,6 +300,16 @@ def _pack(module):
     return pack
 
 
+def _row_groups(rows: int) -> tuple[int, int]:
+    """(rows per D1 threadgroup, groups). D1 stages its rows' x * gamma in
+    threadgroup memory (D halves + D / 16 floats of sums a row): 5 rows fit the
+    32 KB an M1 allows (29.0 KB), 6 to 8 rows run as two groups of 3 to 4 on
+    the grid's z axis. A row's arithmetic does not depend on its group, so the
+    result is bit-identical whatever the row count."""
+    groups = (rows + 4) // 5
+    return (rows + groups - 1) // groups, groups
+
+
 def hc_read_q8(module, hyper_input: mx.array, pending=None):
     """(mixed, written hyper, inject) for 1..MAX_ROWS rows; ``pending`` = (block_out, inject)."""
     lead = hyper_input.shape[:-1]
@@ -318,11 +332,12 @@ def hc_read_q8(module, hyper_input: mx.array, pending=None):
     gamma = module.hc_norm.weight
     rpt = _NSG * _NR
     ks = _KS if _KS > 0 and d % (16 * _KS) == 0 else 1
+    sg_rows, n_groups = _row_groups(rows)
     partial, sumsq, hyper_out = _d1_kernel(write)(
         inputs=[x2, gamma, bo2, inj2, wq, wsc, wbi],
-        template=[("T", dt), ("HC", hc), ("D", d), ("R", r), ("S", rows), ("NSG", _NSG),
+        template=[("T", dt), ("HC", hc), ("D", d), ("R", r), ("S", rows), ("SG", sg_rows), ("NSG", _NSG),
                   ("NR", _NR), ("WRITE", int(write)), ("KS", ks)],
-        grid=(32 * _NSG * ((n_out + rpt - 1) // rpt), hc * ks, 1),
+        grid=(32 * _NSG * ((n_out + rpt - 1) // rpt), hc * ks, n_groups),
         threadgroup=(32 * _NSG, 1, 1),
         output_shapes=[(hc * ks * rows * n_out,), (hc * ks * rows,), (rows, hcd) if write else (1,)],
         output_dtypes=[mx.float32, mx.float32, dt],
