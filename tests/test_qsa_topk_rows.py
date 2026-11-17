@@ -58,7 +58,10 @@ def test_negative_and_infinite_scores_order_correctly():
     assert _sets(got) == _sets(want)
 
 
-def test_the_switch(monkeypatch):
+def test_the_switch_is_opt_in(monkeypatch):
+    monkeypatch.delenv(T.ENV, raising=False)
+    assert not T.enabled()
+    monkeypatch.setenv(T.ENV, "1")
     assert T.enabled()
     monkeypatch.setenv(T.ENV, "0")
     assert not T.enabled()

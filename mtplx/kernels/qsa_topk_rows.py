@@ -1,5 +1,9 @@
 """Exact top-k of a few float32 rows in one threadgroup each (radix select).
 
+OPT-IN (MTPLX_QSA_TOPK_KERNEL=1), default off: 12-layer microbenchmarks win (0.8 vs
+1.3 ms), but inside a real 128K verify forward it is 1-2 ms slower than
+argpartition (fn-s8/LOG.md 17).
+
 Decode and verify select the 512 best of up to 65,536 block scores for 1-8 rows.
 ``mx.argpartition`` does that with a general sort network whose launch and
 passes cost 0.2-0.4 ms per layer at these widths; four threadgroups of 1,024
@@ -123,8 +127,8 @@ _SOURCE = r"""
 
 
 def enabled() -> bool:
-    raw = (os.environ.get(ENV) or "1").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
+    raw = (os.environ.get(ENV) or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 @lru_cache(maxsize=None)

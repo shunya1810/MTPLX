@@ -1,5 +1,9 @@
 """Masked block scores of 1-8 query rows in one dispatch over the float16 pooled keys.
 
+OPT-IN (MTPLX_QSA_DECODE_SCORES=1), default off: in a real 128K verify forward it is
+neutral (53.9 vs 53.7 ms; with the radix top-k 55.0 ms) - the eager score chain is
+not where the long-context verify time goes (fn-s8/LOG.md 17).
+
 The eager selector of a verify forward is a chain of separate MLX kernels:
 the float32 GEMM against the fp32 mirror of the pooled keys, relu, head sum,
 division, causal mask and the index tie-break.  For one to eight rows each of
@@ -124,8 +128,8 @@ _SOURCE = r"""
 
 
 def enabled() -> bool:
-    raw = (os.environ.get(ENV) or "1").strip().lower()
-    return raw not in {"0", "false", "no", "off"}
+    raw = (os.environ.get(ENV) or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def supported(q: mx.array, pooled: mx.array, heads: int, head_dim: int) -> bool:

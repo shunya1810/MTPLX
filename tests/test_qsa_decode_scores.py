@@ -60,8 +60,11 @@ def test_the_selected_sets_agree():
 
 
 def test_signatures_outside_the_kernel_are_refused(monkeypatch):
+    monkeypatch.delenv(D.ENV, raising=False)
     q = mx.zeros((1, 4, 4, 128), dtype=mx.float16)
     pooled = mx.zeros((1, 64, 128), dtype=mx.float16)
+    assert not D.supported(q, pooled, 4, 128)  # opt-in
+    monkeypatch.setenv(D.ENV, "1")
     assert D.supported(q, pooled, 4, 128)
     assert not D.supported(q.astype(mx.float32), pooled, 4, 128)
     assert D.supported(q, pooled[:, :60], 4, 128)
