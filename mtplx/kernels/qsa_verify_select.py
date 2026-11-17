@@ -130,7 +130,8 @@ _MASK_SOURCE = r"""
     const uint s = threadgroup_position_in_grid.y;
     const uint tid = thread_position_in_threadgroup.x;
     const uint lanes = threads_per_threadgroup.x;
-    const uint nb = part_shape[1];
+    const uint pstride = part_shape[1];
+    const uint nb = NBT > 0u ? NBT : pstride;
     const uint k = nb < TOPK ? nb : TOPK;
     const uint words = (nb + 31) / 32;
     for (uint w = tid; w < words; w += lanes) {
@@ -139,7 +140,7 @@ _MASK_SOURCE = r"""
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const int qpos = pos[0] + int(s);
     const int visible = (qpos + 1) / RATIO;
-    const device uint32_t* top = part + size_t(s) * nb + (nb - k);
+    const device uint32_t* top = part + size_t(s) * pstride + (pstride - k);
     for (uint j = tid; j < k; j += lanes) {
         uint block = top[j];
         if (int(block) < visible) {
@@ -174,7 +175,8 @@ _MASK_CHUNKED_SOURCE = r"""
     const uint first_block = first_token / RATIO;
     const uint tid = thread_position_in_threadgroup.x;
     const uint lanes = threads_per_threadgroup.x;
-    const uint nb = part_shape[1];
+    const uint pstride = part_shape[1];
+    const uint nb = NBT > 0u ? NBT : pstride;
     const uint k = nb < TOPK ? nb : TOPK;
     for (uint w = tid; w < CHUNK / RATIO / 32; w += lanes) {
         atomic_store_explicit(&chosen[w], 0u, memory_order_relaxed);
@@ -182,7 +184,7 @@ _MASK_CHUNKED_SOURCE = r"""
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const int qpos = pos[0] + int(s);
     const int visible = (qpos + 1) / RATIO;
-    const device uint32_t* top = part + size_t(s) * nb + (nb - k);
+    const device uint32_t* top = part + size_t(s) * pstride + (pstride - k);
     for (uint j = tid; j < k; j += lanes) {
         uint block = top[j];
         if (block >= first_block && block < first_block + CHUNK / RATIO && int(block) < visible) {
@@ -210,7 +212,8 @@ _TOKENS_SOURCE = r"""
     // token_idx: [S, K * RATIO + RATIO] int32, token_ok: same shape, bool.
     const uint c = thread_position_in_grid.x;
     const uint s = thread_position_in_grid.y;
-    const uint nb = part_shape[1];
+    const uint pstride = part_shape[1];
+    const uint nb = NBT > 0u ? NBT : pstride;
     const uint k = nb < TOPK ? nb : TOPK;
     const uint width = k * RATIO + RATIO;
     if (c >= width) {
@@ -221,7 +224,7 @@ _TOKENS_SOURCE = r"""
     int token;
     bool ok;
     if (c < k * RATIO) {
-        int block = int(part[size_t(s) * nb + (nb - k) + c / RATIO]);
+        int block = int(part[size_t(s) * pstride + (pstride - k) + c / RATIO]);
         ok = block < visible;
         token = block * RATIO + int(c % RATIO);
     } else {
@@ -233,11 +236,12 @@ _TOKENS_SOURCE = r"""
 """
 
 
-def _header(heads: int, ratio: int, topk: int, divide: int, fma_tie: bool) -> str:
+def _header(heads: int, ratio: int, topk: int, divide: int, fma_tie: bool, nbt: int = 0) -> str:
     return (
         f"#define HEADS {int(heads)}u\n"
         f"#define RATIO {int(ratio)}\n"
         f"#define TOPK {int(topk)}u\n"
+        f"#define NBT {int(nbt)}u\n"
         f"#define MASK_WORDS {_MASK_WORDS}\n"
         "#define TIE 1e-12f\n"
         f"#define QSA_DIVIDE {int(divide)}\n"
@@ -258,36 +262,36 @@ def _scores_kernel(heads: int, ratio: int, topk: int, divide: int, fma_tie: bool
 
 
 @lru_cache(maxsize=None)
-def _mask_kernel(ratio: int, topk: int):
+def _mask_kernel(ratio: int, topk: int, nbt: int = 0):
     return mx.fast.metal_kernel(
-        name=f"mtplx_qsa_verify_mask_r{ratio}_k{topk}",
+        name=f"mtplx_qsa_verify_mask_r{ratio}_k{topk}_n{nbt}",
         input_names=["part", "pos"],
         output_names=["mask"],
-        header=_header(1, ratio, topk, 0, False),
+        header=_header(1, ratio, topk, 0, False, nbt),
         source=_MASK_SOURCE,
         ensure_row_contiguous=True,
     )
 
 
 @lru_cache(maxsize=None)
-def _mask_chunked_kernel(ratio: int, topk: int):
+def _mask_chunked_kernel(ratio: int, topk: int, nbt: int = 0):
     return mx.fast.metal_kernel(
-        name=f"mtplx_qsa_verify_mask_chunked_r{ratio}_k{topk}",
+        name=f"mtplx_qsa_verify_mask_chunked_r{ratio}_k{topk}_n{nbt}",
         input_names=["part", "pos"],
         output_names=["mask"],
-        header=_header(1, ratio, topk, 0, False) + f"#define CHUNK {_MASK_CHUNK}u\n",
+        header=_header(1, ratio, topk, 0, False, nbt) + f"#define CHUNK {_MASK_CHUNK}u\n",
         source=_MASK_CHUNKED_SOURCE,
         ensure_row_contiguous=True,
     )
 
 
 @lru_cache(maxsize=None)
-def _tokens_kernel(ratio: int, topk: int):
+def _tokens_kernel(ratio: int, topk: int, nbt: int = 0):
     return mx.fast.metal_kernel(
-        name=f"mtplx_qsa_verify_tokens_r{ratio}_k{topk}",
+        name=f"mtplx_qsa_verify_tokens_r{ratio}_k{topk}_n{nbt}",
         input_names=["part", "pos"],
         output_names=["token_idx", "token_ok"],
-        header=_header(1, ratio, topk, 0, False),
+        header=_header(1, ratio, topk, 0, False, nbt),
         source=_TOKENS_SOURCE,
         ensure_row_contiguous=True,
     )
@@ -332,11 +336,22 @@ def block_scores(
     return out
 
 
-def dense_mask(part: mx.array, pos_start: Any, *, ratio: int, topk: int) -> mx.array:
+def _part_geometry(part: mx.array, blocks: Optional[int]) -> tuple[int, int, int]:
+    """(rows, blocks, nbt): ``blocks`` is given only when ``part`` holds just the
+    selected indices (``[rows, k]``, from ``qsa_topk_rows``) instead of an
+    argpartition of the whole row."""
+
+    rows, width = (int(d) for d in part.shape)
+    if blocks is None or int(blocks) == width:
+        return rows, width, 0
+    return rows, int(blocks), int(blocks)
+
+
+def dense_mask(part: mx.array, pos_start: Any, *, ratio: int, topk: int, blocks: Optional[int] = None) -> mx.array:
     """The ``[1, 1, S, blocks * ratio]`` selection mask from argpartition's output."""
 
-    rows, blocks = (int(d) for d in part.shape)
-    (mask,) = _mask_kernel(int(ratio), int(topk))(
+    rows, blocks, nbt = _part_geometry(part, blocks)
+    (mask,) = _mask_kernel(int(ratio), int(topk), nbt)(
         inputs=[part, _as_scalar_position(pos_start)],
         grid=(_THREADS, rows, 1),
         threadgroup=(_THREADS, 1, 1),
@@ -346,12 +361,12 @@ def dense_mask(part: mx.array, pos_start: Any, *, ratio: int, topk: int) -> mx.a
     return mask
 
 
-def dense_mask_chunked(part: mx.array, pos_start: Any, *, ratio: int, topk: int) -> mx.array:
+def dense_mask_chunked(part: mx.array, pos_start: Any, *, ratio: int, topk: int, blocks: Optional[int] = None) -> mx.array:
     """``dense_mask`` with one threadgroup per 1,024 tokens of a row."""
 
-    rows, blocks = (int(d) for d in part.shape)
+    rows, blocks, nbt = _part_geometry(part, blocks)
     width = blocks * int(ratio)
-    (mask,) = _mask_chunked_kernel(int(ratio), int(topk))(
+    (mask,) = _mask_chunked_kernel(int(ratio), int(topk), nbt)(
         inputs=[part, _as_scalar_position(pos_start)],
         grid=(((width + _MASK_CHUNK - 1) // _MASK_CHUNK) * _THREADS, rows, 1),
         threadgroup=(_THREADS, 1, 1),
@@ -361,13 +376,13 @@ def dense_mask_chunked(part: mx.array, pos_start: Any, *, ratio: int, topk: int)
     return mask
 
 
-def token_lists(part: mx.array, pos_start: Any, *, ratio: int, topk: int) -> tuple[mx.array, mx.array]:
+def token_lists(part: mx.array, pos_start: Any, *, ratio: int, topk: int, blocks: Optional[int] = None) -> tuple[mx.array, mx.array]:
     """Per-row token ids and validity (the rows-gather lane) from argpartition's output."""
 
-    rows, blocks = (int(d) for d in part.shape)
+    rows, blocks, nbt = _part_geometry(part, blocks)
     k = min(int(topk), blocks)
     width = k * int(ratio) + int(ratio)
-    token_idx, token_ok = _tokens_kernel(int(ratio), int(topk))(
+    token_idx, token_ok = _tokens_kernel(int(ratio), int(topk), nbt)(
         inputs=[part, _as_scalar_position(pos_start)],
         grid=(width, rows, 1),
         threadgroup=(min(_THREADS, width), 1, 1),
@@ -375,6 +390,12 @@ def token_lists(part: mx.array, pos_start: Any, *, ratio: int, topk: int) -> tup
         output_dtypes=[mx.int32, mx.bool_],
     )
     return token_idx, token_ok
+
+
+def _topk_rows_enabled() -> bool:
+    from mtplx.kernels import qsa_topk_rows
+
+    return qsa_topk_rows.enabled()
 
 
 def mask_fits(blocks: int) -> bool:
@@ -499,6 +520,23 @@ def _probe_case(indexer: Any, rows: int, blocks: int, position: int, rows_gather
         _STATE["installed"] = False
     if len(stock) != len(fused):
         return "the fused selection returned a different lane"
+    if rows_gather and len(stock) == 2 and _topk_rows_enabled():
+        # The radix top-k lists a row's blocks in a different order than
+        # argpartition; the rows-gather attention reads them as a set.
+        per_block = int(indexer.ratio)
+        listed = min(int(indexer.block_topk), blocks) * per_block
+
+        def canon(idx, ok):
+            idx, ok = np.array(idx), np.array(ok)
+            key = np.where(ok, idx, -1).astype(np.int64)
+            head = np.sort(key[:, :listed], axis=1)
+            return np.concatenate([head, key[:, listed:]], axis=1)
+
+        if stock[0].shape != fused[0].shape or stock[1].shape != fused[1].shape:
+            return "token list shapes differ"
+        if not np.array_equal(canon(stock[0], stock[1]), canon(fused[0], fused[1])):
+            return f"token lists differ as sets at {rows} rows, {blocks} blocks, position {position}"
+        return None
     for want, got in zip(stock, fused):
         if want.shape != got.shape or want.dtype != got.dtype:
             return f"shape or dtype differs: {want.shape} {want.dtype} vs {got.shape} {got.dtype}"

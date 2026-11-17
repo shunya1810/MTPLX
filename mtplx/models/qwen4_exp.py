@@ -4136,16 +4136,27 @@ class QSAIndexer(nn.Module):
             ratio=self.ratio,
             topk=self.block_topk,
         )
-        part = mx.argpartition(masked, kth=nb_total - k_eff, axis=-1)
+        from mtplx.kernels import qsa_topk_rows
+
+        part_blocks = None
+        if (
+            qsa_topk_rows.enabled()
+            and k_eff == min(self.block_topk, nb_total)
+            and int(masked.shape[1]) == nb_total
+        ):
+            part = qsa_topk_rows.topk_rows(masked, k_eff)
+            part_blocks = nb_total
+        else:
+            part = mx.argpartition(masked, kth=nb_total - k_eff, axis=-1)
         if rows_gather:
             qsa_verify_select.note_engaged(S, "rows-gather")
             token_idx, token_ok = qsa_verify_select.token_lists(
-                part, pos_start, ratio=self.ratio, topk=self.block_topk
+                part, pos_start, ratio=self.ratio, topk=self.block_topk, blocks=part_blocks
             )
             return ("gather_rows", token_idx, token_ok)
         qsa_verify_select.note_engaged(S, "dense")
         return qsa_verify_select.dense_mask(
-            part, pos_start, ratio=self.ratio, topk=self.block_topk
+            part, pos_start, ratio=self.ratio, topk=self.block_topk, blocks=part_blocks
         )
 
     def _select_eager(

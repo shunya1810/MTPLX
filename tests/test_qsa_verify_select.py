@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 
 from mtplx.compile_state import compiled_step_body
+from mtplx.kernels import qsa_topk_rows as topk_kernel
 from mtplx.kernels import qsa_verify_select as sel
 from mtplx.models.qwen4_exp import QSAIndexer, TextArgs
 
@@ -171,6 +172,22 @@ def _assert_same(want, got):
         assert np.array_equal(np.array(a), np.array(b))
 
 
+def _assert_same_sets(want, got, blocks):
+    """The rows-gather lists of the radix top-k hold the blocks of each row in
+    index order, argpartition's in its own; the attention reads them as a set."""
+    assert len(want) == len(got) == 3 and want[0] == got[0] == "gather_rows" or len(want) == len(got) == 2
+    idx_w, ok_w = (np.array(a) for a in want[-2:])
+    idx_g, ok_g = (np.array(a) for a in got[-2:])
+    assert idx_w.shape == idx_g.shape and ok_w.shape == ok_g.shape
+    listed = min(TOPK, blocks) * RATIO
+
+    def canon(idx, ok):
+        key = np.where(ok, idx, -1).astype(np.int64)
+        return np.concatenate([np.sort(key[:, :listed], axis=1), key[:, listed:]], axis=1)
+
+    assert np.array_equal(canon(idx_w, ok_w), canon(idx_g, ok_g))
+
+
 def _primitives(indexer, rows_gather, q, pooled, raw, pos, *, compiled: bool) -> collections.Counter:
     run = _runner(indexer, rows_gather)
     if compiled:
@@ -203,7 +220,10 @@ def test_every_width_matches_the_compiled_stock_selector(
     pos = mx.array(position, dtype=mx.int32)
     want = _stock(indexer, rows_gather, q, pooled, raw, pos, monkeypatch)
     got = _compiled(indexer, rows_gather, q, pooled, raw, pos)
-    _assert_same(want, got)
+    if rows_gather and rows > 1 and topk_kernel.enabled():
+        _assert_same_sets(want, got, blocks)
+    else:
+        _assert_same(want, got)
     engaged = sel.engagement()["engaged"]
     lane = "rows-gather" if rows_gather and rows > 1 else "dense"
     assert (rows, lane) in engaged
@@ -212,6 +232,21 @@ def test_every_width_matches_the_compiled_stock_selector(
 def test_inside_a_compiled_body_the_selection_is_two_kernels_around_the_gemm_and_argpartition(
     indexer, installed
 ):
+    q, pooled, raw = _inputs(1088, 4, seed=3)
+    pos = mx.array(4000, dtype=mx.int32)
+    for rows_gather in (False, True):
+        fused = _primitives(indexer, rows_gather, q, pooled, raw, pos, compiled=True)
+        if topk_kernel.enabled():
+            # the radix top-k replaces argpartition: three kernels around the GEMM
+            assert fused == collections.Counter({"AsType": 2, "Matmul": 1, "CustomKernel": 3}), fused
+        else:
+            assert fused == collections.Counter(
+                {"AsType": 2, "Matmul": 1, "ArgPartition": 1, "CustomKernel": 2}
+            ), fused
+
+
+def test_with_the_radix_switch_off_the_selection_keeps_argpartition(indexer, installed, monkeypatch):
+    monkeypatch.setenv(topk_kernel.ENV, "0")
     q, pooled, raw = _inputs(1088, 4, seed=3)
     pos = mx.array(4000, dtype=mx.int32)
     for rows_gather in (False, True):
@@ -286,8 +321,8 @@ def test_the_scores_take_the_compiled_spelling(indexer, installed):
 def test_the_probe_turns_the_selection_off_on_any_difference(indexer, monkeypatch, capsys):
     real = sel.dense_mask
 
-    def one_bit_off(part, pos_start, *, ratio, topk):
-        mask = real(part, pos_start, ratio=ratio, topk=topk)
+    def one_bit_off(part, pos_start, *, ratio, topk, **kwargs):
+        mask = real(part, pos_start, ratio=ratio, topk=topk, **kwargs)
         flat = mask.reshape(-1)
         return mx.concatenate([mx.logical_not(flat[:1]), flat[1:]]).reshape(mask.shape)
 
