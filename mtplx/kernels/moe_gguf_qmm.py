@@ -283,6 +283,100 @@ def prefill_parts(x2, sw, idx):
     return mx.take(y, mx.argsort(order), axis=0)
 
 
+def _flag(name: str, default: bool = True) -> bool:
+    raw = (os.environ.get(name) or "").strip().lower()
+    if raw in {"0", "off", "false", "no"}:
+        return False
+    if raw in {"1", "on", "true", "yes"}:
+        return True
+    return default
+
+
+def fused_epilogue_enabled() -> bool:
+    """MTPLX_GGUF_QMM_FUSED_EPILOGUE (default on): the un-sort and the routing
+    weighted sum after the expert kernels are one pass."""
+    return _flag("MTPLX_GGUF_QMM_FUSED_EPILOGUE")
+
+
+def fused_mid_enabled() -> bool:
+    """MTPLX_GGUF_QMM_FUSED_MID (default on): silu(gate) * up between the two
+    expert kernels is one pass over the [P, 2N] gate/up output."""
+    return _flag("MTPLX_GGUF_QMM_FUSED_MID")
+
+
+# out[t, d] = sum_s w[t, s] * y_sorted[inv[t * TOPK + s], d]: the token-major
+# gather of the sorted expert outputs and the weighted sum over a token's
+# TOPK picks, accumulated in float32 in slot order (mx.take, a float32 [P, D]
+# product and a sum over the slot axis, as _gguf_mixed_call wrote it before).
+_UNSORT_SRC = r"""
+    const uint d = thread_position_in_grid.x;
+    const uint t = thread_position_in_grid.y;
+    if (d >= (uint)D) return;
+    float acc = 0.0f;
+    for (uint s = 0; s < (uint)TOPK; ++s) {
+        const uint p = t * (uint)TOPK + s;
+        acc += w[p] * (float)y[(ulong)inv[p] * (ulong)D + d];
+    }
+    out[(ulong)t * (ulong)D + d] = (T)acc;
+"""
+
+# h[p, j] = silu(gate) * up from the fused gate/up output [P, 2N], with the
+# roundings of the expression it replaces, (g * sigmoid(float32(g)).astype(T)) * u:
+# MLX's sigmoid form, the sigmoid rounded to T, then each product rounded to T.
+_MID_SRC = r"""
+    const uint j = thread_position_in_grid.x;
+    const uint p = thread_position_in_grid.y;
+    if (j >= (uint)NI) return;
+    const ulong base = (ulong)p * (ulong)(2 * NI);
+    const T g = gu[base + j];
+    const float gf = (float)g;
+    const float e = 1.0f / (1.0f + metal::exp(metal::abs(gf)));
+    const float sig = (gf < 0.0f) ? e : 1.0f - e;
+    const T gs = (T)((float)g * (float)((T)sig));
+    h[(ulong)p * (ulong)NI + j] = (T)((float)gs * (float)gu[base + (ulong)NI + j]);
+"""
+
+
+@lru_cache(maxsize=1)
+def _epilogue_kernels():
+    unsort = mx.fast.metal_kernel(
+        name="mtplx_gguf_qmm_unsort_wsum", input_names=["y", "inv", "w"], output_names=["out"],
+        source=_UNSORT_SRC, ensure_row_contiguous=True)
+    mid = mx.fast.metal_kernel(
+        name="mtplx_gguf_qmm_silu_up", input_names=["gu"], output_names=["h"],
+        source=_MID_SRC, ensure_row_contiguous=True)
+    return unsort, mid
+
+
+def silu_up(gu, ni: int):
+    """silu(gu[:, :ni]) * gu[:, ni:] over [P, 2 * ni] in one pass (fp16/bf16/fp32)."""
+    _unsort, mid = _epilogue_kernels()
+    pairs = int(gu.shape[0])
+    (h,) = mid(
+        inputs=[gu], template=[("T", gu.dtype), ("NI", int(ni))],
+        grid=(((int(ni) + 127) // 128) * 128, pairs, 1), threadgroup=(128, 1, 1),
+        output_shapes=[(pairs, int(ni))], output_dtypes=[gu.dtype])
+    return h
+
+
+def prefill_weighted(x2, sw, idx, w):
+    """[M, D] routed output: the expert kernels, then the un-sort and the
+    routing-weighted sum over each token's picks in one pass. ``w`` is the
+    float32 routing weight per pair (token-major, [M * topk])."""
+    y, order = prefill_sorted(x2, sw, idx)
+    rows = int(x2.shape[0])
+    topk = int(idx.size) // rows
+    dm = int(sw.hidden)
+    inv = mx.argsort(order).astype(mx.uint32)
+    unsort, _mid = _epilogue_kernels()
+    (out,) = unsort(
+        inputs=[y, inv, w.reshape(-1).astype(mx.float32)],
+        template=[("T", y.dtype), ("TOPK", topk), ("D", dm)],
+        grid=(((dm + 255) // 256) * 256, rows, 1), threadgroup=(256, 1, 1),
+        output_shapes=[(rows, dm)], output_dtypes=[y.dtype])
+    return out
+
+
 def _tables(experts_sorted_counts, n_experts: int, bm: int = BM):
     zero = mx.zeros((1,), dtype=mx.int32)
     row_start = mx.concatenate([zero, mx.cumsum(experts_sorted_counts)])
@@ -325,8 +419,11 @@ def prefill_sorted(x2, sw, idx):
         output_shapes=[(pairs, 2 * ni)],
         output_dtypes=[x2.dtype],
     )
-    g, u = gu[:, :ni], gu[:, ni:]
-    h = (g * mx.sigmoid(g.astype(mx.float32)).astype(g.dtype)) * u
+    if fused_mid_enabled():
+        h = silu_up(gu, ni)
+    else:
+        g, u = gu[:, :ni], gu[:, ni:]
+        h = (g * mx.sigmoid(g.astype(mx.float32)).astype(g.dtype)) * u
     ty_d = K.TYPE_CODES[sw.down_type]
     (y,) = dn_k(
         inputs=[h, sw.down_d, sw.down_q, tile_start, row_start],

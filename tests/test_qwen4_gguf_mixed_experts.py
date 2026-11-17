@@ -205,3 +205,53 @@ def test_q2_0_blocks_weight_estimate(tmp_path, monkeypatch):
     assert gguf_routed_expert_bytes(tmp_path) == n // 4 + n // 64 * 4
     monkeypatch.setenv("MTPLX_GGUF_Q2_0_BLOCKS", "1")
     assert gguf_routed_expert_bytes(tmp_path) == n // 64 * 18
+
+
+def test_fused_silu_up_matches_the_mlx_expression():
+    """moe_gguf_qmm.silu_up is (g * sigmoid(float32(g)).astype(T)) * u in one pass,
+    with MLX's sigmoid form and the same roundings (fp16 products)."""
+    from mtplx.kernels import moe_gguf_qmm as G
+
+    if not G.available(mx.float16):
+        pytest.skip("MLX kernel headers unavailable")
+    rng = np.random.default_rng(21)
+    for pairs, ni in ((777, 192), (50, 64)):
+        gu = mx.array(rng.normal(0, 2.0, size=(pairs, 2 * ni)).astype(np.float16))
+        g, u = gu[:, :ni], gu[:, ni:]
+        want = np.array(((g * mx.sigmoid(g.astype(mx.float32)).astype(g.dtype)) * u).astype(mx.float32))
+        got = np.array(G.silu_up(gu, ni).astype(mx.float32))
+        np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-4)
+
+
+@pytest.mark.parametrize("fused_mid", ["1", "0"])
+def test_prefill_weighted_matches_the_unfused_epilogue(tmp_path, monkeypatch, fused_mid):
+    """The expert kernels followed by the one-pass un-sort + routing-weighted sum
+    equal the generic chain (mx.take by the inverse order, float32 product, sum
+    over the slot axis) to fp16 rounding."""
+    from mtplx.kernels import moe_gguf_qmm as G
+
+    if not G.available(mx.float16):
+        pytest.skip("MLX kernel headers unavailable")
+    monkeypatch.setenv("MTPLX_GGUF_QMM_FUSED_MID", fused_mid)
+    rng = np.random.default_rng(23)
+    sw, _refs = _module(tmp_path, rng, "Q2_0", "Q2_0")
+    for m in (40, 200):
+        x = mx.array(rng.normal(0, 0.5, size=(m, 512)).astype(np.float32)).astype(mx.float16)
+        idx = mx.array(np.stack([rng.choice(6, 2, replace=False) for _ in range(m)]).reshape(-1), mx.uint32)
+        w = mx.array(rng.dirichlet([1, 1], size=m).astype(np.float32).reshape(-1))
+        part = G.prefill_parts(x, sw, idx)
+        want = np.array((part.reshape(m, 2, -1) * w.reshape(m, 2, 1)).sum(axis=1).astype(mx.float16).astype(mx.float32))
+        got = np.array(G.prefill_weighted(x, sw, idx, w).astype(mx.float32))
+        assert got.shape == want.shape
+        np.testing.assert_allclose(got, want, atol=2e-3 * np.abs(want).max() + 1e-4)
+
+
+def test_epilogue_switches_default_on(monkeypatch):
+    from mtplx.kernels import moe_gguf_qmm as G
+
+    for name in ("MTPLX_GGUF_QMM_FUSED_EPILOGUE", "MTPLX_GGUF_QMM_FUSED_MID"):
+        monkeypatch.delenv(name, raising=False)
+    assert G.fused_epilogue_enabled() and G.fused_mid_enabled()
+    monkeypatch.setenv("MTPLX_GGUF_QMM_FUSED_EPILOGUE", "0")
+    monkeypatch.setenv("MTPLX_GGUF_QMM_FUSED_MID", "0")
+    assert not G.fused_epilogue_enabled() and not G.fused_mid_enabled()
