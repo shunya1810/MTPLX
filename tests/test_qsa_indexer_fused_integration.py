@@ -443,6 +443,9 @@ def test_env_on_flash_routes_blocks_and_matches_eager(indexer, monkeypatch):
 
 
 def test_env_on_rows_routes_tokens_and_preserves_exact_selection(indexer, monkeypatch):
+    # The radix top-k lists a row's blocks in index order, argpartition's in its
+    # own; this gate pins the argpartition order (the set is tested elsewhere).
+    monkeypatch.setenv("MTPLX_QSA_TOPK_KERNEL", "0")
     prefix = 12
     cache_eager = _prime_cache(indexer, monkeypatch, prefix, seed=51)
     cache_fused = _prime_cache(indexer, monkeypatch, prefix, seed=51)
@@ -682,6 +685,7 @@ def test_compiled_qk_rows_routes_public_modes_and_matches_eager(
     rows: int,
     compiled_mode: str,
 ):
+    monkeypatch.setenv("MTPLX_QSA_TOPK_KERNEL", "0")  # list order, as above
     prefix = 12
     cache_eager = _prime_cache(indexer, monkeypatch, prefix, seed=201 + rows)
     cache_compiled = _prime_cache(indexer, monkeypatch, prefix, seed=201 + rows)

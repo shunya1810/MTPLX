@@ -4179,7 +4179,15 @@ class QSAIndexer(nn.Module):
         # astype+swapaxes of the whole table (astype of the same bf16 blocks
         # -> bit-identical scores), without re-materializing 33.5 MB per
         # layer per token at 262K (#393).
-        pooled_t = cache.pooled_f32_view(nb_total)  # [1,1,D,nb]
+        from mtplx.kernels import qsa_decode_scores, qsa_topk_rows
+
+        tile = _qsa_score_tile_rows()
+        fast_scores = (
+            not fixed_capacity
+            and not (0 < tile < S)
+            and qsa_decode_scores.supported(q, pooled, self.n_heads, self.head_dim)
+        )
+        pooled_t = None if fast_scores else cache.pooled_f32_view(nb_total)  # [1,1,D,nb]
 
         qpos = pos_start + mx.arange(S, dtype=mx.int32)  # abs position
         nb_q = (qpos + 1) // self.ratio  # complete blocks visible per query [S]
@@ -4188,14 +4196,27 @@ class QSAIndexer(nn.Module):
         neg = mx.array(-mx.inf, dtype=mx.float32)
         k_eff = min(self.block_topk, nb_total)
 
-        tile = _qsa_score_tile_rows()
         if fixed_capacity:
             fused = self._verify_select_fused(
                 q, pos_start, cache, pooled_t, nb_total, k_eff, tile
             )
             if fused is not None:
                 return fused
-        if S > 1 and not fixed_capacity and 0 < tile < S:
+        if fast_scores:
+            # 1-8 rows (decode, verify): scores, mask and tie-break in one
+            # dispatch over the float16 pooled keys, then a radix top-k; the
+            # eager chain below is ~8 separate kernels per layer.
+            masked_scores = qsa_decode_scores.masked_scores(
+                q, pooled, pos_start, self._score_divisor(), ratio=self.ratio
+            )
+            if qsa_topk_rows.enabled():
+                top_idx = qsa_topk_rows.topk_rows(masked_scores, k_eff)
+            else:
+                top_idx = mx.argpartition(
+                    masked_scores, kth=nb_total - k_eff, axis=-1
+                )[:, nb_total - k_eff :]
+            _qsa_prefill_count("decode_fast_scores")
+        elif S > 1 and not fixed_capacity and 0 < tile < S:
             # Tiled scoring (see _qsa_score_tile_rows): bounds the live fp32
             # score transient at one tile; per-row selection math identical.
             top_idx = self._tiled_topk(

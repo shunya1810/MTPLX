@@ -384,7 +384,8 @@ def test_two_stage_chunk_loop_feeds_scores_to_dedicated_topk():
 
     source = ast.get_source_segment(BACKEND.read_text(), function)
     assert source is not None
-    assert 'score_producer: QSAPrefillScoreProducer = "mpp"' in source
+    assert "score_producer: QSAPrefillScoreProducer = (" in source
+    assert '"mpp" if use_mpp_scores else "simd" if use_simd_scores else "mlx"' in source
     assert "if use_mpp_scores:" in source
     assert "if scores is None:" not in source
     assert "pooled_t = mx.swapaxes(" in source
