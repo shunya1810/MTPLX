@@ -510,6 +510,7 @@ def test_rows_transition_with_visible_blocks_below_topk_is_exact(indexer, monkey
     # At qpos=6, only three complete blocks are visible even though K=4.
     # The five-row call ends at T=11 (five complete blocks), so the overall
     # call is sparse while its first row needs one invalid selected filler.
+    monkeypatch.setenv("MTPLX_QSA_TOPK_KERNEL", "0")  # pins argpartition's list order
     prefix = 6
     cache_eager = _prime_cache(indexer, monkeypatch, prefix, seed=55)
     cache_fused = _prime_cache(indexer, monkeypatch, prefix, seed=55)

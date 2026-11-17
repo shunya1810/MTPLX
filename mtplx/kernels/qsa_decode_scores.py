@@ -39,6 +39,9 @@ _SOURCE = r"""
     if (col0 >= n) {
         return;
     }
+    // A last fragment that runs past N reads its rows through this scratch
+    // (zero beyond N) instead of past the end of the pooled keys.
+    threadgroup half tail[SGS][64];
     simdgroup_float8x8 acc[HEADS][NF];
     #pragma clang loop unroll(full)
     for (int h = 0; h < HEADS; ++h) {
@@ -55,7 +58,18 @@ _SOURCE = r"""
         for (int j = 0; j < NF; ++j) {
             if (col0 + uint(j) * 8 < n) {
                 simdgroup_half8x8 b;
-                simdgroup_load(b, p + ulong(col0 + j * 8) * HEAD_DIM + k, ulong(HEAD_DIM), ulong2(0, 0), true);
+                if (col0 + uint(j) * 8 + 8 <= n) {
+                    simdgroup_load(b, p + ulong(col0 + j * 8) * HEAD_DIM + k, ulong(HEAD_DIM), ulong2(0, 0), true);
+                } else {
+                    const uint r = lane / 4;
+                    const uint c = (lane % 4) * 2;
+                    const uint row = col0 + uint(j) * 8 + r;
+                    tail[sg][r * 8 + c] = row < n ? p[ulong(row) * HEAD_DIM + k + c] : half(0);
+                    tail[sg][r * 8 + c + 1] = row < n ? p[ulong(row) * HEAD_DIM + k + c + 1] : half(0);
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                    simdgroup_load(b, &tail[sg][0], ulong(8), ulong2(0, 0), true);
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                }
                 #pragma clang loop unroll(full)
                 for (int h = 0; h < HEADS; ++h) simdgroup_multiply_accumulate(acc[h][j], a[h], b, acc[h][j]);
             }
@@ -92,6 +106,9 @@ _SOURCE = r"""
                 float score = metal::precise::divide(total, divisor[0]);
 #endif
                 const uint col = col0 + uint(j) * 8 + uint(fn) + uint(e);
+                if (col >= n) {
+                    continue;
+                }
                 float kept = (int(col) < visible) ? score : -INFINITY;
                 float block = float(int(col));
 #if QSA_FMA_TIE
@@ -112,7 +129,7 @@ def enabled() -> bool:
 
 
 def supported(q: mx.array, pooled: mx.array, heads: int, head_dim: int) -> bool:
-    """float16 ``q [1, S<=8, H, D]`` against float16 ``pooled [1, N % 8 == 0, D]``."""
+    """float16 ``q [1, S<=8, H, D]`` against float16 ``pooled [1, N, D]``."""
 
     if not enabled() or not hasattr(mx, "metal") or not mx.metal.is_available():
         return False
@@ -124,7 +141,7 @@ def supported(q: mx.array, pooled: mx.array, heads: int, head_dim: int) -> bool:
         return False
     if pooled.ndim != 3 or int(pooled.shape[0]) != 1 or int(pooled.shape[2]) != int(head_dim):
         return False
-    return int(pooled.shape[1]) > 0 and int(pooled.shape[1]) % 8 == 0
+    return int(pooled.shape[1]) > 0
 
 
 @lru_cache(maxsize=None)

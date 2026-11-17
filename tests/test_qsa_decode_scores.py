@@ -30,7 +30,7 @@ def _stock(q, pooled, pos, divisor):
 
 
 @pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 8])
-@pytest.mark.parametrize("blocks,position", [(64, 200), (2112, 8431), (8192, 8192 * 4 - 12), (32768, 100000)])
+@pytest.mark.parametrize("blocks,position", [(64, 200), (2112, 8431), (8192, 8192 * 4 - 12), (32768, 100000), (2049, 8200), (8195, 32770), (13, 52), (7, 24), (1, 3)])
 def test_scores_match_the_eager_chain(rows, blocks, position):
     mx.random.seed(rows * 13 + blocks)
     q = (mx.random.normal((1, rows, 4, 128)) * 0.3).astype(mx.float16)
@@ -64,7 +64,8 @@ def test_signatures_outside_the_kernel_are_refused(monkeypatch):
     pooled = mx.zeros((1, 64, 128), dtype=mx.float16)
     assert D.supported(q, pooled, 4, 128)
     assert not D.supported(q.astype(mx.float32), pooled, 4, 128)
-    assert not D.supported(q, pooled[:, :60], 4, 128)
+    assert D.supported(q, pooled[:, :60], 4, 128)
+    assert not D.supported(q, pooled[:, :0], 4, 128)
     assert not D.supported(mx.zeros((1, 9, 4, 128), dtype=mx.float16), pooled, 4, 128)
     assert not D.supported(q, pooled, 2, 128)
     monkeypatch.setenv(D.ENV, "0")
