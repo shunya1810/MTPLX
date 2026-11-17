@@ -258,6 +258,48 @@ def gather_matrices(memmaps: dict, uniq, inverse, names) -> dict:
     }
 
 
+#: macOS fcntl command: ask the kernel to read a byte range ahead of use (struct radvisory
+#: { off_t ra_offset; int ra_count; }). The call returns at once; a later read of the page
+#: waits for the I/O already in flight instead of starting a fault of its own.
+F_RDADVISE = 44
+ADVISE_ENV = "MTPLX_NGRAM_ADVISE"
+
+
+def advise_enabled() -> bool:
+    """MTPLX_NGRAM_ADVISE (default on, macOS only): large cold row gathers are read ahead
+    with F_RDADVISE from one thread instead of a pread a row from a thread pool. Cold
+    n-gram rows (a 3.2e8 x 90 B table on the SSD) cost 3.4 us a row this way, 8.9-11.3
+    through the 16-thread pread pool (its threads contend: advisories issued from the pool
+    are no faster than the pool's reads)."""
+    import sys
+
+    if sys.platform != "darwin":
+        return False
+    raw = (os.environ.get(ADVISE_ENV) or "").strip().lower()
+    return raw not in {"0", "off", "false", "no"}
+
+
+def advise_rows(fd: int, metas, rows) -> int:
+    """Read-ahead advisories for the rows' bytes (``metas``: (base offset, row bytes) per
+    map). Returns the number issued; raises OSError when the kernel refuses (the caller
+    falls back to reading the rows)."""
+    import fcntl
+
+    import numpy as np
+
+    rec = np.zeros(len(rows), np.dtype([("off", "<i8"), ("cnt", "<i4"), ("pad", "<i4")]))
+    issued = 0
+    rows64 = np.asarray(rows, dtype=np.int64)
+    for base, row_bytes in metas:
+        rec["off"] = base + rows64 * int(row_bytes)
+        rec["cnt"] = int(row_bytes)
+        buf = rec.tobytes()
+        for i in range(0, len(buf), 16):
+            fcntl.fcntl(fd, F_RDADVISE, buf[i : i + 16])
+        issued += len(rows64)
+    return issued
+
+
 def touch_rows(memmaps, rows, *, block: int = 1 << 18) -> int:
     """Fault ``rows`` of every map into the page cache, ascending, in blocks.
 

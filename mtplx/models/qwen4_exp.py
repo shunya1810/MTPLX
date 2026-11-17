@@ -3116,6 +3116,33 @@ def _fuse_gate_up_sanitize(model, out: dict) -> dict:
 _VERIFY_CAPTURE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "qwen4_exp_verify_capture", default=False
 )
+
+#: DFlash 2 taps (mtplx/dflash2.py): the mean of the four hyper-connection streams
+#: after each completed zero-based layer of DFLASH_TAP_LAYERS, collected per forward
+#: into the list a ``dflash_tap_scope`` installed (each entry [B, S, hidden], float32).
+DFLASH_TAP_LAYERS = (5, 15, 25, 35, 45)
+_DFLASH_TAPS: contextvars.ContextVar[Optional[list]] = contextvars.ContextVar(
+    "qwen4_exp_dflash_taps", default=None
+)
+
+
+@contextlib.contextmanager
+def dflash_tap_scope():
+    """Collect the DFlash 2 taps of every forward run inside the scope: yields a
+    list that gets len(DFLASH_TAP_LAYERS) arrays per forward, in layer order."""
+
+    sink: list = []
+    token = _DFLASH_TAPS.set(sink)
+    try:
+        yield sink
+    finally:
+        _DFLASH_TAPS.reset(token)
+
+
+def _stream_mean(h: mx.array, streams: int) -> mx.array:
+    """[..., streams * d] hyper-connection state -> its [..., d] mean over the streams (float32)."""
+    d = h.shape[-1] // streams
+    return mx.mean(h.astype(mx.float32).reshape(*h.shape[:-1], streams, d), axis=-2)
 _COMPILED_VERIFY_PLE: contextvars.ContextVar[Optional[mx.array]] = (
     contextvars.ContextVar("qwen4_exp_compiled_verify_ple", default=None)
 )
@@ -5974,6 +6001,26 @@ class _SidecarGather:
         return cleared
 
     def _warm(self, rows, *, counted: bool = True, only=None) -> None:
+        # A large cold gather (MTPLX_NGRAM_ADVISE, macOS): kernel read-ahead from this thread,
+        # so the gather's own reads wait for I/O already queued (3.4 us a row against 8.9-11.3
+        # through the pread pool, whose threads contend). Small gathers keep the pool.
+        from mtplx.ple_row_gather import advise_enabled, advise_rows
+
+        if len(rows) > getattr(self, "_HOT_PATH_MAX_ROWS", 4096) and self._fd is not None and advise_enabled():
+            metas = self._row_meta
+            if only is not None and len(metas) == len(self._maps) > 1:
+                wanted = set(only)
+                metas = [meta for name, meta in zip(self._maps, metas) if name in wanted]
+            try:
+                advise_rows(self._fd, metas, rows)
+            except OSError:
+                pass
+            else:
+                if counted:
+                    self.prefetch_batches += 1
+                else:
+                    self.lookahead_batches += 1
+                return
         futures = (
             self._submit_warm(rows, counted=counted)
             if only is None
@@ -7080,6 +7127,7 @@ class Qwen4ExpTextModel(nn.Module):
             capture = _VERIFY_CAPTURE.get()
             midloop = _prefill_midloop_eval_layers(int(h.shape[1]))
             last = len(self.layers) - 1
+            tap_sink = _DFLASH_TAPS.get()
             for index, (layer, c) in enumerate(zip(self.layers, cache)):
                 if (
                     capture
@@ -7088,6 +7136,8 @@ class Qwen4ExpTextModel(nn.Module):
                 ):
                     c._mtplx_verify_ple = (h, inputs)
                 h = layer(h, input_ids=inputs, ssm_mask=ssm_mask, cache=c)
+                if tap_sink is not None and index in DFLASH_TAP_LAYERS:
+                    tap_sink.append(_stream_mean(h, self.args.hc_count))
                 if midloop and index < last and (index + 1) % midloop == 0:
                     mx.async_eval(
                         h, *_midloop_state_arrays(cache[index + 1 - midloop : index + 1])

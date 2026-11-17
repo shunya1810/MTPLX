@@ -170,8 +170,11 @@ class Attention(nn.Module):
         ctx_v: Optional[mx.array],
         ctx_pos0: int,
         start: int,
+        out_scale: float = 1.0,
     ) -> mx.array:
-        """Attention of the block rows (positions start...) over the window and the block."""
+        """Attention of the block rows (positions start...) over the window and the block.
+        The output projection runs on ``out * out_scale`` (its output is out_scale times the
+        true one): the bfloat16 checkpoint's attention outputs reach 1e5, past float16."""
         cfg = self.cfg
         rows = hidden.shape[0]
         q = self.q_norm(self.q_proj(hidden).reshape(rows, cfg.num_heads, cfg.head_dim)).transpose(1, 0, 2)
@@ -191,7 +194,8 @@ class Attention(nn.Module):
         out = mx.fast.scaled_dot_product_attention(
             q[None], k[None], v[None], scale=self.scale, mask=mask
         )[0]
-        return self.o_proj(out.transpose(1, 0, 2).reshape(rows, cfg.num_heads * cfg.head_dim))
+        out = out.transpose(1, 0, 2).reshape(rows, cfg.num_heads * cfg.head_dim)
+        return self.o_proj(out * out_scale if out_scale != 1.0 else out)
 
 
 class MLP(nn.Module):
@@ -223,11 +227,14 @@ class DecoderLayer(nn.Module):
 
     def __call__(self, h, ctx_k, ctx_v, ctx_pos0, start, dtype, down_scale: float = 1.0):
         """``h`` is the float32 residual stream [rows, hidden]; the blocks compute in ``dtype``."""
+        # the output and down projections run on inputs * down_scale and their (linear)
+        # conv ``finish`` follows, so the float16 values stay in range; the float32 stream
+        # gets them divided back
         x, kernel = self.attention_conv.prepare(self.input_layernorm(h).astype(dtype))
-        x = self.attention_conv.finish(self.self_attn(x, ctx_k, ctx_v, ctx_pos0, start), kernel)
-        h = h + x.astype(mx.float32)
+        x = self.attention_conv.finish(self.self_attn(x, ctx_k, ctx_v, ctx_pos0, start, down_scale), kernel)
+        x = x.astype(mx.float32)
+        h = h + (x / down_scale if down_scale != 1.0 else x)
         x, kernel = self.mlp_conv.prepare(self.post_attention_layernorm(h).astype(dtype))
-        # the down projection runs on act * down_scale (see MLP); finish is linear in its input
         x = self.mlp_conv.finish(self.mlp(x, down_scale), kernel).astype(mx.float32)
         return h + (x / down_scale if down_scale != 1.0 else x)
 
@@ -275,8 +282,9 @@ class CandidateSelector(nn.Module):
 
 class DFlash2Draft(nn.Module):
     """The residual stream is float32 (the checkpoint is bfloat16 and its massive
-    activations pass float16's range); the blocks compute in ``dtype`` (float16 on the M1
-    family) with the MLP's down projection fed act / 64."""
+    activations pass float16's range: real attention outputs reach 1.6e5); the blocks
+    compute in ``dtype`` (float16 on the M1 family) with the attention's output
+    projection and the MLP's down projection fed their inputs / 64."""
 
     DOWN_SCALE_F16 = 1.0 / 64.0
 

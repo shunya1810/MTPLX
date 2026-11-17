@@ -567,3 +567,43 @@ def test_the_sidecar_names_its_map_extents_to_the_pre_read():
     call = call[: call.index("\n        )\n") + 1]
     assert "map_extents=tuple(" in call
     assert 'self.row_layout == "planar"' in call
+
+
+def test_advise_rows_issues_one_advisory_a_row_per_map(tmp_path, monkeypatch):
+    """ple_row_gather.advise_rows hands the kernel one 16-byte radvisory record
+    (offset, count) per row and map; on macOS the real call succeeds on a plain file."""
+    import fcntl
+    import struct
+    import sys
+
+    import numpy as np
+
+    from mtplx import ple_row_gather as PG
+
+    calls = []
+    monkeypatch.setattr(fcntl, "fcntl", lambda fd, cmd, arg: calls.append((fd, cmd, bytes(arg))) or arg)
+    n = PG.advise_rows(7, [(192, 90), (1000, 16)], np.array([3, 10, 4_000_000], dtype=np.int64))
+    assert n == 6 and len(calls) == 6
+    assert all(c[0] == 7 and c[1] == PG.F_RDADVISE == 44 and len(c[2]) == 16 for c in calls)
+    assert [struct.unpack("<qi", c[2][:12]) for c in calls[:3]] == [(192 + 3 * 90, 90), (192 + 10 * 90, 90), (192 + 4_000_000 * 90, 90)]
+    assert [struct.unpack("<qi", c[2][:12]) for c in calls[3:]] == [(1000 + 3 * 16, 16), (1000 + 10 * 16, 16), (1000 + 4_000_000 * 16, 16)]
+    monkeypatch.undo()
+    if sys.platform == "darwin":
+        path = tmp_path / "table.bin"
+        path.write_bytes(b"\0" * (1 << 20))
+        fd = __import__("os").open(str(path), __import__("os").O_RDONLY)
+        try:
+            assert PG.advise_rows(fd, [(0, 90)], np.array([0, 5, 9000])) == 3
+        finally:
+            __import__("os").close(fd)
+
+
+def test_advise_switch(monkeypatch):
+    import sys
+
+    from mtplx import ple_row_gather as PG
+
+    monkeypatch.delenv(PG.ADVISE_ENV, raising=False)
+    assert PG.advise_enabled() == (sys.platform == "darwin")
+    monkeypatch.setenv(PG.ADVISE_ENV, "0")
+    assert not PG.advise_enabled()
