@@ -145,3 +145,68 @@ def qsa_flash_skip(q_row, k_backing, v_backing, blocks, t_total, tail_start, sca
         output_dtypes=[q_row.dtype],
     )
     return out
+
+
+def _q8_source() -> str:
+    """The same kernel over int8 K/V with a float16 scale per (head, token).
+
+    q.k = scale_k * sum(q * k_int8); the V rows enter the online softmax as
+    p * scale_v * v_int8, so the int8 values never need a float16 copy."""
+
+    src = _SRC
+    src = src.replace("device const T* kh = k + (size_t)hkv * (size_t)cap * HD;",
+                      "device const int8_t* kh = k + (size_t)hkv * (size_t)cap * HD;\n"
+                      "    device const half* ksh = ksc + (size_t)hkv * (size_t)cap;\n"
+                      "    device const half* vsh = vsc + (size_t)hkv * (size_t)cap;")
+    src = src.replace("device const T* vh = v + (size_t)hkv * (size_t)cap * HD;",
+                      "device const int8_t* vh = v + (size_t)hkv * (size_t)cap * HD;")
+    src = src.replace("device const T* kr = kh + t * HD + dbase;", "device const int8_t* kr = kh + t * HD + dbase;")
+    src = src.replace("device const T* kr = kh + (size_t)t * HD + dbase;", "device const int8_t* kr = kh + (size_t)t * HD + dbase;")
+    src = src.replace("device const T* vr = vh + t * HD + dbase;", "device const int8_t* vr = vh + t * HD + dbase;")
+    src = src.replace("device const T* vr = vh + (size_t)t * HD + dbase;", "device const int8_t* vr = vh + (size_t)t * HD + dbase;")
+    # score scale (selected blocks: index t; tail: index t) and V scale
+    src = src.replace("const float s = simd_sum(part);\n            const float mn", "const float s = simd_sum(part) * (float)ksh[t];\n            const float mn")
+    src = src.replace("const float s = simd_sum(part);\n        const float mn", "const float s = simd_sum(part) * (float)ksh[t];\n        const float mn")
+    src = src.replace("o[d] = o[d] * c + p * (float)vr[d];", "o[d] = o[d] * c + pv * (float)vr[d];")
+    src = src.replace("l = l * c + p;\n            device const int8_t* vr", "l = l * c + p;\n            const float pv = p * (float)vsh[t];\n            device const int8_t* vr")
+    src = src.replace("l = l * c + p;\n        device const int8_t* vr", "l = l * c + p;\n        const float pv = p * (float)vsh[t];\n        device const int8_t* vr")
+    assert src.count("ksh[t]") == 2 and src.count("vsh[t]") == 2 and src.count("pv * (float)vr[d]") == 2, (src.count("ksh[t]"), src.count("vsh[t]"))
+    return src
+
+
+@lru_cache(maxsize=4)
+def _kernel_q8():
+    return mx.fast.metal_kernel(
+        name="mtplx_qsa_flash_skip_q8",
+        input_names=["q", "k", "v", "ksc", "vsc", "blocks", "params", "scale"],
+        output_names=["out"],
+        header=_HEADER,
+        source=_q8_source(),
+    )
+
+
+def qsa_flash_skip_q8(q_row, kq, ks, vq, vs, blocks, t_total, tail_start, scale):
+    """``qsa_flash_skip`` over the int8 backing: kq/vq [1, Hkv, cap, 256] int8,
+    ks/vs [1, Hkv, cap, 1] float16 scales (read in place)."""
+    hq = int(q_row.shape[0])
+    hkv = int(kq.shape[1])
+    cap = int(kq.shape[2])
+    params = mx.array([int(t_total), int(tail_start), int(blocks.shape[0]), cap], dtype=mx.int32)
+    (out,) = _kernel_q8()(
+        inputs=[
+            q_row.reshape(-1),
+            kq.reshape(-1),
+            vq.reshape(-1),
+            ks.reshape(-1),
+            vs.reshape(-1),
+            blocks,
+            params,
+            mx.array([float(scale)], dtype=mx.float32),
+        ],
+        template=[("T", q_row.dtype), ("GQA", hq // hkv)],
+        grid=(hq * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(hq, 256)],
+        output_dtypes=[q_row.dtype],
+    )
+    return out

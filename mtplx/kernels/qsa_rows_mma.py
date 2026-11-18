@@ -347,3 +347,98 @@ def qsa_rows_attention(q, keys, values, token_idx, token_ok, scale: float):
         output_dtypes=[q.dtype],
     )
     return out
+
+
+def _q8_source() -> str:
+    """``_SOURCE`` over int8 K/V with one float16 scale per (head, token).
+
+    A key row's scale multiplies its whole score row (S = scale_k * (q . k_int)),
+    so it is applied once per key when the scores are written; a value row's
+    scale multiplies that key's softmax weight in the P tile (O += p * scale_v *
+    v_int) - the running sum l_i is taken from the unscaled p first."""
+
+    src = _SOURCE
+    a = "const vec<InT, 2> k2 = *((const device vec<InT, 2>*)(keys + kbase[c] + d));"
+    b = "const vec<InT, 2> w2 = *((const device vec<InT, 2>*)(values + vbase + d));"
+    assert a in src and b in src
+    src = src.replace(a, "const vec<char, 2> k2 = *((const device vec<char, 2>*)(keys + kbase[c] + d));")
+    src = src.replace(b, "const vec<char, 2> w2 = *((const device vec<char, 2>*)(values + vbase + d));")
+    key_line = "const int key = (sg * KT + c) * 8 + fm;"
+    assert key_line in src
+    src = src.replace(key_line, key_line + "\n            const float kscl = (float)kscale[(size_t)h * CAP + Sidx[key]];")
+    for e in ("0", "1"):
+        old = "thread_elements()[%s] * qscale;" % e
+        assert src.count(old) == 1, old
+        src = src.replace(old, "thread_elements()[%s] * qscale * kscl;" % e)
+    p_old = ("P[rt].thread_elements()[0] = Ss[(rt * 8 + fm) * LDS + c * 8 + fn];\n"
+             "                P[rt].thread_elements()[1] = Ss[(rt * 8 + fm) * LDS + c * 8 + fn + 1];")
+    assert p_old in src
+    src = src.replace(p_old, "P[rt].thread_elements()[0] = Ss[(rt * 8 + fm) * LDS + c * 8 + fn] * vs0;\n"
+                             "                P[rt].thread_elements()[1] = Ss[(rt * 8 + fm) * LDS + c * 8 + fn + 1] * vs1;")
+    hook = "simdgroup_matrix<float, 8, 8> P[NRT];"
+    assert src.count(hook) == 1
+    src = src.replace(hook, hook + "\n            const float vs0 = (float)vscale[(size_t)h * CAP + Sidx[c * 8 + fn]];"
+                                   "\n            const float vs1 = (float)vscale[(size_t)h * CAP + Sidx[c * 8 + fn + 1]];")
+    return src
+
+
+@lru_cache(maxsize=None)
+def _kernels_q8():
+    attn = mx.fast.metal_kernel(
+        name="mtplx_qsa_rows_mma_q8",
+        input_names=["queries", "keys", "values", "kscale", "vscale", "token_idx", "token_ok", "scale"],
+        output_names=["partials", "maxs", "sums"],
+        source=_q8_source(),
+    )
+    return attn, _kernels()[1]
+
+
+def supported_q8(q: mx.array, kq: mx.array, token_idx: mx.array) -> bool:
+    if q.ndim != 4 or kq.ndim != 4 or int(q.shape[0]) != 1 or int(kq.shape[0]) != 1:
+        return False
+    H, D = int(q.shape[1]), int(q.shape[3])
+    hk = int(kq.shape[1])
+    if hk <= 0 or H % hk or D % 32 or int(kq.shape[3]) != D:
+        return False
+    if q.dtype not in (mx.float16, mx.bfloat16) or kq.dtype != mx.int8:
+        return False
+    return H // hk <= 16 and token_idx.ndim == 2 and int(token_idx.shape[0]) == int(q.shape[2])
+
+
+def qsa_rows_attention_q8(q, kq, ks, vq, vs, token_idx, token_ok, scale: float):
+    """``qsa_rows_attention`` over the int8 backing: kq/vq [1, H_kv, cap, D] int8,
+    ks/vs [1, H_kv, cap, 1] float16 scales."""
+    _, H, S, D = (int(v) for v in q.shape)
+    hk, cap = int(kq.shape[1]), int(kq.shape[2])
+    gqa = H // hk
+    ksel = int(token_idx.shape[1])
+    kt = _env_int("MTPLX_QSA_ROWS_MMA_KT", 1)
+    qks = _env_int("MTPLX_QSA_ROWS_MMA_QKS", 2)
+    bk = 32 * kt
+    splits = _env_int("MTPLX_QSA_ROWS_MMA_SPLITS", 0)
+    if splits <= 0:
+        splits = max(1, min(16, (128 + hk * S - 1) // (hk * S), (ksel + bk - 1) // bk))
+    attn, red = _kernels_q8()
+    rows = hk * S * gqa
+    tmpl = [("InT", q.dtype), ("D", D), ("GQA", gqa), ("KT", kt), ("QKS", qks), ("SPLITS", splits)]
+    if token_idx.dtype != mx.int32:
+        token_idx = token_idx.astype(mx.int32)
+    if token_ok.dtype != mx.bool_:
+        token_ok = token_ok.astype(mx.bool_)
+    partials, maxs, sums = attn(
+        inputs=[q, kq, vq, ks.reshape(-1), vs.reshape(-1), token_idx, token_ok, _scale_array(float(scale))],
+        template=tmpl,
+        grid=(hk * 128, S, splits),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(rows * splits, D), (rows * splits,), (rows * splits,)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    (out,) = red(
+        inputs=[partials, maxs, sums],
+        template=[("OutT", q.dtype), ("D", D), ("GQA", gqa), ("NROWS", S), ("SPLITS", splits)],
+        grid=(rows * D, 1, 1),
+        threadgroup=(D, 1, 1),
+        output_shapes=[(1, H, S, D)],
+        output_dtypes=[q.dtype],
+    )
+    return out

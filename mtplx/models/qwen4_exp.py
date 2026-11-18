@@ -3540,6 +3540,142 @@ class QSAKVCache(KVCache):
         )
 
 
+def qsa_kv_q8_enabled() -> bool:
+    """MTPLX_QSA_KV_Q8=1: Flash-Next's QSA K/V are stored int8 (one float16
+    scale per head and token) instead of float16 - half the KV memory.
+    Opt-in until every reader has an int8 path (see QSAKVCacheQ8)."""
+
+    raw = (os.environ.get("MTPLX_QSA_KV_Q8") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _quantize_kv_rows(x: mx.array) -> tuple[mx.array, mx.array]:
+    """Symmetric int8 over the last axis: ``(q int8 [..., D], scale float16 [..., 1])``.
+
+    The quantizer divides by the float16 scale it stores, so dequantization
+    (``q * scale``) inverts exactly what was rounded."""
+
+    xf = x.astype(mx.float32)
+    scale = (mx.max(mx.abs(xf), axis=-1, keepdims=True) / 127.0).astype(mx.float16)
+    sf = scale.astype(mx.float32)
+    inv = mx.where(sf > 0, 1.0 / mx.where(sf > 0, sf, 1.0), 0.0)
+    q = mx.clip(mx.round(xf * inv), -127.0, 127.0).astype(mx.int8)
+    return q, scale
+
+
+class QSAKVCacheQ8(QSAKVCache):
+    """``QSAKVCache`` with the K/V held int8 + a float16 scale per (head, token).
+
+    ``kq``/``vq`` [B, H, cap, D] int8 and ``ks``/``vs`` [B, H, cap, 1] float16
+    are the storage; converted readers (decode flash-skip, verify rows MMA,
+    prefill direct) read them in place.  ``keys``/``values`` and the views
+    ``update_and_fetch`` returns are LAZY float16 dequantizations of the first
+    ``offset`` rows: a reader that has no int8 path still gets exactly the
+    rows it expects (at the cost of materializing them), and a converted one
+    never evaluates them, so they cost nothing.  ``state`` hands out float16
+    (the four-leaf session contract is unchanged); its setter re-quantizes.
+    """
+
+    def __init__(self):
+        self.kq = self.vq = self.ks = self.vs = None
+        self._dtype = mx.float16
+        super().__init__()
+
+    # -- float16 compatibility surface -------------------------------------
+    def _dq(self, q, scale, rows):
+        if q is None:
+            return None
+        return q[..., :rows, :].astype(self._dtype) * scale[..., :rows, :].astype(self._dtype)
+
+    @property
+    def keys(self):
+        return self._dq(self.kq, self.ks, int(self.offset))
+
+    @keys.setter
+    def keys(self, value):
+        if value is None:
+            self.kq = self.ks = None
+        else:
+            self._dtype = value.dtype
+            self.kq, self.ks = _quantize_kv_rows(value)
+
+    @property
+    def values(self):
+        return self._dq(self.vq, self.vs, int(self.offset))
+
+    @values.setter
+    def values(self, value):
+        if value is None:
+            self.vq = self.vs = None
+        else:
+            self.vq, self.vs = _quantize_kv_rows(value)
+
+    @property
+    def capacity(self) -> int:
+        return 0 if self.kq is None else int(self.kq.shape[2])
+
+    @property
+    def nbytes(self) -> int:
+        if self.kq is None:
+            return 0
+        return int(self.kq.nbytes + self.vq.nbytes + self.ks.nbytes + self.vs.nbytes)
+
+    @property
+    def state(self):
+        if self.kq is None:
+            return (None, None)
+        return (self.keys, self.values)
+
+    @state.setter
+    def state(self, v):
+        keys, values = v
+        self._dtype = keys.dtype
+        self.kq, self.ks = _quantize_kv_rows(keys)
+        self.vq, self.vs = _quantize_kv_rows(values)
+        self.offset = int(keys.shape[2])
+
+    # -- storage -----------------------------------------------------------
+    def _resize(self, rows: int, keys: mx.array, values: mx.array) -> None:
+        """Backing of ``rows`` rows, the history kept, the rest zeros."""
+
+        batch, heads, _n, key_dim = keys.shape
+        value_dim = values.shape[3]
+        prev = int(self.offset)
+        if self.kq is None or prev == 0:
+            self.kq = mx.zeros((batch, heads, rows, key_dim), mx.int8)
+            self.vq = mx.zeros((batch, heads, rows, value_dim), mx.int8)
+            self.ks = mx.zeros((batch, heads, rows, 1), mx.float16)
+            self.vs = mx.zeros((batch, heads, rows, 1), mx.float16)
+            return
+        pad = rows - prev
+        self.kq = mx.concatenate([self.kq[..., :prev, :], mx.zeros((batch, heads, pad, key_dim), mx.int8)], axis=2)
+        self.vq = mx.concatenate([self.vq[..., :prev, :], mx.zeros((batch, heads, pad, value_dim), mx.int8)], axis=2)
+        self.ks = mx.concatenate([self.ks[..., :prev, :], mx.zeros((batch, heads, pad, 1), mx.float16)], axis=2)
+        self.vs = mx.concatenate([self.vs[..., :prev, :], mx.zeros((batch, heads, pad, 1), mx.float16)], axis=2)
+
+    def update_and_fetch(self, keys, values):
+        prev = int(self.offset)
+        n = int(keys.shape[2])
+        needed = prev + n
+        self._dtype = keys.dtype
+        if self.kq is None or needed > int(self.kq.shape[2]):
+            target = qsa_rows_target_value()
+            if target >= needed:
+                self._resize(target, keys, values)
+            else:
+                steps = (self.step + n - 1) // self.step
+                base = prev if (self.kq is None or prev % self.step != 0) else int(self.kq.shape[2])
+                self._resize(base + steps * self.step, keys, values)
+        qk, sk = _quantize_kv_rows(keys)
+        qv, sv = _quantize_kv_rows(values)
+        self.offset = needed
+        self.kq[..., prev:needed, :] = qk
+        self.ks[..., prev:needed, :] = sk
+        self.vq[..., prev:needed, :] = qv
+        self.vs[..., prev:needed, :] = sv
+        return self.keys, self.values
+
+
 class QSACache:
     """Cache for one QSA layer: the attention KV plus the indexer's raw key
     stream and the incrementally maintained pooled (mean->norm->rope) block
@@ -3560,7 +3696,7 @@ class QSACache:
     step = 256
 
     def __init__(self, compress_ratio: int = 4):
-        self.kv = QSAKVCache()
+        self.kv = QSAKVCacheQ8() if qsa_kv_q8_enabled() else QSAKVCache()
         self.ratio = max(1, int(compress_ratio))
         self.rows_gather_kv_m4 = _qsa_stock_rows_gather_kv
         self.raw_keys: Optional[mx.array] = None  # [1, cap, index_head_dim]
@@ -5389,6 +5525,14 @@ class Attention(nn.Module):
 
         if fixed or not _qsa_rows_mma_enabled():
             return None
+        if isinstance(cache.kv, QSAKVCacheQ8):
+            from mtplx.kernels.qsa_rows_mma import qsa_rows_attention_q8, supported_q8
+
+            if cache.kv.kq is None or not supported_q8(q, cache.kv.kq, tok_idx):
+                return None
+            return qsa_rows_attention_q8(
+                q, cache.kv.kq, cache.kv.ks, cache.kv.vq, cache.kv.vs, tok_idx, tok_ok, self.scale
+            )
         keys = getattr(cache.kv, "keys", None)
         values = getattr(cache.kv, "values", None)
         if not isinstance(keys, mx.array) or not isinstance(values, mx.array):
@@ -5562,15 +5706,30 @@ class Attention(nn.Module):
             from mtplx.kernels.qsa_flash_skip import qsa_flash_skip
 
             _, blk_idx, tail_start = sel_mask
-            out = qsa_flash_skip(
-                q.reshape(self.n_heads, self.head_dim),
-                cache.kv.keys,
-                cache.kv.values,
-                blk_idx,
-                T,
-                tail_start,
-                self.scale,
-            )
+            if isinstance(cache.kv, QSAKVCacheQ8):
+                from mtplx.kernels.qsa_flash_skip import qsa_flash_skip_q8
+
+                out = qsa_flash_skip_q8(
+                    q.reshape(self.n_heads, self.head_dim),
+                    cache.kv.kq,
+                    cache.kv.ks,
+                    cache.kv.vq,
+                    cache.kv.vs,
+                    blk_idx,
+                    T,
+                    tail_start,
+                    self.scale,
+                )
+            else:
+                out = qsa_flash_skip(
+                    q.reshape(self.n_heads, self.head_dim),
+                    cache.kv.keys,
+                    cache.kv.values,
+                    blk_idx,
+                    T,
+                    tail_start,
+                    self.scale,
+                )
             out = out.reshape(B, S, -1)
             return self.o_proj(attention_gate(out, gate))
 
