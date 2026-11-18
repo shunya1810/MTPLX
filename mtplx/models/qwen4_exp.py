@@ -2741,6 +2741,36 @@ def qsa_prefill_engagement() -> Dict[str, int]:
     return dict(_QSA_PREFILL_COUNTS)
 
 
+def _qsa_prefill_rows_mma_enabled() -> bool:
+    """MTPLX_QSA_PREFILL_ROWS_MMA: the verify rows-MMA kernel serves large-S
+    prefill attention (4096 rows x ~2,050 selected tokens) ahead of the
+    vendored Steel kernel; on M1 Max it runs the layer's chunk in about half the
+    time (fn-s8/prefill_attn_q8.py) and reads int8 KV directly."""
+
+    raw = (os.environ.get("MTPLX_QSA_PREFILL_ROWS_MMA") or "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _qsa_prefill_token_lists(block_ids, block_valid, pos_start: int, ratio: int):
+    """Per-row token lists of the ``flash_prefill`` block contract: each valid
+    selected block's ``ratio`` tokens, then the visible tail (up to
+    ``ratio - 1`` tokens past the row's last complete block). Returns
+    ``(token_idx int32 [S, K*ratio + ratio - 1], token_ok bool)``."""
+
+    rows, k = int(block_ids.shape[0]), int(block_ids.shape[1])
+    qpos = int(pos_start) + mx.arange(rows, dtype=mx.int32)
+    complete = (qpos + 1) // ratio
+    ok_blocks = block_valid & (block_ids < complete[:, None])
+    block_tokens = (
+        block_ids.astype(mx.int32)[:, :, None] * ratio + mx.arange(ratio, dtype=mx.int32)
+    ).reshape(rows, k * ratio)
+    tail = complete[:, None] * ratio + mx.arange(ratio - 1, dtype=mx.int32)
+    return (
+        mx.concatenate([block_tokens, tail], axis=1),
+        mx.concatenate([mx.repeat(ok_blocks, ratio, axis=1), tail <= qpos[:, None]], axis=1),
+    )
+
+
 def _qsa_prefill_dispatch_tier(
     *,
     flash_supported,
@@ -2749,6 +2779,8 @@ def _qsa_prefill_dispatch_tier(
     direct_call,
     gather_enabled: bool,
     gather_call,
+    rows_supported=None,
+    rows_call=None,
 ):
     """Pick the one consumer of the ``("flash_prefill", ids, valid)`` tuple.
 
@@ -2762,6 +2794,10 @@ def _qsa_prefill_dispatch_tier(
     if flash_supported():
         out = flash_call()
         _qsa_prefill_count("flash_kernel")
+        return out
+    if rows_supported is not None and rows_supported():
+        out = rows_call()
+        _qsa_prefill_count("rows_mma_kernel")
         return out
     if direct_supported():
         out = direct_call()
@@ -5826,6 +5862,35 @@ class Attention(nn.Module):
                     tile_rows=_qsa_prefill_gather_tile_rows(),
                 )
 
+            def _qsa_rows_supported() -> bool:
+                if not _qsa_prefill_rows_mma_enabled():
+                    return False
+                if not _qsa_prefill_direct_attention_enabled(S, T):
+                    return False
+                kv = cache.kv
+                if isinstance(kv, QSAKVCacheQ8):
+                    from mtplx.kernels.qsa_rows_mma import supported_q8
+
+                    return kv.kq is not None and supported_q8(q, kv.kq, block_ids)
+                from mtplx.kernels.qsa_rows_mma import supported
+
+                return isinstance(kv.keys, mx.array) and supported(q, kv.keys, block_ids)
+
+            def _qsa_rows_call():
+                tok_idx, tok_ok = _qsa_prefill_token_lists(
+                    block_ids, block_valid, pos_start, self.indexer.ratio
+                )
+                kv = cache.kv
+                if isinstance(kv, QSAKVCacheQ8):
+                    from mtplx.kernels.qsa_rows_mma import qsa_rows_attention_q8
+
+                    return qsa_rows_attention_q8(
+                        q, kv.kq, kv.ks, kv.vq, kv.vs, tok_idx, tok_ok, self.scale
+                    )
+                from mtplx.kernels.qsa_rows_mma import qsa_rows_attention
+
+                return qsa_rows_attention(q, kv.keys, kv.values, tok_idx, tok_ok, self.scale)
+
             out = _qsa_prefill_dispatch_tier(
                 flash_supported=_qsa_flash_supported,
                 flash_call=_qsa_flash_call,
@@ -5833,6 +5898,8 @@ class Attention(nn.Module):
                 direct_call=_qsa_direct_call,
                 gather_enabled=_qsa_prefill_gather_enabled(),
                 gather_call=_qsa_gather_call,
+                rows_supported=_qsa_rows_supported,
+                rows_call=_qsa_rows_call,
             )
             if out is not None:
                 out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
