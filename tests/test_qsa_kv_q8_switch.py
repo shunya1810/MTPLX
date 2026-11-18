@@ -39,3 +39,18 @@ def test_the_prefill_rows_reader_follows_the_cache_type(monkeypatch):
     assert not Q._qsa_prefill_rows_mma_enabled(True)
     monkeypatch.setenv("MTPLX_QSA_PREFILL_ROWS_MMA", "1")
     assert Q._qsa_prefill_rows_mma_enabled(False)
+
+
+def test_the_draft_head_cache_stays_float16_unless_asked(monkeypatch):
+    import types
+
+    _clear(monkeypatch)
+    monkeypatch.setenv("MTPLX_QSA_KV_Q8", "1")
+    holder = types.SimpleNamespace(model=types.SimpleNamespace(args=types.SimpleNamespace(indexer_compress_ratio=4)))
+    make = Q.Qwen4ExpForCausalLM.make_mtp_cache if hasattr(Q, "Qwen4ExpForCausalLM") else None
+    if make is None:
+        cls = next(c for c in vars(Q).values() if isinstance(c, type) and "make_mtp_cache" in vars(c))
+        make = cls.make_mtp_cache
+    assert type(make(holder)[0].kv) is Q.QSAKVCache
+    monkeypatch.setenv("MTPLX_QSA_KV_Q8_DRAFT", "1")
+    assert type(make(holder)[0].kv) is Q.QSAKVCacheQ8

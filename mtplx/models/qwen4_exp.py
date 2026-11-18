@@ -3740,8 +3740,9 @@ class QSACache:
 
     step = 256
 
-    def __init__(self, compress_ratio: int = 4):
-        self.kv = QSAKVCacheQ8() if qsa_kv_q8_enabled() else QSAKVCache()
+    def __init__(self, compress_ratio: int = 4, int8_kv: Optional[bool] = None):
+        use_int8 = qsa_kv_q8_enabled() if int8_kv is None else bool(int8_kv)
+        self.kv = QSAKVCacheQ8() if use_int8 else QSAKVCache()
         self.ratio = max(1, int(compress_ratio))
         self.rows_gather_kv_m4 = _qsa_stock_rows_gather_kv
         self.raw_keys: Optional[mx.array] = None  # [1, cap, index_head_dim]
@@ -7776,7 +7777,11 @@ class TextModel(nn.Module):
         return self.mtp.fuse_and_run_history(hidden_states, emb, mtp_cache)
 
     def make_mtp_cache(self):
-        return [QSACache(self.model.args.indexer_compress_ratio or 4)]
+        # The draft head's one layer stays float16 unless MTPLX_QSA_KV_Q8_DRAFT=1:
+        # it is 1/13 of the KV and its keys steer every draft token.
+        raw = (os.environ.get("MTPLX_QSA_KV_Q8_DRAFT") or "0").strip().lower()
+        int8_draft = qsa_kv_q8_enabled() and raw in {"1", "true", "yes", "on"}
+        return [QSACache(self.model.args.indexer_compress_ratio or 4, int8_kv=int8_draft)]
 
     def make_cache(self):
         ratio = self.model.args.indexer_compress_ratio or 4
