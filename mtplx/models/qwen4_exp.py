@@ -2741,14 +2741,16 @@ def qsa_prefill_engagement() -> Dict[str, int]:
     return dict(_QSA_PREFILL_COUNTS)
 
 
-def _qsa_prefill_rows_mma_enabled() -> bool:
+def _qsa_prefill_rows_mma_enabled(int8_kv: bool = False) -> bool:
     """MTPLX_QSA_PREFILL_ROWS_MMA: the verify rows-MMA kernel serves large-S
     prefill attention (4096 rows x ~2,050 selected tokens) ahead of the
     vendored Steel kernel; on M1 Max it runs the layer's chunk in about half the
     time (fn-s8/prefill_attn_q8.py) and reads int8 KV directly."""
 
-    raw = (os.environ.get("MTPLX_QSA_PREFILL_ROWS_MMA") or "0").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    raw = (os.environ.get("MTPLX_QSA_PREFILL_ROWS_MMA") or "").strip().lower()
+    if raw:
+        return raw in {"1", "true", "yes", "on"}
+    return bool(int8_kv)  # the int8 cache's prefill reader; float16 KV keeps the Steel kernel
 
 
 def _qsa_prefill_token_lists(block_ids, block_valid, pos_start: int, ratio: int):
@@ -3577,12 +3579,19 @@ class QSAKVCache(KVCache):
 
 
 def qsa_kv_q8_enabled() -> bool:
-    """MTPLX_QSA_KV_Q8=1: Flash-Next's QSA K/V are stored int8 (one float16
-    scale per head and token) instead of float16 - half the KV memory.
-    Opt-in until every reader has an int8 path (see QSAKVCacheQ8)."""
+    """Flash-Next's QSA K/V are stored int8 (one float16 scale per head and
+    token) instead of float16 - half the KV memory. On with
+    ``--paged-kv-quantization q8`` (or ``MTPLX_QSA_KV_Q8=1``); ``MTPLX_QSA_KV_Q8=0``
+    forces float16 whatever the serve flag says."""
 
-    raw = (os.environ.get("MTPLX_QSA_KV_Q8") or "0").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    raw = (os.environ.get("MTPLX_QSA_KV_Q8") or "").strip().lower()
+    if raw:
+        return raw in {"1", "true", "yes", "on"}
+    # No explicit switch: follow the serve flag (--paged-kv-quantization q8,
+    # the app's default), which the boot gate only lets through for models
+    # whose policy supports it.
+    paged = (os.environ.get("MTPLX_PAGED_KV_QUANT") or "").strip().lower()
+    return paged == "q8"
 
 
 def _quantize_kv_rows(x: mx.array) -> tuple[mx.array, mx.array]:
@@ -5863,11 +5872,11 @@ class Attention(nn.Module):
                 )
 
             def _qsa_rows_supported() -> bool:
-                if not _qsa_prefill_rows_mma_enabled():
+                kv = cache.kv
+                if not _qsa_prefill_rows_mma_enabled(isinstance(kv, QSAKVCacheQ8)):
                     return False
                 if not _qsa_prefill_direct_attention_enabled(S, T):
                     return False
-                kv = cache.kv
                 if isinstance(kv, QSAKVCacheQ8):
                     from mtplx.kernels.qsa_rows_mma import supported_q8
 

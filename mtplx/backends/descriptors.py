@@ -477,7 +477,10 @@ QWEN4_EXP_DRAFT_SEMANTICS = DraftSemantics(
 # 2-pass q8 kernel, F29 routing, graphbank promotion) is wired to the
 # qwen3_next SDPA call sites. This family's 12 QSA layers run hand-rolled
 # attention (pooled-score indexer + dense mask / rows-gather) over a plain
-# KVCache the paged installer never converts, so a q8/q4 request would be
+# KVCache the paged installer never converts; q8 is served by the model's own
+# int8 QSA KV (mtplx.models.qwen4_exp.QSAKVCacheQ8: int8 K/V + a float16 scale
+# per head and token, paired-NLL and memory receipts in the m1.18 notes); q4 is
+# not offered, and the boot gate downgrades it to off. (Earlier note: a q8/q4 request would be
 # silently inert — the boot gate downgrades it to off. The hybrid design
 # also keeps KV small by construction: 12 of 48 layers x 2 KV heads x 256
 # head_dim = ~24 KB/token (~2.4 GB bf16 at 100k). A quantized QSA lane
@@ -485,11 +488,9 @@ QWEN4_EXP_DRAFT_SEMANTICS = DraftSemantics(
 # candidate; until it carries parity + memory receipts the policy stays
 # unsupported with an architecture-truth reason instead of the generic one.
 QWEN4_EXP_KV_QUANT_POLICY = KVQuantPolicy(
-    supported=False,
-    disabled_reason=(
-        "Flash-Next keeps KV on 12 of 48 layers (~24 KB/token), and its QSA "
-        "attention has no validated quantized-cache lane yet."
-    ),
+    supported=True,
+    modes=("off", "q8"),
+    proof_level="paired_nll_and_memory",
 )
 QWEN3_8_REASONING_CODEC = ReasoningCodec(
     parser="qwen3",
