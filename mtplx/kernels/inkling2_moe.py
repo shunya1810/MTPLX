@@ -442,3 +442,79 @@ def moe_mxfp8(x2, gate_up, down, experts, route_w, *, gate_softcap: float, up_so
     h = mxfp8_mid(x2, gate_up["weight"], gate_up["scales"], experts,
                   gate_softcap=gate_softcap, up_softcap=up_softcap)
     return mxfp8_down(h, down["weight"], down["scales"], experts, route_w, int(x2.shape[0]))
+
+
+# --------------------------------------------------------------------------
+# Prefill widths (sorted gather_qmm): the glue around the two matmuls in two
+# kernels. gather_scale_rows: xs[p] = x[tok[p]] * f[p] (the outer expert scale
+# times the fp16 shift); combine_rows: y[t] = sum_k w[t, k] * o[inv[t K + k]].
+
+_GATHER_SRC = r"""
+    const uint i = thread_position_in_grid.x;      // over P * D / 4
+    constexpr uint D4 = D / 4;
+    const uint p = i / D4, c = i % D4;
+    const float4 v = float4(((const device vec<T, 4>*)(x + (ulong)tok[p] * D))[c]);
+    ((device vec<T, 4>*)(out + (ulong)p * D))[c] = vec<T, 4>(v * f[p]);
+"""
+
+_COMBINE_SRC = r"""
+    const uint i = thread_position_in_grid.x;      // over T * D / 4
+    constexpr uint D4 = D / 4;
+    const uint t = i / D4, c = i % D4;
+    float4 acc = float4(0.0f);
+    for (uint k = 0; k < (uint)K; ++k) {
+        const uint r = inv[t * K + k];
+        acc += w[t * K + k] * float4(((const device vec<T, 4>*)(o + (ulong)r * D))[c]);
+    }
+    ((device vec<T, 4>*)(y + (ulong)t * D))[c] = vec<T, 4>(acc);
+"""
+
+
+@lru_cache(maxsize=None)
+def _gather_kernel():
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling2_moe_gather_scale",
+        input_names=["x", "tok", "f"],
+        output_names=["out"],
+        source=_GATHER_SRC,
+    )
+
+
+@lru_cache(maxsize=None)
+def _combine_kernel():
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling2_moe_combine",
+        input_names=["o", "inv", "w"],
+        output_names=["y"],
+        source=_COMBINE_SRC,
+    )
+
+
+def gather_scale_rows(x2, tok, f):
+    """x2 [T, D]; tok uint32 [P]; f float32 [P] -> [P, D] in x2's dtype."""
+    P, D = int(tok.shape[0]), int(x2.shape[1])
+    (out,) = _gather_kernel()(
+        inputs=[x2, tok, f],
+        template=[("T", x2.dtype), ("D", D)],
+        grid=(P * D // 4, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(P, D)],
+        output_dtypes=[x2.dtype],
+    )
+    return out
+
+
+def combine_rows(o, inv, w, topk: int):
+    """o [P, D]; inv uint32 [T * topk] (row of o for each (t, k)); w float32
+    [T * topk] -> y [T, D] = sum_k w * o[inv]."""
+    TK, D = int(inv.shape[0]), int(o.shape[-1])
+    T = TK // topk
+    (y,) = _combine_kernel()(
+        inputs=[o, inv, w],
+        template=[("T", o.dtype), ("D", D), ("K", topk)],
+        grid=(T * D // 4, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(T, D)],
+        output_dtypes=[o.dtype],
+    )
+    return y

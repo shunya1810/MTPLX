@@ -93,6 +93,7 @@ _DECODE_COMPILE = (os.environ.get("MTPLX_INKLING2_DECODE_COMPILE") or "1").strip
 # 8, a 4-row verify 32); 0 keeps gather_qmm everywhere.
 _FUSED_MOE_MAX_PAIRS = _env_int("MTPLX_INKLING2_FUSED_MOE_PAIRS", 64)
 _FUSED_FP8 = _env_int("MTPLX_INKLING2_FUSED_FP8", 1) == 1
+_PREFILL_MOE = _env_int("MTPLX_INKLING2_PREFILL_MOE", 1) == 1
 
 
 # One-token kernels (kernels/inkling2_decode.py): fused message gates and the
@@ -195,6 +196,20 @@ def _softcapped_swiglu(
     gate_capped = mx.tanh(gate / gate_softcap) * gate_softcap
     up_capped = mx.tanh(up / up_softcap) * up_softcap
     return (gate_capped * mx.sigmoid(gate) * up_capped).astype(input_dtype)
+
+
+@partial(mx.compile, shapeless=True)
+def _swiglu_rescale(
+    gate: mx.array, up: mx.array, unshift: mx.array, factor: mx.array,
+    gate_softcap: float, up_softcap: float,
+) -> mx.array:
+    """gate / up (strided views of the interleaved rows) carry the fp16 shift
+    (unshift undoes it); the result is pre-multiplied by the down factor."""
+    g = gate.astype(mx.float32) * unshift
+    u = up.astype(mx.float32) * unshift
+    g_c = mx.tanh(g / gate_softcap) * gate_softcap
+    u_c = mx.tanh(u / up_softcap) * up_softcap
+    return (g_c * mx.sigmoid(g) * u_c * factor).astype(gate.dtype)
 
 
 class L2Clip(nn.Module):
@@ -1022,10 +1037,70 @@ class SparseMoeBlock(nn.Module):
                 up_softcap=act.up_softcap,
             )
             return y.reshape(hidden_states.shape)
+        if self._prefill_ok(selected_experts.size, hidden_states.dtype):
+            return self._prefill_moe(hidden_states, selected_experts, routing_weights)
         expert_states = self.experts(hidden_states, selected_experts)
         expert_states = expert_states.astype(mx.float32) * routing_weights[..., None]
         final_hidden_states = expert_states.sum(axis=-2)
         return final_hidden_states.astype(hidden_states.dtype)
+
+    def _prefill_ok(self, num_pairs: int, dtype) -> bool:
+        experts = self.experts
+        gu, dn = experts.gate_up_proj, experts.down_proj
+        if not (
+            _PREFILL_MOE
+            and dtype == mx.float16
+            and num_pairs >= 64
+            and isinstance(gu, ExpertLinear)
+            and isinstance(dn, ExpertLinear)
+            and gu.mode == dn.mode
+            and _use_kernels()
+        ):
+            return False
+        scaled = "expert_scale" in gu and "expert_scale" in dn
+        if scaled:
+            return _EXPERT_ACT == "scaled"
+        return "expert_scale" not in gu and "expert_scale" not in dn
+
+    def _prefill_moe(self, hidden_states, selected_experts, routing_weights):
+        """Sorted gather_qmm pair with the glue in three kernels: gather +
+        outer scale, SwiGLU + unshift + down scale, unsort + weights + sum."""
+        from ..kernels.inkling2_moe import combine_rows, gather_scale_rows
+
+        experts = self.experts
+        gu, dn = experts.gate_up_proj, experts.down_proj
+        act = experts.act_fn
+        dims = hidden_states.shape[-1]
+        topk = selected_experts.shape[-1]
+        x2 = hidden_states.reshape(-1, dims)
+        flat = selected_experts.reshape(-1)
+        order = mx.argsort(flat)
+        idx = flat[order]
+        tok = (order // topk).astype(mx.uint32)
+        inv = mx.argsort(order).astype(mx.uint32)
+        if "expert_scale" in gu:
+            shift = _EXPERT_SCALE_SHIFT
+            f_gu = gu["expert_scale"][idx] * shift
+            f_dn = dn["expert_scale"][idx] * shift
+        else:
+            shift = 1.0
+            f_gu = mx.ones(idx.shape, mx.float32)
+            f_dn = None
+        xs = gather_scale_rows(x2, tok, f_gu)
+        g = mx.gather_qmm(
+            xs[:, None, :], gu["weight"], gu["scales"], None, rhs_indices=idx, transpose=True,
+            group_size=gu.group_size, bits=gu.bits, mode=gu.mode, sorted_indices=True,
+        )
+        unshift = mx.array(1.0 / shift, mx.float32)
+        factor = f_dn[:, None, None] if f_dn is not None else mx.array(1.0, mx.float32)
+        h = _swiglu_rescale(g[..., 0::2], g[..., 1::2], unshift, factor, act.gate_softcap, act.up_softcap)
+        o = mx.gather_qmm(
+            h, dn["weight"], dn["scales"], None, rhs_indices=idx, transpose=True,
+            group_size=dn.group_size, bits=dn.bits, mode=dn.mode, sorted_indices=True,
+        )
+        w = routing_weights.reshape(-1).astype(mx.float32) * (1.0 / shift)
+        y = combine_rows(o.reshape(-1, dims), inv, w, topk)
+        return y.reshape(hidden_states.shape)
 
 
 # --------------------------------------------------------------------------

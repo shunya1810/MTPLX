@@ -259,6 +259,26 @@ class TestInkling2Loop(unittest.TestCase):
         err = mx.abs(fused.astype(mx.float32) - gathered.astype(mx.float32)).max().item()
         self.assertLess(err, 0.02 * max(scale, 1.0))
 
+    def test_prefill_moe_glue_matches_reference(self):
+        model = _model(5)
+        ckpt, _ = _checkpoint(model)
+        loaded = self._load(ckpt)
+        for layer in (1, 7):  # nvfp4 with outer scale, mxfp8
+            mlp = loaded.model.language_model.layers[layer].mlp
+            x = (mx.random.normal((1, 40, 64)) * 2).astype(mx.float16)
+            self.assertTrue(mlp._prefill_ok(40 * 2, mx.float16))
+            new = mlp(x)
+            old = ink._PREFILL_MOE
+            ink._PREFILL_MOE = False
+            try:
+                ref = mlp(x)
+            finally:
+                ink._PREFILL_MOE = old
+            self.assertEqual(new.dtype, mx.float16)
+            scale = mx.abs(ref.astype(mx.float32)).max().item()
+            err = mx.abs(new.astype(mx.float32) - ref.astype(mx.float32)).max().item()
+            self.assertLess(err, 0.01 * max(scale, 1.0), f"layer {layer}")
+
 
 if __name__ == "__main__":
     unittest.main()
