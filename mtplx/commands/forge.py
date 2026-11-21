@@ -45,6 +45,7 @@ SOURCE_COMPRESSED_TENSORS_AWQ = "compressed_tensors_awq"
 SOURCE_COMPRESSED_TENSORS_NVFP4 = "compressed_tensors_nvfp4"
 SOURCE_GEMMA4_ASSISTANT_PAIR = "gemma4_assistant_pair"
 SOURCE_HF_VLLM = "hf_vllm"
+SOURCE_INKLING2_OFFICIAL = "inkling2_official"
 SOURCE_UNKNOWN = "unknown"
 
 SUPPORTED_SOURCE_FORMATS = {
@@ -56,6 +57,7 @@ SUPPORTED_SOURCE_FORMATS = {
     SOURCE_COMPRESSED_TENSORS_NVFP4,
     SOURCE_GEMMA4_ASSISTANT_PAIR,
     SOURCE_HF_VLLM,
+    SOURCE_INKLING2_OFFICIAL,
     SOURCE_UNKNOWN,
 }
 UNSUPPORTED_MTP_SOURCE_FORMATS = {
@@ -855,7 +857,14 @@ def probe_source(source: str) -> dict[str, Any]:
         SOURCE_COMPRESSED_TENSORS_NVFP4: "Compressed-tensors NVFP4 MTP source detected; Forge will convert FP4 weights to MLX affine and verify.",
         SOURCE_HF_VLLM: "HF/vLLM-compatible MTP source detected; Forge will attempt MLX conversion.",
         SOURCE_UNKNOWN: "MTP source detected but format is unfamiliar; Forge will attempt the conservative path.",
+        SOURCE_INKLING2_OFFICIAL: (
+            "Inkling 2 checkpoint (official NVFP4/MXFP8) detected; it loads as shipped, so Forge "
+            "skips conversion, verifies it autoregressive and brands an AR-only pack (its DSpark "
+            "drafter is not attached yet)."
+        ),
     }
+    if str(compatibility_fields.get("recommended_backend") or "") == "inkling2_ar":
+        source_format = SOURCE_INKLING2_OFFICIAL
     return {
         "verdict": "forgeable",
         "forgeable": True,
@@ -1130,6 +1139,17 @@ def _cmd_build(args: Any, *, model_root: str | Path | None = None) -> int:
         branded_name,
         model_root=resolved_model_root,
     )
+    if str(probe.get("recommended_backend") or "") == INKLING2_AR_BACKEND:
+        return _build_inkling2_ar(
+            args,
+            run,
+            source_path=source_path,
+            destination=destination,
+            branded_name=branded_name,
+            source_repo=source_repo or args.repo,
+            source_sha=source_sha or str(probe.get("source_sha") or ""),
+            recipe=recipe,
+        )
     source_format = str(probe.get("source_format") or SOURCE_UNKNOWN)
     _err(f"[forge] source format: {source_format}")
     if source_format in {SOURCE_MLX_AFFINE, SOURCE_MLX_AFFINE_WITH_MTP} or probe.get("already_mtplx"):
@@ -1331,6 +1351,140 @@ def _cmd_build(args: Any, *, model_root: str | Path | None = None) -> int:
         _json_out({"local_path": str(destination), "runtime_metadata": runtime_metadata})
     return 0
 
+
+
+# Inkling 2 Mini: the in-tree inkling2_loop trunk loads the official NVFP4 /
+# MXFP8 checkpoint as it ships, and its mtp.safetensors is a DSpark block
+# drafter this build does not attach. So there is nothing to convert and no
+# MTP contract to calibrate: the lane mirrors the source, verifies it serves
+# (a short greedy AR run through the runtime, finite and non-empty answers),
+# and stamps an AR-only runtime contract the app lists like any forged pack.
+INKLING2_AR_BACKEND = "inkling2_ar"
+_INKLING2_VERIFY_PROMPTS = (
+    "What is the capital of France? Answer in one word.",
+    "日本で一番高い山は？一言で答えて。",
+    "Write a Python one-liner that reverses a string s.",
+)
+
+
+def _verify_inkling2_ar(destination: Path, *, max_tokens: int) -> list[dict[str, Any]]:
+    from mtplx.generation import SamplerConfig, generate_ar
+    from mtplx.runtime import load
+
+    rt = load(destination, mtp=False)
+    texts: list[str] = []
+    tok_s: list[float] = []
+    finish: dict[str, int] = {}
+    started = time.perf_counter()
+    for prompt in _INKLING2_VERIFY_PROMPTS:
+        ids = rt.tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=True,
+            reasoning_effort="low",
+        )
+        out = generate_ar(
+            rt,
+            list(ids),
+            max_tokens=max_tokens,
+            sampler=SamplerConfig(temperature=0.0),
+        )
+        texts.append(str(out.text or ""))
+        raw_stats = getattr(out, "stats", None)
+        stats = raw_stats.to_dict() if hasattr(raw_stats, "to_dict") else (raw_stats if isinstance(raw_stats, dict) else {})
+        rate = _as_float(stats.get("decode_tok_s") or stats.get("tok_s"))
+        if rate:
+            tok_s.append(rate)
+        reason = str(out.finish_reason or "unknown")
+        finish[reason] = finish.get(reason, 0) + 1
+    quality_passed = all(t.strip() for t in texts)
+    return [
+        {
+            "depth": 0,
+            "tok_s": (sum(tok_s) / len(tok_s)) if tok_s else 0.0,
+            "multiplier_vs_ar": 1.0,
+            "acceptance_by_position": [],
+            "verify_time_s": time.perf_counter() - started,
+            "quality_passed": quality_passed,
+            "finish_reasons": finish,
+            "answers": [t[-200:] for t in texts],
+        }
+    ]
+
+
+def _build_inkling2_ar(
+    args: Any,
+    run: Path,
+    *,
+    source_path: Path,
+    destination: Path,
+    branded_name: str,
+    source_repo: str,
+    source_sha: str,
+    recipe: dict[str, Any],
+) -> int:
+    from mtplx.backends.descriptors import INKLING2_AR_DESCRIPTOR
+
+    _err("[forge] Inkling 2 (in-tree inkling2_loop): official weights load as shipped; no conversion, AR-only")
+    _mirror_model_tree(source_path, destination)
+    _write_progress(run, "convert", progress=1.0, label="in_tree_as_shipped", finished=True)
+    _write_progress(run, "calibrate", progress=1.0, label="ar_only_no_mtp_contract", finished=True)
+    if _cancel_requested(args.run_id):
+        raise ForgeError("forge cancelled", code=130)
+    rows = _verify_inkling2_ar(destination, max_tokens=min(_forge_verify_max_tokens(args), 512))
+    _write_verify(run, rows)
+    if not rows or not rows[0].get("quality_passed"):
+        outcome = _build_outcome_payload(
+            destination,
+            rows=rows,
+            verdict="verification_failed",
+            failure_reasons=["empty_answer"],
+            phase="verify",
+            architecture_id="inkling2-loop-ar",
+        )
+        _write_build_outcome(run, outcome)
+        raise ForgeError("Inkling 2 verification produced an empty answer")
+    source_repo, source_sha = _resolve_source_identity(source_repo, source_sha)
+    runtime_metadata = {
+        "mtplx_version": __version__,
+        "arch_id": "inkling2-loop-ar",
+        "model_family": "inkling2",
+        "backend_id": INKLING2_AR_BACKEND,
+        "served_model_id": branded_name,
+        "ar_only": True,
+        "mtp_depth_max": 0,
+        "recommended_profile": "sustained",
+        "sampler": INKLING2_AR_DESCRIPTOR.sampler_defaults.to_dict(),
+        "reasoning": INKLING2_AR_DESCRIPTOR.reasoning_codec.to_dict(),
+        "verified_on": {
+            "timestamp": _now_iso(),
+            "hardware": platform.platform(),
+            "machine_arch": platform.machine(),
+            "macos": platform.mac_ver()[0],
+            "model": branded_name,
+        },
+        "verification": {"mode": "full-load", "status": "verified", "full_load_verified": True, "lane": "ar_only"},
+        "speed_evidence": {"ar_tok_s": rows[0].get("tok_s"), "verdict": "ar_only"},
+        "exactness_baseline": {},
+        "mtp_sidecar": "dspark-block-drafter (not attached)",
+        "base_trunk": source_repo,
+        "artifact_role": "forge-local",
+        "forge_provenance": {
+            "source_repo": source_repo,
+            "source_sha": source_sha or None,
+            "source_format": "inkling2_official",
+            "forge_recipe": recipe,
+            "forged_at": _now_iso(),
+            "mtplx_version": __version__,
+            "forged_locally": True,
+        },
+    }
+    atomic_write_json(destination / "mtplx_runtime.json", runtime_metadata)
+    _write_brand(run, branded_name, runtime_metadata)
+    _write_forge(run, destination, runtime_metadata)
+    _err(f"[forge] Inkling 2 AR-only pack ready: {destination} (AR {rows[0].get('tok_s') or 0:.1f} tok/s)")
+    if bool(getattr(args, "json", False)):
+        _json_out({"local_path": str(destination), "runtime_metadata": runtime_metadata})
+    return 0
 
 def _already_downloaded_source(
     repo_id: str, *, model_root: str | Path | None = None
