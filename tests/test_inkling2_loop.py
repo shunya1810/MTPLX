@@ -405,5 +405,24 @@ class TestInkling2Loop(unittest.TestCase):
             self.assertLess(err, tol, f"half={half}")
 
 
+    def test_session_restore_without_meta_state(self):
+        """The server's bank restore (a cache factory, restore_meta_state
+        False) keeps the sliding windows' offsets: the restored cache decodes
+        as the original."""
+        from mtplx import cache_state
+
+        model = _model(14)
+        prompt = mx.array([[5, 9, 17, 3, 44, 2, 101, 7, 19, 23, 4, 8, 15, 16, 42, 99]])
+        cache = model.make_cache()
+        model(prompt, cache=cache)
+        snap = cache_state.snapshot_cache_lazy_hybrid(cache)
+        fresh = model.make_cache()
+        cache_state.restore_cache(fresh, snap, restore_meta_state=False, clone_states=False)
+        self.assertEqual([c[0].offset for c in fresh], [c[0].offset for c in cache])
+        got = model(mx.array([[61]]), cache=fresh)
+        ref = model(mx.array([[61]]), cache=cache)
+        self.assertEqual(mx.abs(got - ref).max().item(), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

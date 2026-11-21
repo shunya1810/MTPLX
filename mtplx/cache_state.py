@@ -6087,7 +6087,12 @@ def restore_cache(
             else:
                 install_view = not clone_states and _is_trimmable(entry)
                 _restore_state_preserving_container(entry, state, clone=not install_view)
-        if restore_meta_state and meta_state is not None:
+        if meta_state is not None and (
+            restore_meta_state or getattr(entry, "mtplx_restore_meta_state", False)
+        ):
+            # A cache whose offsets live only in its meta state (Inkling 2's
+            # sliding windows: RotatingKVCache's state setter keeps offset and
+            # ring index at 0) takes it whatever the caller's layout says.
             entry.meta_state = _clone_tree(meta_state)
 
 

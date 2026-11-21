@@ -1886,6 +1886,13 @@ class InklingVisitCache(CacheList):
     """
 
     mtplx_boundary_checkpoints = False
+    # The sliding windows' offset and ring index are only in the meta state
+    # (RotatingKVCache's state setter leaves both at 0). The server's bank
+    # restores into a factory-built cache without meta states
+    # (``restore_meta_state=cache_factory is None``), which restarted every
+    # window at position 0 after a restore; mtplx.cache_state.restore_cache
+    # restores it for caches that set this.
+    mtplx_restore_meta_state = True
 
 
 class Model(nn.Module):
