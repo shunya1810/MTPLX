@@ -26,3 +26,35 @@
 - agent 用の既定 effort を medium にするかどうか（high では思考が長すぎる）。
 - server の committed-reasoning が ChatML 前提のため、Inkling では前ターンの思考が履歴に残らない。postcommit が retokenized_history_mismatch になる（性能だけの問題）。
 - 未実施：日本語の複数ターン、needle 32K/64K の battery（t7_chat_battery.py は削除されたので作り直しが必要）。
+
+## 会話テスト（server、forge 済み pack、sampling は既定の 1.0）
+
+- 日本語の 3 ターン（京都の紅葉）：
+  - 自然な日本語で、prefix cache も効いていた（cached 1088 → 1803）。decode は約 27 tok/s。
+  - ただし行き方の説明は曖昧だった。model card のとおり、知識系は弱い。
+- effort low / medium / high / xhigh：
+  - すべて正解（バットとボール）。
+  - 思考は 92 / 198 / 198 / 238 トークン。
+- `enable_thinking: false`：思考は非表示になり、本文は「Bonjour」。template の都合で、内部では思考している。
+- max_tokens=64 で思考の途中に打ち切ると、finish は length で、本文は空。
+- needle：
+
+  | 文脈 | 結果 | prefill | TTFT | decode |
+  |---|---|---|---|---|
+  | 32K | 正解 | 313 tok/s | 102 s | 25.6 tok/s |
+  | 64K | 正解 | 274 tok/s | 233 s | 22.8 tok/s |
+
+  prefill の中止は 0 回。
+
+## forge とアプリ（ba755150）
+
+- forge は MTP contract の校正を必須にしていたため、Inkling（DSpark drafter）は calibrate で失敗していた。そこで AR-only の lane を作った：
+  - 変換しない
+  - hardlink でミラーする
+  - AR で 3 問を検証する
+  - AR-only として `mtplx_runtime.json` に書き込む
+- アプリで使えない理由：
+  1. アプリの runtime（MTPLX-app）は、起動のたびに origin/m1max-longctx（m1.18）へ更新されるので、Inkling 対応が入っていない。
+  2. アプリのモデル一覧は `~/.mtplx/models` と「設定 → フォルダを追加」で登録したフォルダしか見ない。Flash-Next（`setup_flashnext_unsloth.py` の既定は `~/models`）も、同じ理由で一覧に出なかった。
+- アプリと同じ起動形（`--depth 1`、q8 KV、SSD cache on、256K）でも、このブランチなら動く。MTP は AR に、q8 は off に自動で切り替わる。
+- `mtplx tune` は unsupported_tune_model を返す（tune_policy が非対応）。そのため、アプリの自動チューニングは走らない想定。
