@@ -198,3 +198,138 @@ def conv_step(x: mx.array, state: mx.array, weight: mx.array) -> tuple[mx.array,
         output_dtypes=[x.dtype, mx.float32],
     )
     return out.reshape(x.shape), new_state.reshape(1, 3, C)
+
+
+# --------------------------------------------------------------------------
+# Attention prologue (one token): everything between the projections and the
+# KV cache in one kernel.
+#   q: scaled L2 clip, then the log-scaling tau          -> (HQ, D)
+#   k: [short conv step] then L2 clip                     -> (HKV, D)
+#   v: [short conv step] then unweighted RMS norm         -> (HKV, D)
+#   r: scaled L2 clip, tau, then r @ rel_proj             -> bias (HQ, R)
+# Threadgroups (128 threads): [0, HQ) q heads, [HQ, HQ+HKV) k heads,
+# [HQ+HKV, HQ+2HKV) v heads, then HQ bias rows. params = (qk_th, rel_th,
+# eps, tau). Rounds where the MLX reference rounds (each op returns the
+# input dtype T).
+
+_PREP_SRC = r"""
+    constexpr float RSQ5 = 0.4472135954999579f;
+    const uint tg = threadgroup_position_in_grid.x;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint lane = tid % 32, sg = tid / 32;
+    threadgroup float red[4];
+    const float qk_th = params[0], rel_th = params[1], eps = params[2], tau = params[3];
+    auto tg_sum = [&](float v) -> float {
+        v = simd_sum(v);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0) red[sg] = v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        return red[0] + red[1] + red[2] + red[3];
+    };
+    if (tg < (uint)HQ) {
+        const uint h = tg, d = tid;               // D == 128 == threads
+        const float s = (float)q[h * D + d] * (float)qscale[h * D + d];
+        const float n = metal::precise::sqrt(tg_sum(s * s));
+        float o = (float)(T)(s * metal::min(qk_th / (n + 1e-6f), 1.0f));
+        if (TAU) o = (float)(T)(o * tau);
+        q_out[h * D + d] = (T)o;
+    } else if (tg < (uint)(HQ + HKV)) {
+        const uint h = tg - HQ, d = tid, c = h * D + d;
+        float x = (float)k[c];
+        if (CONV) {
+            float win[4];
+            for (int j = 0; j < 3; ++j) win[j] = kstate[(ulong)j * (HKV * D) + c];
+            win[3] = x;
+            float acc = 0.0f;
+            for (int j = 0; j < 4; ++j) acc += (float)kw[(ulong)c * 4 + j] * (float)(T)win[j];
+            x = (float)(T)(((float)(T)acc + win[3]) * RSQ5);
+            for (int j = 0; j < 3; ++j) kstate_new[(ulong)j * (HKV * D) + c] = win[j + 1];
+        }
+        const float n = metal::precise::sqrt(tg_sum(x * x));
+        k_out[c] = (T)(x * metal::min(qk_th / (n + 1e-6f), 1.0f));
+    } else if (tg < (uint)(HQ + 2 * HKV)) {
+        const uint h = tg - HQ - HKV, d = tid, c = h * D + d;
+        float x = (float)v[c];
+        if (CONV) {
+            float win[4];
+            for (int j = 0; j < 3; ++j) win[j] = vstate[(ulong)j * (HKV * D) + c];
+            win[3] = x;
+            float acc = 0.0f;
+            for (int j = 0; j < 4; ++j) acc += (float)vw[(ulong)c * 4 + j] * (float)(T)win[j];
+            x = (float)(T)(((float)(T)acc + win[3]) * RSQ5);
+            for (int j = 0; j < 3; ++j) vstate_new[(ulong)j * (HKV * D) + c] = win[j + 1];
+        }
+        const float ms = tg_sum(x * x) / (float)D;
+        v_out[c] = (T)(x * metal::precise::rsqrt(ms + eps));
+    } else {
+        const uint h = tg - HQ - 2 * HKV;
+        // clipped relative row (DR = 16 values), every thread keeps a copy
+        float rr[DR];
+        float ss = 0.0f;
+        for (int i = 0; i < DR; ++i) {
+            rr[i] = (float)r[h * DR + i] * (float)rscale[h * DR + i];
+            ss += rr[i] * rr[i];
+        }
+        const float f = metal::min(rel_th / (metal::precise::sqrt(ss) + 1e-6f), 1.0f);
+        for (int i = 0; i < DR; ++i) {
+            float o = (float)(T)(rr[i] * f);
+            if (TAU) o = (float)(T)(o * tau);
+            rr[i] = o;
+        }
+        for (uint j = tid; j < (uint)R; j += 128) {
+            float acc = 0.0f;
+            for (int i = 0; i < DR; ++i) acc += rr[i] * (float)relp[(ulong)i * R + j];
+            pb[(ulong)h * R + j] = (T)acc;
+        }
+    }
+"""
+
+
+@lru_cache(maxsize=None)
+def _prep_kernel():
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling2_attn_prep",
+        input_names=["q", "k", "v", "r", "qscale", "rscale", "relp", "params", "kstate", "vstate", "kw", "vw"],
+        output_names=["q_out", "k_out", "v_out", "pb", "kstate_new", "vstate_new"],
+        source=_PREP_SRC,
+    )
+
+
+def attn_prep(
+    q, k, v, r, *, qscale, rscale, relp, qk_th, rel_th, eps, tau=None,
+    kstate=None, vstate=None, kw=None, vw=None,
+):
+    """One token. q (HQ*D,), k / v (HKV*D,), r (HQ*DR,) in dtype T; qscale
+    (HQ, D), rscale (HQ, DR), relp (DR, R). With kstate/vstate/kw/vw the k/v
+    short conv step runs first (sliding layers). Returns q (HQ, D), k (HKV, D),
+    v (HKV, D), bias (HQ, R), and the new conv states (or None)."""
+    HQ, D = int(qscale.shape[0]), int(qscale.shape[1])
+    DR, R = int(relp.shape[0]), int(relp.shape[1])
+    HKV = int(k.size) // D
+    if D != 128:
+        raise ValueError("attn_prep expects head_dim 128")
+    T = q.dtype
+    conv = kstate is not None
+    tau_v = 1.0 if tau is None else tau
+    params = mx.array([qk_th, rel_th, eps, 0.0], dtype=mx.float32)
+    if tau is not None:
+        params = mx.concatenate([params[:3], mx.reshape(mx.array(tau_v, mx.float32) if not isinstance(tau_v, mx.array) else tau_v.astype(mx.float32), (1,))])
+    dummy = mx.zeros((1,), mx.float32)
+    dummy_w = mx.zeros((1,), T)
+    outs = _prep_kernel()(
+        inputs=[
+            q.reshape(-1), k.reshape(-1), v.reshape(-1), r.reshape(-1), qscale, rscale, relp, params,
+            kstate.reshape(-1) if conv else dummy,
+            vstate.reshape(-1) if conv else dummy,
+            kw.reshape(-1) if conv else dummy_w,
+            vw.reshape(-1) if conv else dummy_w,
+        ],
+        template=[("T", T), ("HQ", HQ), ("HKV", HKV), ("D", D), ("DR", DR), ("R", R),
+                  ("CONV", int(conv)), ("TAU", int(tau is not None))],
+        grid=((2 * HQ + 2 * HKV) * 128, 1, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(HQ, D), (HKV, D), (HKV, D), (HQ, R), (3, HKV * D) if conv else (1,), (3, HKV * D) if conv else (1,)],
+        output_dtypes=[T, T, T, T, mx.float32, mx.float32],
+    )
+    q_out, k_out, v_out, pb, ks, vs = outs
+    return q_out, k_out, v_out, pb, (ks if conv else None), (vs if conv else None)

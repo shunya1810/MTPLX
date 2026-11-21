@@ -562,6 +562,68 @@ class Attention(nn.Module):
         y = mx.quantized_matmul(x, W, S, Bi, transpose=True, group_size=_PROJ_GROUP_SIZE, bits=8)
         return mx.split(y, splits, axis=-1)
 
+    def _raw_projections(self, hq, hk, hv):
+        """q, r, gate, sinks, k, v straight from the projections (no conv)."""
+        parts = None
+        if hk is hq and hv is hq:
+            parts = self._project_fused(
+                hq, ("q_proj", "r_proj", "gate_proj", "sink_proj", "k_proj", "v_proj")
+            )
+        if parts is not None:
+            return tuple(parts)
+        parts = self._project_fused(hq, ("q_proj", "r_proj", "gate_proj", "sink_proj"))
+        if parts is not None:
+            q, r, gate, sinks = parts
+        else:
+            q, r = self.q_proj(hq), self.r_proj(hq)
+            gate, sinks = self.gate_proj(hq), self.sink_proj(hq)
+        return q, r, gate, sinks, self.k_proj(hk), self.v_proj(hv)
+
+    def _decode_prep_ok(self, hq) -> bool:
+        return (
+            _DECODE_KERNELS
+            and _use_kernels()
+            and hq.shape[0] == 1
+            and hq.shape[1] == 1
+            and self.head_dim == 128
+            and hq.dtype in (mx.float16, mx.bfloat16)
+        )
+
+    def _decode_prep(self, hq, hk, hv, conv_states, tau):
+        """One token: projections, then the prologue kernel (clips, conv,
+        norm, relative bias). Returns q, k, v (B, H, 1, D), bias, sinks, gate
+        and leaves the next conv states in conv_states."""
+        from ..kernels.inkling2_decode import attn_prep
+
+        q, r, gate, sinks, k_raw, v_raw = self._raw_projections(hq, hk, hv)
+        sliding = isinstance(self, SlidingAttention)
+        if sliding:
+            kw, vw = self.k_sconv.conv1d.weight, self.v_sconv.conv1d.weight
+            ks, vs = conv_states[0], conv_states[1]
+            k_in, v_in = k_raw, v_raw
+        else:
+            k_in, conv_states[0] = self.k_sconv(k_raw, hk, conv_states[0], None)
+            v_in, conv_states[1] = self.v_sconv(v_raw, hv, conv_states[1], None)
+            kw = vw = ks = vs = None
+        qo, ko, vo, pb, ks_new, vs_new = attn_prep(
+            q, k_in, v_in, r,
+            qscale=self.q_l2_clip.scale, rscale=self.rel_l2_clip.scale, relp=self.rel_logits_proj.proj,
+            qk_th=self.q_l2_clip.threshold, rel_th=self.rel_l2_clip.threshold, eps=self.eps, tau=tau,
+            kstate=ks, vstate=vs, kw=kw, vw=vw,
+        )
+        if sliding:
+            conv_states[0] = ks_new.reshape(1, 3, -1)
+            conv_states[1] = vs_new.reshape(1, 3, -1)
+        D = self.head_dim
+        return (
+            qo.reshape(1, self.num_heads, 1, D),
+            ko.reshape(1, self.num_key_value_heads, 1, D),
+            vo.reshape(1, self.num_key_value_heads, 1, D),
+            pb.reshape(1, 1, self.num_heads, -1),
+            sinks.reshape(1, 1, -1),
+            gate,
+        )
+
     def _finish(self, attn_output: mx.array, gate: mx.array) -> mx.array:
         B, L = gate.shape[:2]
         attn_output = attn_output.reshape(B, L, -1).astype(mx.float32)
@@ -1164,8 +1226,11 @@ class DecoderLayer(nn.Module):
                     attention_inputs = self.attention_input(bs, normed_residual)
                 hq, hk, hv = self._attn_inputs(h, attention_inputs, msg)
                 conv_states = [c0, c1]
-                q, k, v, r, gate, sinks = attn._project_all(hq, hk, hv, conv_states, None)
-                q, k, v, pb, sinks, gate = attn._prep(hq, q, k, v, r, tau, gate=gate, sinks=sinks)
+                if attn._decode_prep_ok(hq):
+                    q, k, v, pb, sinks, gate = attn._decode_prep(hq, hk, hv, conv_states, tau)
+                else:
+                    q, k, v, r, gate, sinks = attn._project_all(hq, hk, hv, conv_states, None)
+                    q, k, v, pb, sinks, gate = attn._prep(hq, q, k, v, r, tau, gate=gate, sinks=sinks)
                 return (
                     q,
                     k,
