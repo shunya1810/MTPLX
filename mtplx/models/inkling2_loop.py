@@ -67,11 +67,17 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-_EXPERT_WIDE_DTYPE = (
-    mx.float32
-    if (os.environ.get("MTPLX_INKLING2_EXPERT_ACT") or "").strip().lower() in {"f32", "float32"}
-    else mx.bfloat16
-)
+# float16 activations through NVFP4 experts: the raw product is the output
+# divided by the outer scale (4e-5..2.4e-4 in the official checkpoint), far
+# past float16's 65,504. "scaled" (default) folds outer scale x 2^8 into the
+# input per (token, expert) pair, runs the product in float16 and takes the
+# 2^8 back out (measured |gate_up| <= 21, |down| <= 31 over en/ja/code/agent
+# prefill, so the scaled output keeps 8x headroom); "bf16" / "f32" run the
+# product in a wider dtype instead (M1 Max, 2,048-token sorted gate_up:
+# float16 32.3 ms, bfloat16 45.1, float32 37.4).
+_EXPERT_ACT = (os.environ.get("MTPLX_INKLING2_EXPERT_ACT") or "scaled").strip().lower()
+_EXPERT_WIDE_DTYPE = mx.float32 if _EXPERT_ACT in {"f32", "float32"} else mx.bfloat16
+_EXPERT_SCALE_SHIFT = 256.0
 
 
 # Decode (one token per call) runs each layer visit as two compiled halves
@@ -674,11 +680,24 @@ class ExpertLinear(nn.Module):
 
     def __call__(self, x: mx.array, indices: mx.array, sorted_indices: bool = False) -> mx.array:
         out_dtype = x.dtype
-        if "expert_scale" in self and x.dtype == mx.float16:
-            # The raw NVFP4 product is the output divided by the outer scale
-            # (4e-5..2.4e-4 in the official checkpoint), far past float16's
-            # 65,504: the product runs in a wider dtype and only the scaled
-            # result returns to float16.
+        has_scale = "expert_scale" in self
+        if has_scale and x.dtype == mx.float16 and _EXPERT_ACT == "scaled":
+            factor = self["expert_scale"][indices].reshape(indices.shape + (1, 1))
+            x = (x.astype(mx.float32) * (factor * _EXPERT_SCALE_SHIFT)).astype(mx.float16)
+            out = mx.gather_qmm(
+                x,
+                self["weight"],
+                self["scales"],
+                None,
+                rhs_indices=indices,
+                transpose=True,
+                group_size=self.group_size,
+                bits=self.bits,
+                mode=self.mode,
+                sorted_indices=sorted_indices,
+            )
+            return out * mx.array(1.0 / _EXPERT_SCALE_SHIFT, mx.float16)
+        if has_scale and x.dtype == mx.float16:
             x = x.astype(_EXPERT_WIDE_DTYPE)
         out = mx.gather_qmm(
             x,
