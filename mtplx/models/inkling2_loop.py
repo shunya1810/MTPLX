@@ -106,6 +106,7 @@ _SMALL_ATTENTION = _env_int("MTPLX_INKLING2_SMALL_ATTENTION", 1) == 1
 _GROUPED_MOE_MAX_TOKENS = _env_int("MTPLX_INKLING2_GROUPED_MOE_TOKENS", 9)
 _SEG_GEMM = _env_int("MTPLX_INKLING2_SEG_GEMM", 1) == 1
 _STEEL_ATTENTION = _env_int("MTPLX_INKLING2_STEEL_ATTENTION", 1) == 1
+_GATE_COMPILE = _env_int("MTPLX_INKLING2_GATE_COMPILE", 1) == 1
 
 
 # One-token kernels (kernels/inkling2_decode.py): fused message gates and the
@@ -1217,6 +1218,21 @@ class MessageGate(nn.Module):
         self.message_gate_proj = nn.Linear(rank, dims, bias=False)
 
     def __call__(self, hidden_states: mx.array, message: mx.array) -> mx.array:
+        if _GATE_COMPILE and isinstance(self.down_proj, nn.Linear) and "bias" not in self.forget_gate_proj:
+            # wide (prefill) rows: the two rank -> D projections as one matmul,
+            # the norms / concat and the mix each one compiled kernel
+            w = self.__dict__.get("_fg_weight")
+            if w is None:
+                w = mx.concatenate(
+                    [self.forget_gate_proj.weight, self.message_gate_proj.weight], axis=0
+                ).T.astype(mx.float32)
+                mx.eval(w)
+                object.__setattr__(self, "_fg_weight", w)
+            states = _gate_in(hidden_states, message).astype(self.down_proj.weight.dtype)
+            states = self.down_proj(states).astype(mx.float32)
+            fg = states @ w
+            dims = hidden_states.shape[-1]
+            return _gate_mix(fg[..., :dims], fg[..., dims:], hidden_states, message)
         states = mx.concatenate(
             [unweighted_rms_norm(hidden_states), unweighted_rms_norm(message)],
             axis=-1,
@@ -1226,6 +1242,16 @@ class MessageGate(nn.Module):
         forget_gate = mx.tanh(self.forget_gate_proj(states))
         message_gate = mx.tanh(self.message_gate_proj(states))
         return (1 - forget_gate) * hidden_states + message_gate * message
+
+
+@partial(mx.compile, shapeless=True)
+def _gate_in(h: mx.array, m: mx.array) -> mx.array:
+    return mx.concatenate([unweighted_rms_norm(h), unweighted_rms_norm(m)], axis=-1)
+
+
+@partial(mx.compile, shapeless=True)
+def _gate_mix(f: mx.array, g: mx.array, h: mx.array, m: mx.array) -> mx.array:
+    return (1 - mx.tanh(f)) * h + mx.tanh(g) * m
 
 
 class MessageInput(nn.Module):
