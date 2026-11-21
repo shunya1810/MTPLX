@@ -6053,9 +6053,17 @@ def _gdn_boundary_tail_interval() -> int:
 
 
 def _cache_has_recurrent_entries(cache: list[Any] | None) -> bool:
+    """Whether cold prefills should record interior recurrent boundaries for
+    ``cache``: some entry cannot be trimmed back, and it does not declare
+    ``mtplx_boundary_checkpoints = False`` (an untrimmable cache whose
+    boundary records would clone far more than they save, e.g. Inkling 2's
+    per-visit KV + conv tails)."""
     from .cache_state import _is_trimmable
 
-    return any(not _is_trimmable(entry) for entry in (cache or []))
+    return any(
+        not _is_trimmable(entry) and getattr(entry, "mtplx_boundary_checkpoints", True)
+        for entry in (cache or [])
+    )
 
 
 def _sink_admits(sink: Any, position: int) -> bool:

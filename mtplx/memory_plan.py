@@ -135,7 +135,23 @@ def dense_kv_bytes_per_token_from_config(config: dict | None) -> int | None:
     text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
     layer_types = text.get("layer_types")
     n_full: int | None = None
-    if isinstance(layer_types, list) and layer_types:
+    local_ids = text.get("local_layer_ids")
+    if isinstance(local_ids, list) and isinstance(text.get("num_hidden_layers"), int):
+        # Sliding-window layers keep a fixed window, so only the global
+        # layers grow per token; a looped core (Inkling 2: layers
+        # core_start..core_end run num_passes times, each pass with its own
+        # cache) counts once per pass. Inkling 2 Mini: 8 global visits x 2 x
+        # 8 KV heads x 128 x 2 B = 32,768 B/token, not 24 layers' 98,304.
+        local = {int(i) for i in local_ids}
+        loop = text.get("loop_config") if isinstance(text.get("loop_config"), dict) else {}
+        core = range(int(loop.get("core_start", 0) or 0), int(loop.get("core_end", 0) or 0))
+        passes = max(1, int(loop.get("num_passes", 1) or 1))
+        n_full = sum(
+            passes if i in core else 1
+            for i in range(int(text["num_hidden_layers"]))
+            if i not in local
+        )
+    elif isinstance(layer_types, list) and layer_types:
         n_full = sum(1 for t in layer_types if t != "linear_attention")
     else:
         n_layers = text.get("num_hidden_layers")

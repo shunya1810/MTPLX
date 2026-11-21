@@ -1307,6 +1307,20 @@ _PROJ_SUFFIXES = (
 _PROJ_GROUP_SIZE = 64
 
 
+class InklingVisitCache(CacheList):
+    """One layer visit's caches: (KV, the four conv tails).
+
+    Not trimmable (the conv tails and a wrapped sliding window cannot step
+    back), so the session bank treats it like a recurrent state: exact-prefix
+    restores only. Unlike a GDN state it needs no interior prompt checkpoints
+    (``mtplx_boundary_checkpoints``): the generation lanes would otherwise
+    clone every visit's whole KV at each boundary (12.8 GB banked for a
+    5,330-token agent prompt, then the memory guard aborted 24K prefills).
+    """
+
+    mtplx_boundary_checkpoints = False
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -1478,7 +1492,7 @@ class Model(nn.Module):
     def make_cache(self) -> list:
         window = self.args.text.sliding_window_size
         return [
-            CacheList(
+            InklingVisitCache(
                 (
                     RotatingKVCache(max_size=window)
                     if isinstance(layer, SlidingDecoderLayer)
