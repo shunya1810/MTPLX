@@ -1263,7 +1263,8 @@ _DECLARED_MODULES_LOWERED = {
 # deliberately absent: its runnability is decided by the pinned-artifact
 # geometry/sidecar gate on its catalog row (supply-chain fence), never by
 # model_type alone.
-_INTREE_MODEL_TYPES = {"deepseek_v4", "qwen4_exp", "qwen4_exp_text", "inkling2_loop", "inkling2_loop_text"}
+_INKLING2_MODEL_TYPES = {"inkling2_loop", "inkling2_loop_text"}
+_INTREE_MODEL_TYPES = {"deepseek_v4", "qwen4_exp", "qwen4_exp_text", *_INKLING2_MODEL_TYPES}
 
 # Families whose catalog family_gate is an artifact-integrity fence (pinned
 # geometry + pinned sidecars). A gate failure here refuses outright and is
@@ -1509,6 +1510,30 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
     # refuse).
     native_path = _native_construction_path(inspection)
     constructable = native_path is not None and _passes_mlx_lm_ar_gate(inspection)
+    if constructable and _text(getattr(inspection, "model_type", None)) in _INKLING2_MODEL_TYPES:
+        # Inkling 2 Mini: in-tree looped trunk on its own AR lane (sampler,
+        # message-channel reasoning codec, native tool prompts). Its
+        # mtp.safetensors is a DSpark block drafter this build does not
+        # attach yet.
+        return CompatibilityVerdict(
+            tier=TIER_AR_ONLY,
+            arch_id="inkling2-loop-ar",
+            supported=False,
+            recognized=True,
+            can_run=True,
+            exit_code=EXIT_VERIFIED,
+            message=(
+                "Inkling 2 Mini recognized (in-tree inkling2_loop trunk). Its "
+                "DSpark block drafter is not attached yet -> mtp_off: serving "
+                f"autoregressive via {native_path}."
+            ),
+            recommended_backend="inkling2_ar",
+            recommended_profile=DEFAULT_PROFILE_NAME,
+            unverified_model=True,
+            mtp_supported="no",
+            runtime_compatibility="native-ar-only-mtp-unsupported",
+            support_level="trunk-ar-fallback",
+        )
     if _requires_remote_code(model_dir) and not (
         native_path is not None and _file_present(inspection, "tokenizer.json")
     ):

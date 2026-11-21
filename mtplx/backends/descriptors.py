@@ -518,6 +518,7 @@ REASONING_FAMILY_OVERRIDE_LANES: dict[str, frozenset[str]] = {
     "qwen3_8": frozenset({"qwen3_next"}),
     "qwen4_exp": frozenset({"qwen4_exp", "native_mtp"}),
     "lfm2": frozenset({"mlx_lm_ar"}),
+    "inkling2": frozenset({"inkling2_ar"}),
 }
 
 
@@ -584,6 +585,8 @@ def sampler_defaults_for_model(
         return QWEN3_8_SAMPLER_DEFAULTS
     if family == "qwen4_exp":
         return QWEN4_EXP_SAMPLER_DEFAULTS
+    if family == "inkling2":
+        return INKLING2_AR_DESCRIPTOR.sampler_defaults
     return resolved.sampler_defaults
 
 
@@ -755,6 +758,41 @@ MLX_LM_AR_LFM2_DESCRIPTOR = replace(
     required_tool_prompt_mode="native",
 )
 
+
+
+# Thinking Machines' Inkling 2 Mini (model_type inkling2_loop): the in-tree
+# looped MoE trunk, served target-only (its DSpark block drafter is not wired
+# yet). Output rides message channels, not think tags:
+# <|message_model|><|content_thinking|>..<|end_message|> is reasoning,
+# <|content_text|> the answer, <|content_invoke_tool_json|> a tool call; the
+# "inkling2" codec (mtplx/reasoning_codecs.py) maps them onto the think-tag /
+# <tool_call> grammar the stream and tool lanes already parse. The chat
+# template owns tool formatting and takes reasoning_effort as a level
+# (low 0.2, medium 0.7, high 0.9 - its default, xhigh 0.99).
+INKLING2_REASONING_CODEC = ReasoningCodec(
+    parser="inkling2",
+    display_name="Inkling 2 message channels",
+    default_mode="auto",
+    effort_levels=("low", "medium", "high", "xhigh"),
+    default_effort="high",
+)
+
+INKLING2_AR_DESCRIPTOR = replace(
+    MLX_LM_AR_DESCRIPTOR,
+    backend_id="inkling2_ar",
+    architecture_id="inkling2-loop-ar",
+    model_family="inkling2",
+    display_name="Inkling 2 looped MoE (target-only AR)",
+    # The model card's recommendation: temperature 1.0, no truncation.
+    sampler_defaults=SamplerDefaults(temperature=1.0, top_p=1.0, top_k=0),
+    reasoning_codec=INKLING2_REASONING_CODEC,
+    default_tool_prompt_mode="native",
+    required_tool_prompt_mode="native",
+    notes=(
+        "Inkling 2 Mini on the in-tree inkling2_loop trunk (official NVFP4/"
+        "MXFP8 checkpoint), autoregressive; DSpark drafting pending."
+    ),
+)
 
 NATIVE_CONTRACT_DESCRIPTOR = BackendDescriptor(
     backend_id="native_mtp",
@@ -1082,6 +1120,7 @@ DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     QWEN3_NEXT_DESCRIPTOR.backend_id: QWEN3_NEXT_DESCRIPTOR,
     LAGUNA_AR_DESCRIPTOR.backend_id: LAGUNA_AR_DESCRIPTOR,
     MLX_LM_AR_DESCRIPTOR.backend_id: MLX_LM_AR_DESCRIPTOR,
+    INKLING2_AR_DESCRIPTOR.backend_id: INKLING2_AR_DESCRIPTOR,
     NATIVE_CONTRACT_DESCRIPTOR.backend_id: NATIVE_CONTRACT_DESCRIPTOR,
     GEMMA4_ASSISTANT_DESCRIPTOR.backend_id: GEMMA4_ASSISTANT_DESCRIPTOR,
     STEP3P5_MTP_DESCRIPTOR.backend_id: STEP3P5_MTP_DESCRIPTOR,
@@ -1298,6 +1337,8 @@ def model_family_from_inspection(
         return "mimo"
     if "lfm2" in text:
         return "lfm2"
+    if backend_id == "inkling2_ar" or "inkling" in text:
+        return "inkling2"
     family = _explicit_qwen_family_marker(text)
     if family is not None:
         return family
@@ -1460,6 +1501,8 @@ def reasoning_policy_for_model(
         return LAGUNA_AR_DESCRIPTOR.reasoning_codec
     if family == "lfm2":
         return MLX_LM_AR_LFM2_DESCRIPTOR.reasoning_codec
+    if family == "inkling2":
+        return INKLING2_REASONING_CODEC
     return ReasoningCodec(
         parser="none",
         display_name="No verified reasoning parser",

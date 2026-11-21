@@ -207,6 +207,9 @@ from mtplx.fan_mode import (
     normalize_fan_mode,
 )
 from mtplx.reasoning_codecs import (
+    INKLING2_PARSERS,
+    Inkling2StreamSplitter,
+    inkling2_to_think_markup,
     QWEN_STYLE_REASONING_BLOCK_RE,
     QWEN_STYLE_REASONING_CLOSE_RE,
     QWEN_STYLE_REASONING_CONTROL_RE,
@@ -2615,6 +2618,15 @@ def _reasoning_parser_for_state(state: "ServerState") -> str:
     if parser:
         return str(parser)
     return _backend_descriptor(state).reasoning_codec.parser
+
+
+def _parser_view_text(state: "ServerState", text: str) -> str:
+    """The generated text in the grammar the parsing lanes read: the inkling2
+    codec transcodes Inkling 2 message channels onto think tags and
+    <tool_call> blocks; every other parser reads the text as generated."""
+    if _reasoning_parser_for_state(state) in INKLING2_PARSERS:
+        return inkling2_to_think_markup(text)
+    return text
 
 
 def _model_family_for_state(state: "ServerState") -> str:
@@ -15382,7 +15394,7 @@ def _maybe_canonicalize_committed_reasoning(
     except Exception:
         return None
     committed_turns = _committed_assistant_turns(
-        committed_text,
+        _parser_view_text(state, committed_text),
         gemma4=_reasoning_parser_for_state(state) == "gemma4",
     )
     if not any(interior for interior, _gate, _markup in committed_turns):
@@ -19630,10 +19642,10 @@ def _coerce_setting(name: str, value: Any) -> Any:
         return bool(value)
     if name == "reasoning_parser":
         text = str(value)
-        if text not in {"qwen3", "step3p5", "gemma4", "poolside_v1", "lfm2", "none"}:
+        if text not in {"qwen3", "step3p5", "gemma4", "poolside_v1", "lfm2", "inkling2", "none"}:
             raise ValueError(
                 "reasoning_parser must be 'qwen3', 'step3p5', 'gemma4', "
-                "'poolside_v1', 'lfm2', or 'none'"
+                "'poolside_v1', 'lfm2', 'inkling2', or 'none'"
             )
         return text
     if name == "managed_client_controls":
@@ -28546,7 +28558,7 @@ def _history_ids_for_postcommit(
         if committed_text:
             committed_gemma4 = _reasoning_parser_for_state(state) == "gemma4"
             committed_turns = _committed_assistant_turns(
-                committed_text, gemma4=committed_gemma4
+                _parser_view_text(state, committed_text), gemma4=committed_gemma4
             )
             # F11 #3 follow-up (founder-session receipt 2026-08-21): the
             # request-local stream renders an EMPTY think interior for any
@@ -34119,7 +34131,7 @@ def _tool_extraction_text_parts(
             text,
             thinking_enabled=thinking_enabled,
         )
-    return omlx_extract_thinking(text)
+    return omlx_extract_thinking(_parser_view_text(state, text))
 
 
 class _IncrementalTokenDecoder:
@@ -35179,6 +35191,22 @@ def _stream_splitter_for_state(
     parser = _reasoning_parser_for_state(state)
     if parser == "gemma4":
         return stream_splitter_for_parser(parser, thinking_enabled=thinking_enabled)
+    if parser in INKLING2_PARSERS:
+        # Inkling 2 never pre-opens a think block in the prompt; its channel
+        # markup is transcoded onto think tags / <tool_call> blocks before the
+        # shared splitter sees it.
+        return Inkling2StreamSplitter(
+            _ThinkingContentStreamSplitter(
+                thinking_enabled=thinking_enabled,
+                recover_unclosed_reasoning_as_content=recover_unclosed_reasoning_as_content,
+                start_inside_thinking=False,
+                suppress_orphan_tool_markup=suppress_orphan_tool_markup,
+                no_tools_declared=no_tools_declared,
+                tool_markup_is_content=tool_markup_is_content,
+                trim_visible_content_edges=True,
+                tool_names=tool_names,
+            )
+        )
     return _ThinkingContentStreamSplitter(
         thinking_enabled=thinking_enabled,
         recover_unclosed_reasoning_as_content=recover_unclosed_reasoning_as_content,
@@ -35356,7 +35384,7 @@ def _nonstream_chat_message_parts(
     suppress_stats_footer: bool = False,
 ) -> tuple[str, str]:
     raw_text = _strip_generated_chat_template_sentinels(
-        str(generated.get("text") or "")
+        _parser_view_text(state, str(generated.get("text") or ""))
     )
     reasoning_text = ""
     display_text = raw_text
@@ -35388,7 +35416,7 @@ def _nonstream_chat_message_parts(
         stats["visible_reasoning_stripped"] = bool(
             reasoning_text and display_text != raw_text
         )
-    elif parser_enabled and parser in {"qwen3", "step3p5", "poolside_v1", "lfm2"}:
+    elif parser_enabled and parser in {"qwen3", "step3p5", "poolside_v1", "lfm2", "inkling2"}:
         # starts_in_think covers the marker-less truncation case: the prompt
         # pre-opened <think>, generation hit max_tokens before </think>, so
         # the completion carries no tag yet is entirely reasoning (routine at
@@ -41022,7 +41050,7 @@ def create_app(state: ServerState) -> FastAPI:
                     # "</parameter>" from a pasted traceback and then hit
                     # end-of-turn inside thinking reached the client empty.
                     if _generated_text_attempts_tool_call(
-                        first_text,
+                        _parser_view_text(state, first_text),
                         thinking_enabled=thinking_enabled,
                         start_inside_thinking=not aime_visible_working,
                         tool_names=_tool_names(tool_specs) if tools_active else None,
@@ -45700,7 +45728,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--reasoning-parser",
-        choices=["qwen3", "step3p5", "gemma4", "poolside_v1", "lfm2", "none"],
+        choices=["qwen3", "step3p5", "gemma4", "poolside_v1", "lfm2", "inkling2", "none"],
         default="qwen3",
         help="Parser for streamed reasoning tags. Use 'none' to stream all text as content.",
     )

@@ -228,9 +228,9 @@ def normalize_messages_for_template(
         # to emit, and tool results as tool_response turns. Flattening them
         # here showed the model its own calls as "[Calling tool: ...]" and
         # its tool results as user turns, contradicting the contract.
-        from mtplx.chat_encoding import is_gemma4_tokenizer
+        from mtplx.chat_encoding import is_gemma4_tokenizer, is_inkling2_tokenizer
 
-        native_tools = is_gemma4_tokenizer(tokenizer)
+        native_tools = is_gemma4_tokenizer(tokenizer) or is_inkling2_tokenizer(tokenizer)
     processed: list[dict[str, Any]] = []
     for message in messages:
         role = _message_role(message)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+from typing import Any
 
 from mtplx.chat_encoding import (
     GEMMA4_THINK_CLOSE,
@@ -62,6 +63,175 @@ STREAM_TAG_HOLDBACK = max(
     + len("</:opensource>"),
     32,
 )
+
+
+# --- Inkling 2 message channels ----------------------------------------------
+# Inkling 2 writes each part of a turn as its own message:
+#   <|message_model|><|content_thinking|>REASONING<|end_message|>
+#   <|message_model|><|content_text|>ANSWER<|end_message|>
+#   <|message_model|>NAME<|content_invoke_tool_json|>{"name":..,"args":{..}}<|end_message|>
+# and ends the turn with <|content_model_end_sampling|> (its EOS). The
+# "inkling2" codec transcodes this onto the grammar every server lane already
+# parses: <think>REASONING</think>, plain answer text, and
+# <tool_call>{json}</tool_call>. The channel markers are single special
+# tokens, so they arrive whole; the stream transcoder still holds back a
+# partial "<|..." tail in case a detokenizer splits one.
+INKLING2_PARSERS = {"inkling2"}
+INKLING2_MESSAGE_MODEL = "<|message_model|>"
+INKLING2_END_MESSAGE = "<|end_message|>"
+INKLING2_END_SAMPLING = "<|content_model_end_sampling|>"
+INKLING2_THINKING = "<|content_thinking|>"
+INKLING2_TOOL_JSON = "<|content_invoke_tool_json|>"
+INKLING2_TEXT_CHANNELS = (
+    "<|content_text|>",
+    "<|content_tool_error|>",
+    "<|content_invoke_tool_text|>",
+)
+_INKLING2_CHANNELS = (INKLING2_THINKING, INKLING2_TOOL_JSON, *INKLING2_TEXT_CHANNELS)
+_INKLING2_MARKERS = (
+    INKLING2_MESSAGE_MODEL,
+    INKLING2_END_MESSAGE,
+    INKLING2_END_SAMPLING,
+    *_INKLING2_CHANNELS,
+)
+_INKLING2_HOLDBACK = max(len(m) for m in _INKLING2_MARKERS) - 1
+
+
+def inkling2_has_markup(text: str) -> bool:
+    raw = str(text or "")
+    return any(marker in raw for marker in _INKLING2_CHANNELS)
+
+
+class Inkling2MarkupTranscoder:
+    """Incremental Inkling 2 channel markup -> think-tag / <tool_call> text.
+
+    ``feed`` returns the transcoded text that is safe to release; ``finish``
+    flushes the rest. Header text between messages (the role token and a
+    tool name before its JSON channel) is dropped; text before any channel
+    marker in a turn that never opens one passes through as the answer.
+    """
+
+    _OUTSIDE, _THINK, _TEXT, _TOOL = range(4)
+
+    def __init__(self) -> None:
+        self._state = self._OUTSIDE
+        self._pending = ""
+        self._saw_channel = False
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        self._pending += text
+        return self._drain(final=False)
+
+    def finish(self) -> str:
+        out = self._drain(final=True)
+        if self._state == self._THINK:
+            out += "</think>"
+        elif self._state == self._TOOL:
+            out += "</tool_call>"
+        self._state = self._OUTSIDE
+        return out
+
+    @staticmethod
+    def _partial_marker_tail(text: str) -> int:
+        """Length of a tail of ``text`` that could start a marker."""
+        start = text.rfind("<|", max(0, len(text) - _INKLING2_HOLDBACK))
+        if start < 0:
+            return 1 if text.endswith("<") else 0
+        tail = text[start:]
+        if any(marker.startswith(tail) for marker in _INKLING2_MARKERS):
+            return len(tail)
+        return 0
+
+    def _drain(self, *, final: bool) -> str:
+        out: list[str] = []
+        while self._pending:
+            pending = self._pending.replace(INKLING2_END_SAMPLING, "")
+            self._pending = pending
+            if self._state == self._OUTSIDE:
+                best, marker = -1, ""
+                for candidate in _INKLING2_CHANNELS:
+                    idx = pending.find(candidate)
+                    if idx >= 0 and (best < 0 or idx < best):
+                        best, marker = idx, candidate
+                if best < 0:
+                    if final:
+                        if not self._saw_channel:
+                            out.append(
+                                pending.replace(INKLING2_MESSAGE_MODEL, "").replace(
+                                    INKLING2_END_MESSAGE, ""
+                                )
+                            )
+                        self._pending = ""
+                    elif not self._saw_channel and INKLING2_MESSAGE_MODEL not in pending:
+                        # No channel structure yet: a plain-text turn streams
+                        # through, minus a tail that may open a marker.
+                        keep = self._partial_marker_tail(pending)
+                        if len(pending) > keep:
+                            out.append(pending[: len(pending) - keep])
+                            self._pending = pending[len(pending) - keep :]
+                    break
+                self._saw_channel = True
+                self._pending = pending[best + len(marker) :]
+                if marker == INKLING2_THINKING:
+                    self._state = self._THINK
+                    out.append("<think>")
+                elif marker == INKLING2_TOOL_JSON:
+                    self._state = self._TOOL
+                    out.append("<tool_call>")
+                else:
+                    self._state = self._TEXT
+                continue
+            idx = pending.find(INKLING2_END_MESSAGE)
+            if idx < 0:
+                keep = 0 if final else self._partial_marker_tail(pending)
+                if len(pending) > keep:
+                    out.append(pending[: len(pending) - keep])
+                    self._pending = pending[len(pending) - keep :]
+                break
+            out.append(pending[:idx])
+            if self._state == self._THINK:
+                out.append("</think>")
+            elif self._state == self._TOOL:
+                out.append("</tool_call>")
+            self._state = self._OUTSIDE
+            self._pending = pending[idx + len(INKLING2_END_MESSAGE) :]
+        return "".join(out)
+
+
+def inkling2_to_think_markup(text: str) -> str:
+    """Whole-text form of :class:`Inkling2MarkupTranscoder`; text without
+    Inkling channel markers is returned unchanged."""
+    raw = str(text or "")
+    if not inkling2_has_markup(raw):
+        return raw.replace(INKLING2_END_SAMPLING, "")
+    transcoder = Inkling2MarkupTranscoder()
+    return transcoder.feed(raw) + transcoder.finish()
+
+
+class Inkling2StreamSplitter:
+    """Stream splitter for the inkling2 codec: transcodes the channel markup
+    and hands the result to ``inner`` (a think-tag splitter, built by the
+    server with its tool-markup policy). Everything else delegates."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self._transcoder = Inkling2MarkupTranscoder()
+
+    def start(self) -> list[tuple[str, str]]:
+        return self._inner.start()
+
+    def feed(self, text: str) -> list[tuple[str, str]]:
+        return self._inner.feed(self._transcoder.feed(text))
+
+    def finish(self, **kwargs: Any) -> list[tuple[str, str]]:
+        tail = self._transcoder.finish()
+        chunks = self._inner.feed(tail) if tail else []
+        return chunks + self._inner.finish(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
 
 
 @dataclass(frozen=True)
@@ -309,6 +479,10 @@ def split_reasoning_text(
     parser_id = str(parser or "none").lower()
     if parser_id == "gemma4":
         return split_gemma4_reasoning_text(text, thinking_enabled=thinking_enabled)
+    if parser_id in INKLING2_PARSERS:
+        return split_qwen_reasoning_text(
+            inkling2_to_think_markup(text), thinking_enabled=thinking_enabled
+        )
     if parser_id == "lfm2":
         return split_qwen_reasoning_text(text, thinking_enabled=thinking_enabled)
     if parser_id in QWEN_STYLE_REASONING_PARSERS:
@@ -692,6 +866,10 @@ def stream_splitter_for_parser(
         )
     if parser_id == "lfm2":
         return Lfm2ThinkingContentStreamSplitter(thinking_enabled=thinking_enabled)
+    if parser_id in INKLING2_PARSERS:
+        return Inkling2StreamSplitter(
+            QwenThinkingContentStreamSplitter(thinking_enabled=thinking_enabled)
+        )
     if parser_id in QWEN_STYLE_REASONING_PARSERS:
         return QwenThinkingContentStreamSplitter(thinking_enabled=thinking_enabled)
     return QwenThinkingContentStreamSplitter(thinking_enabled=False)

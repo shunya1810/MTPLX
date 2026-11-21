@@ -45,6 +45,20 @@ def is_gemma4_tokenizer(tokenizer: Any) -> bool:
         return False
 
 
+def is_inkling2_tokenizer(tokenizer: Any) -> bool:
+    """Inkling 2's message-channel vocabulary. Its chat template renders
+    structured tool calls (<|content_invoke_tool_json|>) and tool turns
+    (<|message_tool|>) natively, but mlx-lm's has_tool_calling only knows
+    <tool_call>-style templates and reports False."""
+    try:
+        return _vocab_contains_all(
+            tokenizer,
+            ("<|message_model|>", "<|message_tool|>", "<|content_invoke_tool_json|>", "<|end_message|>"),
+        )
+    except Exception:
+        return False
+
+
 def _vocab_contains_all(tokenizer: Any, tokens: tuple[str, ...]) -> bool:
     """Vocabulary membership without materializing the vocabulary.
 
