@@ -518,12 +518,17 @@ class Attention(nn.Module):
         if names in table:
             return table[names]
         ws, ss, bs, rows = [], [], [], []
+        bits = None
         for name in names:
             mod = getattr(self, name)
             if isinstance(mod, nn.QuantizedLinear):
-                if mod.bits != 8 or mod.group_size != _PROJ_GROUP_SIZE or getattr(mod, "mode", "affine") != "affine":
+                bits = mod.bits if bits is None else bits
+                if mod.bits != bits or mod.group_size != _PROJ_GROUP_SIZE or getattr(mod, "mode", "affine") != "affine":
                     table[names] = None
                     return None
+        for name in names:
+            mod = getattr(self, name)
+            if isinstance(mod, nn.QuantizedLinear):
                 w, sc, bi = mod.weight, mod.scales, mod.biases
             elif (
                 name == "sink_proj"
@@ -533,7 +538,10 @@ class Attention(nn.Module):
             ):
                 # 24 rows: quantized to ride in the same matmul (the generic
                 # path reads the same fused sinks, so prefill and decode agree).
-                w, sc, bi = mx.quantize(mod.weight, group_size=_PROJ_GROUP_SIZE, bits=8)
+                if bits is None:
+                    table[names] = None
+                    return None
+                w, sc, bi = mx.quantize(mod.weight, group_size=_PROJ_GROUP_SIZE, bits=bits)
             else:
                 table[names] = None
                 return None
@@ -551,15 +559,15 @@ class Attention(nn.Module):
         for r in rows[:-1]:
             run += r
             splits.append(run)
-        table[names] = (W, S, Bi, splits)
+        table[names] = (W, S, Bi, splits, bits)
         return table[names]
 
     def _project_fused(self, x: mx.array, names: tuple):
         fused = self._fused_linear(names) if _FUSED_PROJ else None
         if fused is None:
             return None
-        W, S, Bi, splits = fused
-        y = mx.quantized_matmul(x, W, S, Bi, transpose=True, group_size=_PROJ_GROUP_SIZE, bits=8)
+        W, S, Bi, splits, bits = fused
+        y = mx.quantized_matmul(x, W, S, Bi, transpose=True, group_size=_PROJ_GROUP_SIZE, bits=bits)
         return mx.split(y, splits, axis=-1)
 
     def _raw_projections(self, hq, hk, hv):
@@ -1092,6 +1100,18 @@ class DecoderLayer(nn.Module):
             self.v_message_gate = MessageGate(dims, rank)
             self.mlp_message_gate = MessageGate(dims, rank)
 
+    def _post_mid_ok(self, x: mx.array) -> bool:
+        return (
+            _DECODE_KERNELS
+            and _use_kernels()
+            and x.ndim == 3
+            and x.shape[0] == 1
+            and x.shape[1] == 1
+            and x.dtype in (mx.float16, mx.bfloat16)
+            and self.post_attention_convolution.kernel_size == 4
+            and (not hasattr(self, "q_message_gate") or self._gates_fusable(x))
+        )
+
     def _fused_gate_weights(self) -> tuple:
         cached = self.__dict__.get("_gate_weights")
         if cached is None:
@@ -1249,6 +1269,36 @@ class DecoderLayer(nn.Module):
                 msg = rest.pop(0) if has_msg else None
                 dtype = h.dtype
                 x = attn._finish(attn_out, gate)
+                if self._post_mid_ok(x):
+                    # One kernel: conv, residual / block, RMS, depth attention,
+                    # and (without messages) the post-attention RMS norm.
+                    from ..kernels.inkling2_decode import post_mid
+
+                    dims = x.shape[-1]
+                    res, y, c2n = post_mid(
+                        x, h, normed_residual,
+                        None if bs is None else bs.reshape(-1, dims),
+                        c2, self.post_attention_convolution.conv1d.weight,
+                        self.mlp_input.query, self.post_attention_layernorm.weight,
+                        boundary=self.is_block_boundary, norm=msg is None,
+                        eps=self.post_attention_layernorm.eps,
+                    )
+                    if self.is_block_boundary:
+                        block = normed_residual[None]
+                        bs = block if bs is None else mx.concatenate([bs, block])
+                    residual = res.reshape(1, 1, dims)
+                    w2 = c2n.reshape(1, 3, dims)
+                    if msg is None:
+                        x = self.mlp(y.reshape(1, 1, dims))
+                    else:
+                        from ..kernels.inkling2_decode import message_gates
+
+                        _, (wd, wf, wg) = self._fused_gate_weights()
+                        x = message_gates(y.reshape(1, dims), msg.reshape(-1, dims)[3:4], wd, wf, wg)
+                        x = self.mlp(self.post_attention_layernorm(x.reshape(1, 1, dims)).astype(dtype))
+                    x, w3 = self.post_mlp_convolution(x, c3, None)
+                    out = (residual + x.astype(mx.float32)).astype(dtype)
+                    return out, bs, w2, _tail3(w3)
                 x, w2 = self.post_attention_convolution(x, c2, None)
                 residual = x = x.astype(mx.float32)
                 if self.is_block_boundary:
