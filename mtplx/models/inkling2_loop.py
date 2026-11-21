@@ -379,6 +379,14 @@ def _decode_mask(bias_rows: mx.array, dclip: mx.array, use_bias: mx.array, base:
 
 
 class Attention(nn.Module):
+    # __call__ takes (q, k, v hidden states, cache, conv states) and the
+    # relative bias / sinks are part of the attention: the runtime's generic
+    # dense-SDPA hooks (attention_split) and q|k|v projection fusion
+    # (proj_fusion: q/k/v inputs differ on global layers and message passes)
+    # must leave this class alone.
+    _mtplx_generic_sdpa_rewrites_unsupported = True
+    _mtplx_proj_fusion_unsupported = True
+
     def __init__(self, args: TextArgs, *, sliding: bool):
         super().__init__()
         if sliding:

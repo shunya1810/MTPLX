@@ -1243,6 +1243,7 @@ _INTREE_MODEL_CLASS_LOADERS: dict[str, Callable[[], tuple[type, type]]] = {
     # Thinking Machines' Inkling 2 Mini: looped MoE trunk, official NVFP4 /
     # MXFP8 experts loaded as they ship (text only).
     "inkling2_loop": _inkling2_loop_model_classes,
+    "inkling2_loop_text": _inkling2_loop_model_classes,
 }
 
 

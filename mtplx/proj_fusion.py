@@ -425,6 +425,12 @@ def configure_fused_projections(model: Any | None = None) -> dict[str, Any]:
         return n
 
     for _, module in model.named_modules():
+        if getattr(module, "_mtplx_proj_fusion_unsupported", False):
+            # The module's projections take different inputs (or its own
+            # lane fuses them): an identity-keyed hub would run the whole
+            # fused matmul once per member.
+            _note_skip("all", f"{type(module).__name__} opts out")
+            continue
         if "gdn" in groups and all(hasattr(module, n) for n in _GDN_NAMES):
             reason = _fuse_group(module, _GDN_NAMES, "_mtplx_fused_in_proj", max_rows)
             if reason is None:
