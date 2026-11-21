@@ -47,6 +47,7 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.models.switch_layers import SwitchLinear, _gather_sort, _scatter_unsort
 
+from .. import moe_sorted_gather
 from ..kernels.inkling2_kernels import (
     depth_attention,
     expert_routing,
@@ -929,7 +930,7 @@ class ExpertLinear(nn.Module):
         if has_scale and x.dtype == mx.float16 and _EXPERT_ACT == "scaled":
             factor = self["expert_scale"][indices].reshape(indices.shape + (1, 1))
             x = (x.astype(mx.float32) * (factor * _EXPERT_SCALE_SHIFT)).astype(mx.float16)
-            out = mx.gather_qmm(
+            out = moe_sorted_gather.gather_qmm(
                 x,
                 self["weight"],
                 self["scales"],
@@ -944,7 +945,7 @@ class ExpertLinear(nn.Module):
             return out * mx.array(1.0 / _EXPERT_SCALE_SHIFT, mx.float16)
         if has_scale and x.dtype == mx.float16:
             x = x.astype(_EXPERT_WIDE_DTYPE)
-        out = mx.gather_qmm(
+        out = moe_sorted_gather.gather_qmm(
             x,
             self["weight"],
             self["scales"],
@@ -1163,13 +1164,13 @@ class SparseMoeBlock(nn.Module):
             h = _swiglu_rescale(g[..., 0::2], g[..., 1::2], unshift, factor, act.gate_softcap, act.up_softcap)
             o = seg_gemm(h, dn["weight"], dn["scales"], table, bits=dn.bits, group_size=dn.group_size)
         else:
-            g = mx.gather_qmm(
+            g = moe_sorted_gather.gather_qmm(
                 xs[:, None, :], gu["weight"], gu["scales"], None, rhs_indices=idx, transpose=True,
                 group_size=gu.group_size, bits=gu.bits, mode=gu.mode, sorted_indices=True,
             )
             factor = f_dn[:, None, None] if f_dn is not None else mx.array(1.0, mx.float32)
             h = _swiglu_rescale(g[..., 0::2], g[..., 1::2], unshift, factor, act.gate_softcap, act.up_softcap)
-            o = mx.gather_qmm(
+            o = moe_sorted_gather.gather_qmm(
                 h, dn["weight"], dn["scales"], None, rhs_indices=idx, transpose=True,
                 group_size=dn.group_size, bits=dn.bits, mode=dn.mode, sorted_indices=True,
             )
