@@ -239,6 +239,26 @@ class TestInkling2Loop(unittest.TestCase):
         err = mx.abs(fused.astype(mx.float32) - gathered.astype(mx.float32)).max().item()
         self.assertLess(err, 0.02 * max(scale, 1.0))
 
+    def test_fused_mxfp8_moe_matches_gather(self):
+        model = _model(4)
+        ckpt, _ = _checkpoint(model)
+        loaded = self._load(ckpt)
+        mlp = loaded.model.language_model.layers[7].mlp
+        self.assertEqual(mlp.experts.gate_up_proj.mode, "mxfp8")
+        x = (mx.random.normal((1, 3, 64)) * 2).astype(mx.float16)
+        self.assertEqual(mlp._fused_mode(3 * 2, mx.float16), "mxfp8")
+        fused = mlp(x)
+        old = ink._FUSED_MOE_MAX_PAIRS
+        ink._FUSED_MOE_MAX_PAIRS = 0
+        try:
+            gathered = mlp(x)
+        finally:
+            ink._FUSED_MOE_MAX_PAIRS = old
+        self.assertEqual(fused.dtype, mx.float16)
+        scale = mx.abs(gathered.astype(mx.float32)).max().item()
+        err = mx.abs(fused.astype(mx.float32) - gathered.astype(mx.float32)).max().item()
+        self.assertLess(err, 0.02 * max(scale, 1.0))
+
 
 if __name__ == "__main__":
     unittest.main()

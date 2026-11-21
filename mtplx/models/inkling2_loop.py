@@ -92,6 +92,7 @@ _DECODE_COMPILE = (os.environ.get("MTPLX_INKLING2_DECODE_COMPILE") or "1").strip
 # Fused NVFP4 expert kernels up to this many (token, expert) pairs (decode is
 # 8, a 4-row verify 32); 0 keeps gather_qmm everywhere.
 _FUSED_MOE_MAX_PAIRS = _env_int("MTPLX_INKLING2_FUSED_MOE_PAIRS", 64)
+_FUSED_FP8 = _env_int("MTPLX_INKLING2_FUSED_FP8", 1) == 1
 
 
 # One-token kernels (kernels/inkling2_decode.py): fused message gates and the
@@ -977,32 +978,41 @@ class SparseMoeBlock(nn.Module):
         self.gate = TopKRouter(args)
         self.experts = Experts(args)
 
-    def _fused_ok(self, num_pairs: int, dtype) -> bool:
+    def _fused_mode(self, num_pairs: int, dtype) -> str | None:
+        """'nvfp4' / 'mxfp8' when the fused decode kernels apply, else None."""
         experts = self.experts
         gu, dn = experts.gate_up_proj, experts.down_proj
-        return (
+        if not (
             _FUSED_MOE_MAX_PAIRS > 0
             and dtype in (mx.float16, mx.bfloat16)
             and num_pairs <= _FUSED_MOE_MAX_PAIRS
             and isinstance(gu, ExpertLinear)
             and isinstance(dn, ExpertLinear)
-            and gu.mode == dn.mode == "nvfp4"
-            and "expert_scale" in gu
-            and "expert_scale" in dn
+            and gu.mode == dn.mode
             and _use_kernels()
-        )
+        ):
+            return None
+        if gu.mode == "nvfp4" and "expert_scale" in gu and "expert_scale" in dn:
+            return "nvfp4"
+        if gu.mode == "mxfp8" and "expert_scale" not in gu and "expert_scale" not in dn and _FUSED_FP8:
+            return "mxfp8"
+        return None
+
+    def _fused_ok(self, num_pairs: int, dtype) -> bool:
+        return self._fused_mode(num_pairs, dtype) is not None
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
         selected_experts, routing_weights = self.gate(hidden_states)
-        if self._fused_ok(selected_experts.size, hidden_states.dtype):
+        mode = self._fused_mode(selected_experts.size, hidden_states.dtype)
+        if mode is not None:
             # Decode / verify widths: two kernels (gate/up + softcapped
             # SwiGLU, down + routing weights + sum over experts).
-            from ..kernels.inkling2_moe import moe_nvfp4
+            from ..kernels.inkling2_moe import moe_mxfp8, moe_nvfp4
 
             dims = hidden_states.shape[-1]
             experts = self.experts
             act = experts.act_fn
-            y = moe_nvfp4(
+            y = (moe_nvfp4 if mode == "nvfp4" else moe_mxfp8)(
                 hidden_states.reshape(-1, dims),
                 experts.gate_up_proj,
                 experts.down_proj,

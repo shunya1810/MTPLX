@@ -23,7 +23,7 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-__all__ = ["moe_nvfp4", "nvfp4_mid", "nvfp4_down"]
+__all__ = ["moe_nvfp4", "nvfp4_mid", "nvfp4_down", "moe_mxfp8", "mxfp8_mid", "mxfp8_down"]
 
 _HEADER = r"""
 inline void ink_build_table(threadgroup half2* c_lut, threadgroup float* s_lut, uint tid);
@@ -162,6 +162,101 @@ _DOWN_SRC = r"""
 """
 
 
+# MXFP8 (layers 20-23): E4M3 codes one per byte, one E8M0 scale per 32
+# values, no outer scale. Codes decode in registers: (b & 0x7F) << 7 with the
+# sign moved to bit 15 is a float16 whose value is the E4M3 value / 256
+# (normals and subnormals alike), so the 256 folds into the E8M0 scale.
+_FP8_HEADER = r"""
+inline float ink_fp8_dot4(uint w, float4 a) {
+    const uint t0 = w & 0x00FF00FFu, t1 = (w >> 8) & 0x00FF00FFu;
+    const half2 v02 = as_type<half2>(((t0 & 0x00800080u) << 8) | ((t0 & 0x007F007Fu) << 7));
+    const half2 v13 = as_type<half2>(((t1 & 0x00800080u) << 8) | ((t1 & 0x007F007Fu) << 7));
+    return dot(float4(v02.x, v13.x, v02.y, v13.y), a);
+}
+inline float ink_e8m0x256(uchar s) { return as_type<float>((uint(s) + 8u) << 23); }
+inline float ink_fp8_dot32(const device uint4* q, float4 xv[8]) {
+    const uint4 a = q[0], b = q[1];
+    return ink_fp8_dot4(a.x, xv[0]) + ink_fp8_dot4(a.y, xv[1]) + ink_fp8_dot4(a.z, xv[2])
+         + ink_fp8_dot4(a.w, xv[3]) + ink_fp8_dot4(b.x, xv[4]) + ink_fp8_dot4(b.y, xv[5])
+         + ink_fp8_dot4(b.z, xv[6]) + ink_fp8_dot4(b.w, xv[7]);
+}
+"""
+
+_FP8_MID_SRC = r"""
+    constexpr int CH = K / 32;
+    constexpr int GPS = 32 / LPR;
+    constexpr int ROWS = 8 * GPS * NR;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint pair = threadgroup_position_in_grid.y;
+    const uint t = pair / TOPK;
+    const uint e = experts[pair];
+    const uint sg = tid / 32, lane = tid % 32;
+    const uint grp = lane / LPR, l8 = lane % LPR;
+    const uint j0 = threadgroup_position_in_grid.x * ROWS + (sg * GPS + grp) * NR;
+    if (j0 >= (uint)N) return;
+    const device vec<T, 4>* xd = (const device vec<T, 4>*)(x + (ulong)t * K);
+
+    float acc[2 * NR];
+    for (int i = 0; i < 2 * NR; ++i) acc[i] = 0.0f;
+    for (uint c = l8; c < (uint)CH; c += LPR) {
+        float4 xv[8];
+        for (int i = 0; i < 8; ++i) xv[i] = float4(xd[c * 8 + i]);
+        for (int rp = 0; rp < 2 * NR; ++rp) {
+            const uint j = j0 + rp / 2;
+            if (j >= (uint)N) break;
+            const ulong row = (ulong)e * (2 * N) + 2 * j + (rp & 1);
+            const device uint4* q = (const device uint4*)(w + row * (K / 4)) + 2 * c;
+            acc[rp] += ink_e8m0x256(scales[row * (K / 32) + c]) * ink_fp8_dot32(q, xv);
+        }
+    }
+    for (int rp = 0; rp < 2 * NR; ++rp) {
+        float v = acc[rp];
+        for (uint o = 1; o < (uint)LPR; o *= 2) v += simd_shuffle_xor(v, o);
+        acc[rp] = v;
+    }
+    if (l8 == 0) {
+        for (int r = 0; r < NR; ++r) {
+            const uint j = j0 + r;
+            if (j >= (uint)N) break;
+            const float g = (float)((T)acc[2 * r]);
+            const float u = (float)((T)acc[2 * r + 1]);
+            const float gs = (float)GSOFT, us = (float)USOFT;
+            const float gc = metal::precise::tanh(g / gs) * gs;
+            const float uc = metal::precise::tanh(u / us) * us;
+            const float sig = 1.0f / (1.0f + metal::precise::exp(-g));
+            h[(ulong)pair * N + j] = (T)(gc * sig * uc);
+        }
+    }
+"""
+
+_FP8_DOWN_SRC = r"""
+    constexpr int CH = N / 32;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint t = threadgroup_position_in_grid.y;
+    const device vec<T, 4>* src = (const device vec<T, 4>*)(h + (ulong)t * TOPK * N);
+    const uint sg = tid / 32, lane = tid % 32, l4 = lane % LPD;
+    const uint dim = threadgroup_position_in_grid.x * (TGS / LPD) + sg * (32 / LPD) + lane / LPD;
+    if (dim >= (uint)DM) return;
+    float acc = 0.0f;
+    for (uint slot = 0; slot < (uint)TOPK; ++slot) {
+        const uint e = experts[t * TOPK + slot];
+        const ulong row = (ulong)e * DM + dim;
+        const device uint4* qrow = (const device uint4*)(w + row * (N / 4));
+        const device uchar* srow = scales + row * (N / 32);
+        float d = 0.0f;
+        for (uint c = l4; c < (uint)CH; c += LPD) {
+            const uint b = (slot * N + c * 32) / 4;
+            float4 hv[8];
+            for (int i = 0; i < 8; ++i) hv[i] = float4(src[b + i]);
+            d += ink_e8m0x256(srow[c]) * ink_fp8_dot32(qrow + 2 * c, hv);
+        }
+        acc = metal::fma(rw[t * TOPK + slot], d, acc);
+    }
+    for (uint o = 1; o < (uint)LPD; o *= 2) acc += simd_shuffle_xor(acc, o);
+    if (l4 == 0) y[(ulong)t * DM + dim] = (T)acc;
+"""
+
+
 @lru_cache(maxsize=None)
 def _mid_kernel():
     return mx.fast.metal_kernel(
@@ -181,6 +276,28 @@ def _down_kernel():
         output_names=["y"],
         header=_HEADER,
         source=_DOWN_SRC,
+    )
+
+
+@lru_cache(maxsize=None)
+def _fp8_mid_kernel():
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling2_mxfp8_mid",
+        input_names=["x", "w", "scales", "experts"],
+        output_names=["h"],
+        header=_FP8_HEADER,
+        source=_FP8_MID_SRC,
+    )
+
+
+@lru_cache(maxsize=None)
+def _fp8_down_kernel():
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling2_mxfp8_down",
+        input_names=["h", "w", "scales", "experts", "rw"],
+        output_names=["y"],
+        header=_FP8_HEADER,
+        source=_FP8_DOWN_SRC,
     )
 
 
@@ -269,3 +386,59 @@ def moe_nvfp4(x2, gate_up, down, experts, route_w, *, gate_softcap: float, up_so
         route_w,
         int(x2.shape[0]),
     )
+
+
+
+def mxfp8_mid(x2, w, scales, experts, *, gate_softcap: float, up_softcap: float):
+    """x2 [M, K]; w uint32 [E, 2N, K/4]; scales uint8 [E, 2N, K/32]; experts
+    uint32 [M * topk]. Returns h [M * topk, N]."""
+    m_rows, k = int(x2.shape[0]), int(x2.shape[1])
+    n = int(w.shape[1]) // 2
+    pairs = int(experts.shape[0])
+    nr = _env_int("MTPLX_INKLING2_FP8_MID_NR", 1, (1, 2, 4))
+    lpr = _env_int("MTPLX_INKLING2_FP8_MID_LPR", 8, (4, 8, 16, 32))
+    rows = 8 * (32 // lpr) * nr
+    (h,) = _fp8_mid_kernel()(
+        inputs=[x2, w, scales, experts],
+        template=[
+            ("T", x2.dtype),
+            ("K", k),
+            ("N", n),
+            ("TOPK", pairs // m_rows),
+            ("NR", nr),
+            ("LPR", lpr),
+            ("GSOFT", _int_softcap(gate_softcap)),
+            ("USOFT", _int_softcap(up_softcap)),
+        ],
+        grid=(((n + rows - 1) // rows) * 256, pairs, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(pairs, n)],
+        output_dtypes=[x2.dtype],
+    )
+    return h
+
+
+def mxfp8_down(h, w, scales, experts, route_w, m_rows: int):
+    """h [M * topk, N]; w uint32 [E, D, N/4]; route_w float32 [M * topk]."""
+    n = int(h.shape[1])
+    dmodel = int(w.shape[1])
+    topk = int(experts.shape[0]) // m_rows
+    lpd = _env_int("MTPLX_INKLING2_FP8_DOWN_LPD", 8, (2, 4, 8, 16, 32))
+    tgs = _env_int("MTPLX_INKLING2_FP8_DOWN_TGS", 64, (64, 128, 256))
+    dpt = tgs // lpd
+    (y,) = _fp8_down_kernel()(
+        inputs=[h, w, scales, experts, route_w],
+        template=[("T", h.dtype), ("N", n), ("DM", dmodel), ("TOPK", topk), ("LPD", lpd), ("TGS", tgs)],
+        grid=(((dmodel + dpt - 1) // dpt) * tgs, m_rows, 1),
+        threadgroup=(tgs, 1, 1),
+        output_shapes=[(m_rows, dmodel)],
+        output_dtypes=[h.dtype],
+    )
+    return y
+
+
+def moe_mxfp8(x2, gate_up, down, experts, route_w, *, gate_softcap: float, up_softcap: float):
+    """Routed experts for ExpertLinear pairs in mxfp8 (no outer scale)."""
+    h = mxfp8_mid(x2, gate_up["weight"], gate_up["scales"], experts,
+                  gate_softcap=gate_softcap, up_softcap=up_softcap)
+    return mxfp8_down(h, down["weight"], down["scales"], experts, route_w, int(x2.shape[0]))
