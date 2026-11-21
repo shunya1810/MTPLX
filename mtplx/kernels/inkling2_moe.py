@@ -518,3 +518,204 @@ def combine_rows(o, inv, w, topk: int):
         output_dtypes=[o.dtype],
     )
     return y
+
+
+# --------------------------------------------------------------------------
+# Verify widths (2..9 tokens): the pairs sorted by expert, one threadgroup a
+# distinct expert (the first pair of its run; the others return at once), so
+# each expert's weights are read and decoded once for all the tokens routed
+# to it. mid writes h in the original pair order; down writes per-pair
+# outputs (routing weight and outer scale applied) that are summed per token.
+
+_GROUP_HEAD = r"""
+    const uint q0 = threadgroup_position_in_grid.y;
+    const uint e = sorted[q0];
+    if (q0 > 0 && sorted[q0 - 1] == e) return;
+    uint seg = 1;
+    while (q0 + seg < (uint)P && seg < (uint)MAXT && sorted[q0 + seg] == e) ++seg;
+"""
+
+# Per chunk the packed weights (and scales) of a row are loaded once into
+# registers; each routed token then runs the same table / in-register dot
+# as the per-pair kernels.
+_GROUP_DOT = {
+    "nvfp4": dict(
+        load=r"""
+        const uint4 QV = ((const device uint4*)(w + ROWX * (KDIM / 8)))[c];
+        const device uchar* SCP = scales + ROWX * (KDIM / 16) + 2 * c;
+        const float S0 = s_lut[SCP[0]], S1 = s_lut[SCP[1]];
+""",
+        dot="(S0 * (ink_dot8(QV.x, XV[0], XV[1], c_lut) + ink_dot8(QV.y, XV[2], XV[3], c_lut)) + "
+            "S1 * (ink_dot8(QV.z, XV[4], XV[5], c_lut) + ink_dot8(QV.w, XV[6], XV[7], c_lut)))",
+    ),
+    "mxfp8": dict(
+        load=r"""
+        const device uint4* QP = (const device uint4*)(w + ROWX * (KDIM / 4)) + 2 * c;
+        const uint4 QA = QP[0], QB = QP[1];
+        const float S0 = ink_e8m0x256(scales[ROWX * (KDIM / 32) + c]);
+""",
+        dot="(S0 * (ink_fp8_dot4(QA.x, XV[0]) + ink_fp8_dot4(QA.y, XV[1]) + ink_fp8_dot4(QA.z, XV[2]) + "
+            "ink_fp8_dot4(QA.w, XV[3]) + ink_fp8_dot4(QB.x, XV[4]) + ink_fp8_dot4(QB.y, XV[5]) + "
+            "ink_fp8_dot4(QB.z, XV[6]) + ink_fp8_dot4(QB.w, XV[7])))",
+    ),
+}
+
+
+def _gload(fmt, row, kdim, tag):
+    src = _GROUP_DOT[fmt]["load"]
+    for a, b in (("QV", f"qv{tag}"), ("QP", f"qp{tag}"), ("QA", f"qa{tag}"), ("QB", f"qb{tag}"),
+                 ("SCP", f"scp{tag}"), ("S0", f"s0{tag}"), ("S1", f"s1{tag}"), ("ROWX", row), ("KDIM", kdim)):
+        src = src.replace(a, b)
+    return src
+
+
+def _gdot(fmt, tag, xv):
+    src = _GROUP_DOT[fmt]["dot"]
+    for a, b in (("QV", f"qv{tag}"), ("QA", f"qa{tag}"), ("QB", f"qb{tag}"), ("S0", f"s0{tag}"), ("S1", f"s1{tag}"), ("XV", xv)):
+        src = src.replace(a, b)
+    return src
+
+
+def _group_mid_src(fmt: str) -> str:
+    tables = r"""
+    threadgroup half2 c_lut[256];
+    threadgroup float s_lut[256];
+    ink_build_tables(c_lut, s_lut, thread_position_in_threadgroup.x);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+""" if fmt == "nvfp4" else ""
+    fac = "escale[e]" if fmt == "nvfp4" else "1.0f"
+    return _GROUP_HEAD + tables + r"""
+    constexpr int CH = K / 32;
+    constexpr int GPS = 32 / LPR;
+    constexpr int ROWS = 8 * GPS;
+    const uint tid = thread_position_in_threadgroup.x;
+    const float fac = """ + fac + r""";
+    const uint sg = tid / 32, lane = tid % 32;
+    const uint grp = lane / LPR, l8 = lane % LPR;
+    const uint j = threadgroup_position_in_grid.x * ROWS + sg * GPS + grp;
+    if (j >= (uint)N) return;
+    const ulong rg = (ulong)e * (2 * N) + 2 * j, ru = rg + 1;
+    uint tok[MAXT];
+    float ag[MAXT], au[MAXT];
+    for (int t = 0; t < MAXT; ++t) {
+        tok[t] = (t < (int)seg) ? order[q0 + t] / TOPK : 0u;
+        ag[t] = 0.0f; au[t] = 0.0f;
+    }
+    for (uint c = l8; c < (uint)CH; c += LPR) {
+""" + _gload(fmt, "rg", "K", "g") + _gload(fmt, "ru", "K", "u") + r"""
+        for (int t = 0; t < MAXT; ++t) {
+            if (t >= (int)seg) break;
+            const device vec<T, 4>* xd = (const device vec<T, 4>*)(x + (ulong)tok[t] * K) + c * 8;
+            float4 xv[8];
+            for (int i = 0; i < 8; ++i) xv[i] = float4(xd[i]);
+            ag[t] += """ + _gdot(fmt, "g", "xv") + r""";
+            au[t] += """ + _gdot(fmt, "u", "xv") + r""";
+        }
+    }
+    for (int t = 0; t < MAXT; ++t) {
+        if (t >= (int)seg) break;
+        float g = ag[t], u = au[t];
+        for (uint o = 1; o < (uint)LPR; o *= 2) { g += simd_shuffle_xor(g, o); u += simd_shuffle_xor(u, o); }
+        if (l8 == 0) {
+            const float gg = (float)((T)(g * fac)), uu = (float)((T)(u * fac));
+            const float gs = (float)GSOFT, us = (float)USOFT;
+            const float gc = metal::precise::tanh(gg / gs) * gs;
+            const float uc = metal::precise::tanh(uu / us) * us;
+            const float sig = 1.0f / (1.0f + metal::precise::exp(-gg));
+            h[(ulong)order[q0 + t] * N + j] = (T)(gc * sig * uc);
+        }
+    }
+"""
+
+
+def _group_down_src(fmt: str) -> str:
+    tables = r"""
+    threadgroup half2 c_lut[256];
+    threadgroup float s_lut[256];
+    ink_build_tables(c_lut, s_lut, thread_position_in_threadgroup.x, TGS);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+""" if fmt == "nvfp4" else ""
+    fac = "escale[e]" if fmt == "nvfp4" else "1.0f"
+    return _GROUP_HEAD + tables + r"""
+    constexpr int CH = N / 32;
+    const uint tid = thread_position_in_threadgroup.x;
+    const float fac = """ + fac + r""";
+    const uint sg = tid / 32, lane = tid % 32, l4 = lane % LPD;
+    const uint dim = threadgroup_position_in_grid.x * (TGS / LPD) + sg * (32 / LPD) + lane / LPD;
+    if (dim >= (uint)DM) return;
+    const ulong row = (ulong)e * DM + dim;
+    uint pr[MAXT];
+    float acc[MAXT];
+    for (int t = 0; t < MAXT; ++t) { pr[t] = (t < (int)seg) ? order[q0 + t] : 0u; acc[t] = 0.0f; }
+    for (uint c = l4; c < (uint)CH; c += LPD) {
+""" + _gload(fmt, "row", "N", "d") + r"""
+        for (int t = 0; t < MAXT; ++t) {
+            if (t >= (int)seg) break;
+            const device vec<T, 4>* hd = (const device vec<T, 4>*)(h + (ulong)pr[t] * N) + c * 8;
+            float4 hv[8];
+            for (int i = 0; i < 8; ++i) hv[i] = float4(hd[i]);
+            acc[t] += """ + _gdot(fmt, "d", "hv") + r""";
+        }
+    }
+    for (int t = 0; t < MAXT; ++t) {
+        if (t >= (int)seg) break;
+        float a = acc[t];
+        for (uint o = 1; o < (uint)LPD; o *= 2) a += simd_shuffle_xor(a, o);
+        if (l4 == 0) o_pair[(ulong)pr[t] * DM + dim] = a * fac * rw[pr[t]];
+    }
+"""
+
+
+@lru_cache(maxsize=None)
+def _group_kernels(fmt: str):
+    header = _HEADER if fmt == "nvfp4" else _FP8_HEADER
+    names_mid = ["x", "w", "scales", "escale", "sorted", "order"] if fmt == "nvfp4" else ["x", "w", "scales", "sorted", "order"]
+    names_down = ["h", "w", "scales", "escale", "sorted", "order", "rw"] if fmt == "nvfp4" else ["h", "w", "scales", "sorted", "order", "rw"]
+    mid = mx.fast.metal_kernel(
+        name=f"mtplx_inkling2_{fmt}_group_mid", input_names=names_mid, output_names=["h"],
+        header=header, source=_group_mid_src(fmt),
+    )
+    down = mx.fast.metal_kernel(
+        name=f"mtplx_inkling2_{fmt}_group_down", input_names=names_down, output_names=["o_pair"],
+        header=header, source=_group_down_src(fmt),
+    )
+    return mid, down
+
+
+def moe_grouped(x2, gate_up, down, experts, route_w, *, fmt: str, gate_softcap: float, up_softcap: float):
+    """Routed experts for 2..9 tokens with each distinct expert read once.
+    x2 [M, K]; experts uint32 [M * topk]; route_w float32 [M * topk]."""
+    m_rows, k = int(x2.shape[0]), int(x2.shape[1])
+    pairs = int(experts.shape[0])
+    topk = pairs // m_rows
+    n = int(gate_up["weight"].shape[1]) // 2
+    dm = int(down["weight"].shape[1])
+    order = mx.argsort(experts).astype(mx.uint32)
+    sorted_e = experts[order]
+    mid_k, down_k = _group_kernels(fmt)
+    lpr = _env_int("MTPLX_INKLING2_GROUP_MID_LPR", 8, (4, 8, 16, 32))
+    rows = 8 * (32 // lpr)
+    common = [("T", x2.dtype), ("TOPK", topk), ("P", pairs), ("MAXT", m_rows)]
+    mid_in = [x2, gate_up["weight"], gate_up["scales"]] + ([gate_up["expert_scale"]] if fmt == "nvfp4" else []) + [sorted_e, order]
+    (h,) = mid_k(
+        inputs=mid_in,
+        template=common + [("K", k), ("N", n), ("LPR", lpr),
+                           ("GSOFT", _int_softcap(gate_softcap)), ("USOFT", _int_softcap(up_softcap))],
+        grid=(((n + rows - 1) // rows) * 256, pairs, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(pairs, n)],
+        output_dtypes=[x2.dtype],
+    )
+    lpd = _env_int("MTPLX_INKLING2_GROUP_DOWN_LPD", 8, (4, 8, 16, 32))
+    tgs = _env_int("MTPLX_INKLING2_GROUP_DOWN_TGS", 128, (64, 128, 256))
+    dpt = tgs // lpd
+    down_in = [h, down["weight"], down["scales"]] + ([down["expert_scale"]] if fmt == "nvfp4" else []) + [sorted_e, order, route_w]
+    (o,) = down_k(
+        inputs=down_in,
+        template=common + [("N", n), ("DM", dm), ("LPD", lpd), ("TGS", tgs)],
+        grid=(((dm + dpt - 1) // dpt) * tgs, pairs, 1),
+        threadgroup=(tgs, 1, 1),
+        output_shapes=[(pairs, dm)],
+        output_dtypes=[mx.float32],
+    )
+    return o.reshape(m_rows, topk, dm).sum(axis=1).astype(x2.dtype)

@@ -103,6 +103,7 @@ _PREFILL_MOE = _env_int("MTPLX_INKLING2_PREFILL_MOE", 1) == 1
 # two compiled halves around the KV cache; wider ones take the eager path.
 _COMPILED_MAX_ROWS = _env_int("MTPLX_INKLING2_COMPILED_ROWS", 9)
 _SMALL_ATTENTION = _env_int("MTPLX_INKLING2_SMALL_ATTENTION", 1) == 1
+_GROUPED_MOE_MAX_TOKENS = _env_int("MTPLX_INKLING2_GROUPED_MOE_TOKENS", 9)
 
 
 # One-token kernels (kernels/inkling2_decode.py): fused message gates and the
@@ -1039,6 +1040,27 @@ class SparseMoeBlock(nn.Module):
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
         selected_experts, routing_weights = self.gate(hidden_states)
+        tokens = selected_experts.size // selected_experts.shape[-1]
+        if 2 <= tokens <= _GROUPED_MOE_MAX_TOKENS:
+            mode = self._fused_mode(selected_experts.shape[-1], hidden_states.dtype)
+            if mode is not None:
+                # verify widths: each distinct expert read once for its tokens
+                from ..kernels.inkling2_moe import moe_grouped
+
+                dims = hidden_states.shape[-1]
+                experts = self.experts
+                act = experts.act_fn
+                y = moe_grouped(
+                    hidden_states.reshape(-1, dims),
+                    experts.gate_up_proj,
+                    experts.down_proj,
+                    selected_experts.reshape(-1).astype(mx.uint32),
+                    routing_weights.reshape(-1).astype(mx.float32),
+                    fmt=mode,
+                    gate_softcap=act.gate_softcap,
+                    up_softcap=act.up_softcap,
+                )
+                return y.reshape(hidden_states.shape)
         mode = self._fused_mode(selected_experts.size, hidden_states.dtype)
         if mode is not None:
             # Decode / verify widths: two kernels (gate/up + softcapped
@@ -1291,7 +1313,7 @@ class DecoderLayer(nn.Module):
     def _gates_fusable(self, ref: mx.array) -> bool:
         if not (_DECODE_KERNELS and _use_kernels()):
             return False
-        if ref.ndim != 3 or ref.shape[0] != 1 or ref.shape[1] != 1:
+        if ref.ndim != 3 or ref.shape[0] != 1 or ref.shape[1] > _COMPILED_MAX_ROWS:
             return False
         g = self.q_message_gate
         return (
@@ -1308,12 +1330,13 @@ class DecoderLayer(nn.Module):
             from ..kernels.inkling2_decode import message_gates
 
             dims = q_states.shape[-1]
+            rows = q_states.shape[1]
             dtype = mx.float32 if any(x.dtype == mx.float32 for x in states) else q_states.dtype
-            h3 = mx.concatenate([x.reshape(1, dims).astype(dtype) for x in states], axis=0)
-            m3 = messages.reshape(-1, dims)[:3]
+            h3 = mx.stack([x.reshape(rows, dims).astype(dtype) for x in states], axis=0)
+            m3 = messages.reshape(rows, -1, dims)[:, :3].transpose(1, 0, 2)
             (wd, wf, wg), _ = self._fused_gate_weights()
             out = message_gates(h3, m3, wd, wf, wg)
-            return tuple(out[i].reshape(1, 1, dims) for i in range(3))
+            return tuple(out[i].reshape(1, rows, dims) for i in range(3))
         return (
             self.q_message_gate(q_states, messages[..., 0, :]),
             self.k_message_gate(k_states, messages[..., 1, :]),
@@ -1474,11 +1497,11 @@ class DecoderLayer(nn.Module):
                     if self._gates_fusable(x):
                         from ..kernels.inkling2_decode import message_gates
 
-                        dims = x.shape[-1]
+                        dims, rows = x.shape[-1], x.shape[1]
                         _, (wd, wf, wg) = self._fused_gate_weights()
                         x = message_gates(
-                            x.reshape(1, dims), msg.reshape(-1, dims)[3:4], wd, wf, wg
-                        ).reshape(1, 1, dims)
+                            x.reshape(1, rows, dims), msg.reshape(rows, -1, dims)[None, :, 3], wd, wf, wg
+                        ).reshape(1, rows, dims)
                     else:
                         x = self.mlp_message_gate(x, msg[..., 3, :])
                 x = self.mlp(self.post_attention_layernorm(x).astype(dtype))

@@ -351,6 +351,26 @@ class TestInkling2Loop(unittest.TestCase):
         err = mx.abs(cached - full).max().item()
         self.assertLess(err, 0.05 * max(scale, 1.0))
 
+    def test_grouped_moe_matches_reference(self):
+        """2..9-token widths: pairs sorted by expert, each expert read once."""
+        model = _model(8)
+        ckpt, _ = _checkpoint(model)
+        loaded = self._load(ckpt)
+        for layer in (1, 7):  # nvfp4 with outer scale, mxfp8
+            mlp = loaded.model.language_model.layers[layer].mlp
+            for tokens in (2, 5, 9):
+                x = (mx.random.normal((1, tokens, 64)) * 2).astype(mx.float16)
+                got = mlp(x)
+                old = ink._GROUPED_MOE_MAX_TOKENS
+                ink._GROUPED_MOE_MAX_TOKENS = 0
+                try:
+                    ref = mlp(x)
+                finally:
+                    ink._GROUPED_MOE_MAX_TOKENS = old
+                scale = mx.abs(ref.astype(mx.float32)).max().item()
+                err = mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max().item()
+                self.assertLess(err, 0.02 * max(scale, 1.0), f"layer {layer} tokens {tokens}")
+
 
 if __name__ == "__main__":
     unittest.main()

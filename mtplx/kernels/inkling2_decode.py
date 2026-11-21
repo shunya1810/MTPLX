@@ -31,7 +31,8 @@ __all__ = ["message_gates", "conv_step"]
 _GATE_DOWN_SRC = r"""
     // grid: (RB-row blocks of R) x G ; threadgroup 256
     const uint tid = thread_position_in_threadgroup.x;
-    const uint g = threadgroup_position_in_grid.y;
+    const uint g = threadgroup_position_in_grid.y;        // gate * ROWS + row
+    const uint gw = g / ROWS;                              // the gate's weights
     const uint r0 = threadgroup_position_in_grid.x * RB;
     const uint lane = tid % 32, sg = tid / 32;
     const device TH* hg = h + (ulong)g * D;
@@ -57,7 +58,7 @@ _GATE_DOWN_SRC = r"""
     for (uint rr = sg; rr < (uint)RB; rr += 8) {
         const uint r = r0 + rr;
         if (r >= (uint)R) break;
-        const device TW* w = wd + ((ulong)g * R + r) * (2 * D);
+        const device TW* w = wd + ((ulong)gw * R + r) * (2 * D);
         float acc = 0.0f;
         for (uint i = lane; i < (uint)D; i += 32) {
             const TW xh = (TW)(float)(TH)((float)hg[i] * ih);
@@ -73,7 +74,8 @@ _GATE_MIX_SRC = r"""
     // grid: (DB-dim blocks of D) x G ; threadgroup 256 = 8 simdgroups, each
     // simdgroup owns DB / 8 dims; lanes split the R = 64 inner products.
     const uint tid = thread_position_in_threadgroup.x;
-    const uint g = threadgroup_position_in_grid.y;
+    const uint g = threadgroup_position_in_grid.y;        // gate * ROWS + row
+    const uint gw = g / ROWS;
     const uint lane = tid % 32, sg = tid / 32;
     const device float* sg_s = s + (ulong)g * R;
     float sv[R / 32];
@@ -82,8 +84,8 @@ _GATE_MIX_SRC = r"""
     for (uint dd = sg; dd < (uint)DB; dd += 8) {
         const uint d = d0 + dd;
         if (d >= (uint)D) break;
-        const device float* wfr = wf + ((ulong)g * D + d) * R;
-        const device float* wgr = wg + ((ulong)g * D + d) * R;
+        const device float* wfr = wf + ((ulong)gw * D + d) * R;
+        const device float* wgr = wg + ((ulong)gw * D + d) * R;
         float f = 0.0f, q = 0.0f;
         for (uint k = 0; k < (uint)(R / 32); ++k) {
             f += wfr[lane + 32 * k] * sv[k];
@@ -121,17 +123,22 @@ def _gate_mix_kernel():
 
 
 def message_gates(h: mx.array, m: mx.array, wd: mx.array, wf: mx.array, wg: mx.array, *, eps: float = 1e-6) -> mx.array:
-    """h [G, D] (float16 / bfloat16 / float32), m [G, D] float32, wd [G, R, 2D]
-    float16 or bfloat16, wf / wg [G, D, R] float32. Returns [G, D] float32."""
-    G, D = int(h.shape[0]), int(h.shape[1])
+    """h [G, D] or [G, L, D] (float16 / bfloat16 / float32), m like h in
+    float32, wd [G, R, 2D] float16 or bfloat16, wf / wg [G, D, R] float32.
+    Returns h's shape in float32 (gate g's weights for all its L rows)."""
+    shape = h.shape
+    rows = int(shape[1]) if h.ndim == 3 else 1
+    D = int(shape[-1])
+    h = h.reshape(-1, D)
+    G = int(h.shape[0])
     R = int(wd.shape[1])
     if R % 32 or wf.dtype != mx.float32 or wg.dtype != mx.float32 or wd.dtype not in (mx.float16, mx.bfloat16):
         raise ValueError(f"message_gates: unsupported weight layout (R={R}, wd {wd.dtype}, wf {wf.dtype}, wg {wg.dtype})")
-    m = m.astype(mx.float32)
+    m = m.astype(mx.float32).reshape(-1, D)
     RB = 8
     (s,) = _gate_down_kernel()(
         inputs=[h, m, wd],
-        template=[("TH", h.dtype), ("TW", wd.dtype), ("D", D), ("R", R), ("RB", RB), ("EPS", _f(eps))],
+        template=[("TH", h.dtype), ("TW", wd.dtype), ("D", D), ("R", R), ("RB", RB), ("EPS", _f(eps)), ("ROWS", rows)],
         grid=(((R + RB - 1) // RB) * 256, G, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(G, R)],
@@ -140,13 +147,13 @@ def message_gates(h: mx.array, m: mx.array, wd: mx.array, wf: mx.array, wg: mx.a
     DB = 32
     (out,) = _gate_mix_kernel()(
         inputs=[s, wf, wg, h, m],
-        template=[("D", D), ("R", R), ("DB", DB)],
+        template=[("D", D), ("R", R), ("DB", DB), ("ROWS", rows)],
         grid=(((D + DB - 1) // DB) * 256, G, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(G, D)],
         output_dtypes=[mx.float32],
     )
-    return out
+    return out.reshape(shape)
 
 
 def _f(value: float) -> int:
