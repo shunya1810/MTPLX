@@ -94,6 +94,25 @@ _DECODE_COMPILE = (os.environ.get("MTPLX_INKLING2_DECODE_COMPILE") or "1").strip
 _FUSED_MOE_MAX_PAIRS = _env_int("MTPLX_INKLING2_FUSED_MOE_PAIRS", 64)
 
 
+# One-token kernels (kernels/inkling2_decode.py): fused message gates and the
+# short-convolution step. MTPLX_INKLING2_DECODE_KERNELS=0 keeps MLX ops.
+_DECODE_KERNELS = (os.environ.get("MTPLX_INKLING2_DECODE_KERNELS") or "1").strip() not in {
+    "0",
+    "false",
+    "off",
+}
+
+
+# Projections of one input as a single 8-bit matmul (decode / verify / prefill).
+_FUSED_PROJ = (os.environ.get("MTPLX_INKLING2_FUSED_PROJ") or "1").strip() not in {"0", "false", "off"}
+
+
+def _tail3(window: mx.array) -> mx.array:
+    """The next conv state: the last 3 rows of a 4-row window, or a 3-row
+    state the conv step kernel already produced."""
+    return window if window.shape[1] == 3 else window[:, -3:]
+
+
 def _use_kernels() -> bool:
     return mx.default_device() == mx.gpu and mx.metal.is_available()
 
@@ -243,6 +262,22 @@ class ShortConvolution(nn.Module):
         conv_mask: mx.array | None,
     ) -> tuple[mx.array, mx.array]:
         K = self.kernel_size
+        if (
+            _DECODE_KERNELS
+            and K == 4
+            and hidden_states.shape[1] == 1
+            and hidden_states.shape[0] == 1
+            and conv_state is not None
+            and conv_mask is None
+            and hidden_states.dtype in (mx.float16, mx.bfloat16)
+            and _use_kernels()
+        ):
+            # One kernel: conv, residual, scale and the next state. Returns
+            # the 3-row state in place of the 4-row window (_conv_state and
+            # _tail3 take the last 3 rows of either).
+            from ..kernels.inkling2_decode import conv_step
+
+            return conv_step(hidden_states, conv_state, self.conv1d.weight)
         residual = hidden_states.astype(mx.float32)
         window = _conv_input(hidden_states, conv_state, conv_mask, K)
         # As the reference, the conv runs in the weight dtype.
@@ -437,12 +472,16 @@ class Attention(nn.Module):
         value_states: mx.array,
         relative_states: mx.array,
         tau: mx.array | None = None,
+        gate: mx.array | None = None,
+        sinks: mx.array | None = None,
     ) -> tuple:
         """Everything before the KV cache: gate, sinks, clipped q/k, unit-RMS
         v, the relative bias rows; q/k/v come back (B, H, L, D)."""
         B, L, _ = hidden_states.shape
-        gate = self.gate_proj(hidden_states)
-        sinks = self.sink_proj(hidden_states)
+        if gate is None:
+            gate = self.gate_proj(hidden_states)
+        if sinks is None:
+            sinks = self.sink_proj(hidden_states)
 
         query_states = query_states.reshape(B, L, self.num_heads, -1)
         key_states = key_states.reshape(B, L, self.num_key_value_heads, -1)
@@ -468,6 +507,61 @@ class Attention(nn.Module):
         value_states = value_states.transpose(0, 2, 1, 3)
         return query_states, key_states, value_states, position_bias, sinks, gate
 
+    def _fused_linear(self, names: tuple):
+        """One 8-bit affine matmul for several projections of the same input
+        (rows concatenated; a float projection is quantized to join). None
+        when the members do not share a quantization."""
+        table = self.__dict__.get("_fused_proj")
+        if table is None:
+            table = {}
+            object.__setattr__(self, "_fused_proj", table)
+        if names in table:
+            return table[names]
+        ws, ss, bs, rows = [], [], [], []
+        for name in names:
+            mod = getattr(self, name)
+            if isinstance(mod, nn.QuantizedLinear):
+                if mod.bits != 8 or mod.group_size != _PROJ_GROUP_SIZE or getattr(mod, "mode", "affine") != "affine":
+                    table[names] = None
+                    return None
+                w, sc, bi = mod.weight, mod.scales, mod.biases
+            elif (
+                name == "sink_proj"
+                and isinstance(mod, nn.Linear)
+                and "bias" not in mod
+                and mod.weight.shape[-1] % _PROJ_GROUP_SIZE == 0
+            ):
+                # 24 rows: quantized to ride in the same matmul (the generic
+                # path reads the same fused sinks, so prefill and decode agree).
+                w, sc, bi = mx.quantize(mod.weight, group_size=_PROJ_GROUP_SIZE, bits=8)
+            else:
+                table[names] = None
+                return None
+            ws.append(w)
+            ss.append(sc)
+            bs.append(bi)
+            rows.append(int(w.shape[0]))
+        dtypes = {a.dtype for a in ss}
+        if len(dtypes) != 1:
+            table[names] = None
+            return None
+        W, S, Bi = (mx.concatenate(x, axis=0) for x in (ws, ss, bs))
+        mx.eval(W, S, Bi)
+        splits, run = [], 0
+        for r in rows[:-1]:
+            run += r
+            splits.append(run)
+        table[names] = (W, S, Bi, splits)
+        return table[names]
+
+    def _project_fused(self, x: mx.array, names: tuple):
+        fused = self._fused_linear(names) if _FUSED_PROJ else None
+        if fused is None:
+            return None
+        W, S, Bi, splits = fused
+        y = mx.quantized_matmul(x, W, S, Bi, transpose=True, group_size=_PROJ_GROUP_SIZE, bits=8)
+        return mx.split(y, splits, axis=-1)
+
     def _finish(self, attn_output: mx.array, gate: mx.array) -> mx.array:
         B, L = gate.shape[:2]
         attn_output = attn_output.reshape(B, L, -1).astype(mx.float32)
@@ -483,9 +577,12 @@ class Attention(nn.Module):
         relative_states: mx.array,
         cache: Any | None,
         tau: mx.array | None = None,
+        gate: mx.array | None = None,
+        sinks: mx.array | None = None,
     ) -> mx.array:
         query_states, key_states, value_states, position_bias, sinks, gate = self._prep(
-            hidden_states, query_states, key_states, value_states, relative_states, tau
+            hidden_states, query_states, key_states, value_states, relative_states, tau,
+            gate=gate, sinks=sinks,
         )
         if cache is not None:
             key_states, value_states = cache.update_and_fetch(key_states, value_states)
@@ -557,18 +654,34 @@ class SlidingAttention(Attention):
         self.v_sconv = ShortConvolution(dims, args.sconv_kernel_size)
 
     def _project(self, hidden_states, key_hidden_states, value_hidden_states, conv_states, conv_mask):
-        key_states, conv_states[0] = self.k_sconv(
-            self.k_proj(key_hidden_states), conv_states[0], conv_mask
+        q, k, v, r, _, _ = self._project_all(
+            hidden_states, key_hidden_states, value_hidden_states, conv_states, conv_mask
         )
-        value_states, conv_states[1] = self.v_sconv(
-            self.v_proj(value_hidden_states), conv_states[1], conv_mask
-        )
-        return (
-            self.q_proj(hidden_states),
-            key_states,
-            value_states,
-            self.r_proj(hidden_states),
-        )
+        return q, k, v, r
+
+    def _project_all(self, hidden_states, key_hidden_states, value_hidden_states, conv_states, conv_mask):
+        """q, conv'd k, conv'd v, r, gate, sinks (gate / sinks None when not
+        fused: _prep computes them)."""
+        gate = sinks = None
+        k_raw = v_raw = None
+        parts = None
+        if key_hidden_states is hidden_states and value_hidden_states is hidden_states:
+            parts = self._project_fused(
+                hidden_states, ("q_proj", "r_proj", "gate_proj", "sink_proj", "k_proj", "v_proj")
+            )
+            if parts is not None:
+                q, r, gate, sinks, k_raw, v_raw = parts
+        if parts is None:
+            parts = self._project_fused(hidden_states, ("q_proj", "r_proj", "gate_proj", "sink_proj"))
+            if parts is not None:
+                q, r, gate, sinks = parts
+            else:
+                q, r = self.q_proj(hidden_states), self.r_proj(hidden_states)
+            k_raw = self.k_proj(key_hidden_states)
+            v_raw = self.v_proj(value_hidden_states)
+        key_states, conv_states[0] = self.k_sconv(k_raw, conv_states[0], conv_mask)
+        value_states, conv_states[1] = self.v_sconv(v_raw, conv_states[1], conv_mask)
+        return q, key_states, value_states, r, gate, sinks
 
     def __call__(
         self,
@@ -581,10 +694,10 @@ class SlidingAttention(Attention):
         conv_mask: mx.array | None,
     ) -> mx.array:
         kv_cache = cache[0] if cache is not None else None
-        q, k, v, r = self._project(
+        q, k, v, r, gate, sinks = self._project_all(
             hidden_states, key_hidden_states, value_hidden_states, conv_states, conv_mask
         )
-        return self._attend(hidden_states, q, k, v, r, kv_cache)
+        return self._attend(hidden_states, q, k, v, r, kv_cache, gate=gate, sinks=sinks)
 
 
 class FullAttention(Attention):
@@ -598,6 +711,18 @@ class FullAttention(Attention):
         self.log_scaling_alpha = args.log_scaling_alpha
 
     def _project(self, hidden_states, key_hidden_states, value_hidden_states, conv_states, conv_mask):
+        q, k, v, r, _, _ = self._project_all(
+            hidden_states, key_hidden_states, value_hidden_states, conv_states, conv_mask
+        )
+        return q, k, v, r
+
+    def _project_all(self, hidden_states, key_hidden_states, value_hidden_states, conv_states, conv_mask):
+        gate = sinks = None
+        parts = self._project_fused(hidden_states, ("q_proj", "r_proj", "gate_proj", "sink_proj"))
+        if parts is not None:
+            q, r, gate, sinks = parts
+        else:
+            q, r = self.q_proj(hidden_states), self.r_proj(hidden_states)
         key_states, conv_states[0] = self.k_sconv(
             self.k_proj(key_hidden_states),
             key_hidden_states,
@@ -610,12 +735,7 @@ class FullAttention(Attention):
             conv_states[1],
             conv_mask,
         )
-        return (
-            self.q_proj(hidden_states),
-            key_states,
-            value_states,
-            self.r_proj(hidden_states),
-        )
+        return q, key_states, value_states, r, gate, sinks
 
     def _tau(self, offset, length: int) -> mx.array:
         position_ids = _positions(offset, length).astype(mx.float32)
@@ -641,12 +761,12 @@ class FullAttention(Attention):
         conv_mask: mx.array | None,
     ) -> mx.array:
         kv_cache = cache[0] if cache is not None else None
-        q, k, v, r = self._project(
+        q, k, v, r, gate, sinks = self._project_all(
             hidden_states, key_hidden_states, value_hidden_states, conv_states, conv_mask
         )
         offset = kv_cache.offset if kv_cache is not None else 0
         tau = self._tau(offset, hidden_states.shape[1])
-        return self._attend(hidden_states, q, k, v, r, kv_cache, tau=tau)
+        return self._attend(hidden_states, q, k, v, r, kv_cache, tau=tau, gate=gate, sinks=sinks)
 
 
 # --------------------------------------------------------------------------
@@ -910,8 +1030,48 @@ class DecoderLayer(nn.Module):
             self.v_message_gate = MessageGate(dims, rank)
             self.mlp_message_gate = MessageGate(dims, rank)
 
+    def _fused_gate_weights(self) -> tuple:
+        cached = self.__dict__.get("_gate_weights")
+        if cached is None:
+            gates = (self.q_message_gate, self.k_message_gate, self.v_message_gate)
+            qkv = tuple(
+                mx.stack([getattr(g, name).weight for g in gates])
+                for name in ("down_proj", "forget_gate_proj", "message_gate_proj")
+            )
+            mlp = tuple(
+                getattr(self.mlp_message_gate, name).weight[None]
+                for name in ("down_proj", "forget_gate_proj", "message_gate_proj")
+            )
+            mx.eval(qkv, mlp)
+            cached = (qkv, mlp)
+            object.__setattr__(self, "_gate_weights", cached)
+        return cached
+
+    def _gates_fusable(self, ref: mx.array) -> bool:
+        if not (_DECODE_KERNELS and _use_kernels()):
+            return False
+        if ref.ndim != 3 or ref.shape[0] != 1 or ref.shape[1] != 1:
+            return False
+        g = self.q_message_gate
+        return (
+            g.down_proj.weight.dtype == mx.float16
+            and g.forget_gate_proj.weight.dtype == mx.float32
+            and g.message_gate_proj.weight.dtype == mx.float32
+        )
+
     def _mix_messages(self, states: tuple, messages: mx.array) -> tuple:
         q_states, k_states, v_states = states
+        if self._gates_fusable(q_states):
+            # One token: the three gates in two kernels.
+            from ..kernels.inkling2_decode import message_gates
+
+            dims = q_states.shape[-1]
+            dtype = mx.float32 if any(x.dtype == mx.float32 for x in states) else q_states.dtype
+            h3 = mx.concatenate([x.reshape(1, dims).astype(dtype) for x in states], axis=0)
+            m3 = messages.reshape(-1, dims)[:3]
+            (wd, wf, wg), _ = self._fused_gate_weights()
+            out = message_gates(h3, m3, wd, wf, wg)
+            return tuple(out[i].reshape(1, 1, dims) for i in range(3))
         return (
             self.q_message_gate(q_states, messages[..., 0, :]),
             self.k_message_gate(k_states, messages[..., 1, :]),
@@ -1004,8 +1164,8 @@ class DecoderLayer(nn.Module):
                     attention_inputs = self.attention_input(bs, normed_residual)
                 hq, hk, hv = self._attn_inputs(h, attention_inputs, msg)
                 conv_states = [c0, c1]
-                q, k, v, r = attn._project(hq, hk, hv, conv_states, None)
-                q, k, v, pb, sinks, gate = attn._prep(hq, q, k, v, r, tau)
+                q, k, v, r, gate, sinks = attn._project_all(hq, hk, hv, conv_states, None)
+                q, k, v, pb, sinks, gate = attn._prep(hq, q, k, v, r, tau, gate=gate, sinks=sinks)
                 return (
                     q,
                     k,
@@ -1013,8 +1173,8 @@ class DecoderLayer(nn.Module):
                     pb,
                     sinks,
                     gate,
-                    conv_states[0][:, 1:],
-                    conv_states[1][:, 1:],
+                    _tail3(conv_states[0]),
+                    _tail3(conv_states[1]),
                     normed_residual,
                 )
 
@@ -1033,11 +1193,20 @@ class DecoderLayer(nn.Module):
                     residual = x = h.astype(mx.float32) + x
                 x = self.mlp_input(bs, unweighted_rms_norm(x))[..., 0, :]
                 if msg is not None:
-                    x = self.mlp_message_gate(x, msg[..., 3, :])
+                    if self._gates_fusable(x):
+                        from ..kernels.inkling2_decode import message_gates
+
+                        dims = x.shape[-1]
+                        _, (wd, wf, wg) = self._fused_gate_weights()
+                        x = message_gates(
+                            x.reshape(1, dims), msg.reshape(-1, dims)[3:4], wd, wf, wg
+                        ).reshape(1, 1, dims)
+                    else:
+                        x = self.mlp_message_gate(x, msg[..., 3, :])
                 x = self.mlp(self.post_attention_layernorm(x).astype(dtype))
                 x, w3 = self.post_mlp_convolution(x, c3, None)
                 out = (residual + x.astype(mx.float32)).astype(dtype)
-                return out, bs, w2[:, 1:], w3[:, 1:]
+                return out, bs, _tail3(w2), _tail3(w3)
 
             fns[key] = (mx.compile(pre), mx.compile(post))
         return fns[key]
