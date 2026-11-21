@@ -90,6 +90,7 @@ From bench 2 of [apple-silicon-llm-bench](https://github.com/shunya1810/apple-si
 - v2.12.3-m1.16 adds Qwen3.8-Flash-Next from Unsloth's UD-Q2_0 GGUF (see the feature list below) and does not change the paths of the models in these tables, so they were not re-measured.
 - v2.12.3-m1.17 speeds up Qwen3.8-Flash-Next (Japanese decode 1.4–1.6x with thinking on) and keeps long anonymous chats restorable; the models in these tables keep their paths and were not re-measured.
 - v2.12.3-m1.18 speeds up Qwen3.8-Flash-Next's long contexts (128K cold prompt 281 → 388 tok/s, decode 36.7 → 40.5 tok/s) and stores its QSA KV in int8 by default, which lets 192K and 256K complete on a 64 GB Mac (m1.17 could not); the models in these tables keep their paths and were not re-measured.
+- v2.12.3-m1.19 adds Thinking Machines' Inkling-2-Mini (see the feature list below) and does not change the paths of the models in these tables, so they were not re-measured.
 - Qwen3.6-35B-A3B now reads 32K–64K prompts more slowly than Ornith-1.5-35B-A3B, which has the same layout (931 against 1,026 tok/s at 32K); on v2.12.2-m1.10 the two were equal (1,028 and 1,034). m1.13 does not change prefill and was not slower than m1.12 on the same day (cold prompts of about 29K and 104K tokens: 910 and 513 tok/s against 697 and 444). The cause is being investigated.
 - The 8K–128K prompts repeat one 11K-token HTML file. Read to about 256K (22 repeats), Qwen3.8-27B predicts its own next tokens poorly from the third repeat on (upstream MTPLX too), and the draft head, which reads the model's hidden states, then rarely matches, so 256K is shown with the non-repeating text above instead.
 - MacBook Pro M1 Max 64 GB, macOS 26. Profile `turbo`, 256K context limit, 8-bit KV cache, temperature 0.6 with fixed seeds.
@@ -119,6 +120,7 @@ From bench 2 of [apple-silicon-llm-bench](https://github.com/shunya1810/apple-si
 - Qwen3.5, 3.6 and 3.8 family models launch on `turbo` on M1 when no profile is given. The family is read from `model_type` in `config.json`, so fine-tunes and packs you forge yourself are included.
 - Models with the same layout as Qwen3.6-35B-A3B (256 experts, 8 per token, hidden size 2048, 40 layers, 4-bit body in groups of 64) also get the A3B optimizations: decode rounds queued on the GPU back to back, context-copy for file rewrites, and more.
 - `turbo`'s verify kernels cover 4-bit, 6-bit and 8-bit affine quantization. Other quantizations (3-bit, mxfp4, ternary and so on) compute those matmuls on the stock path.
+- Inkling-2-Mini runs on its own AR lane ([USAGE](docs/m1max-longctx/USAGE.md#inkling-2-mini-thinking-machines)).
 - Models of other families launch on `sustained`, as upstream. Choosing `turbo` with `--profile turbo` or the profile setting in the app may enable the M1 changes for them; that combination is not measured.
 - [Re-measure the MTP depth](#re-measure-the-mtp-depth) finds each model's fastest depth.
 
@@ -219,6 +221,7 @@ scripts/m1-depth-sweep.py --model "$HOME/.mtplx/models/<model folder>"
 - Defaults: Qwen3.5, 3.6 and 3.8 family models launch on `turbo`. A Qwen3.6-35B-A3B family model started from the app also takes the A3B path.
 - Qwen4 groundwork (not yet tested on a real Qwen4 model): upstream's `qwen4_exp` path is written for Qwen3.8-Flash-Next (hidden size 2560, MoE, 24 query / 2 KV heads). In case a Qwen4 model uses this architecture at another size, it also takes dense layers, other widths and other head layouts. On M1, bf16 packs of this family run in fp16.
 - Qwen3.8-Flash-Next on a 64 GB Mac, recommended from Unsloth's UD-Q2_0 GGUF: `scripts/setup_flashnext_unsloth.py` downloads and converts it ([USAGE](docs/m1max-longctx/USAGE.md#qwen38-flash-next-unsloth-ud-q2_0)). The routed experts (IQ2_XXS / IQ2_S / Q2_0 / IQ4_NL blocks) and the n-gram table stay in the GGUF and are read by M1 kernels. On the M1 Max, with thinking on and a 2K prompt, it decodes code / English / Japanese / an agent log at 47.8 / 42.0 / 43.7 / 45.3 tok/s and reads a 32K prompt in about 83 s and a 128K prompt in about 440 s, with a peak of about 50–55 GB (fp16 KV; 128K is the longest that always fits a 64 GB Mac), and its perplexity is far lower than with ISTA's Q2_0 GGUF (Japanese prose 20.2 against 34.6), which `scripts/convert_flashnext_ista_gguf.py` still converts.
+- Thinking Machines' Inkling-2-Mini from its official NVFP4 / MXFP8 weights (AR, no MTP; v2.12.3-m1.19). On the M1 Max it reads a 16K prompt at about 500 tok/s and decodes at 49 tok/s after a 2K prompt. Its experts run as a GEMM with per-expert tiles, its attention on MLX's steel attention with the relative bias added, its one-token decode on fused kernels, and the next token is drawn on the GPU so the CPU work overlaps. Forged into `~/.mtplx/models` it also shows up in the app ([USAGE](docs/m1max-longctx/USAGE.md#inkling-2-mini-thinking-machines)).
 - Agent sessions (on any Mac): finding the same conversation again across history rewrites, keeping the cache when thinking is switched on or off, keeping whitespace in tool arguments, retrying a request when macOS stops a long GPU command, resuming from the deepest saved state, and more.
 
 Every change with its measurements: [CHANGES.ja.md](docs/m1max-longctx/CHANGES.ja.md) (Japanese) and the [release notes](https://github.com/shunya1810/MTPLX/releases).
@@ -235,7 +238,7 @@ Each M1 default can be turned off with an environment variable; `MTPLX_M1_LONG_C
 | `MTPLX_M1_PAGED_PREFILL=0` | on from 32K | prefill straight into 8-bit pages |
 | `MTPLX_M1_ENGINE_RAM_FRACTION=0.75` | 13/16 of memory | the engine's memory cap (set a smaller value) |
 | `MTPLX_M1_TURBO_DEFAULT=0` | `turbo` for Qwen3.5, 3.6 and 3.8 families | the `turbo` default |
-| `MTPLX_M1_FP16_CAST=0` | on for the `qwen4_exp` family | running a bf16 pack in fp16 (`=1` turns it on for other families; no effect on fp16 packs) |
+| `MTPLX_M1_FP16_CAST=0` | on for the `qwen4_exp` family and Inkling | running a bf16 pack in fp16 (`=1` turns it on for other families; no effect on fp16 packs) |
 | `MTPLX_M1_MOE_LANE=0` | on for MoE models | every MoE default (the rows below included) |
 | `MTPLX_M1_RESIDENT_DECODE=0` | on for Qwen3.6-35B-A3B family models | decode rounds queued on the GPU |
 | `MTPLX_A3B_GDN_FUSED=0` | on for Qwen3.6-35B-A3B family models | one kernel per GDN layer in verify |

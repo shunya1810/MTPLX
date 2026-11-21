@@ -123,6 +123,31 @@ PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/pyth
 - M1 Max 64 GB での実測（思考あり、コード / 英語 / 日本語 / エージェントのログ）: decode は 2K のプロンプトの後で 47.8 / 42.0 / 43.7 / 45.3 tok/s、3.2 万トークンの後で 44.2 / 41.6 / 38.4 / 48.6 tok/s、12.8 万トークンの後で 37.5 / 37.2 / 34.8 / 42.8 tok/s です。cold なプロンプトの読み込みは 2K で約 5.4 秒、8K で約 20.5 秒、3.2 万トークンで約 83 秒、12.8 万トークンで約 440 秒です。
 - Unsloth のファイルを勧める理由: ISTA の Q2_0 の GGUF（Splash が使うもの。こちらも使えます）と比べて、perplexity が英語の小説 / 日本語の小説 / コード / エージェントのログで 7.30 / 34.6 / 2.77 / 2.65 から 6.77 / 20.2 / 2.47 / 1.94 に下がります。その代わり decode とプロンプトの読み込みが数 % 遅くなります（v2.12.3-m1.16 での計測）。プロンプトの中の事実を答える質問は 48 問すべて正解でした（ISTA は 3.2 万トークンで 2 問を外しました）。Unsloth は routed の expert を IQ2_XXS / IQ2_S（gate、up）と Q2_0 / IQ4_NL（down）で、dense の層を Q5_K〜Q8_0 で量子化しています。ISTA の dense は Q2_0〜Q4_K です。
 
+## Inkling-2-Mini（Thinking Machines）
+
+Inkling-2-Mini（MoE、expert 128 個から 8 個、24 層のうち 12 層を 3 周する構造）は、公式の重み（NVFP4 / MXFP8、約 20 GB）のまま動きます。MTP の draft は使わず、自己回帰（AR）で動きます。v2.12.3-m1.19 から対応しています。
+
+必要なもの: 32 GB 以上の Mac（計測は 64 GB だけです）、約 20 GB の空きディスク、上のネイティブ拡張。forge で `~/.mtplx/models` に置くと、アプリのモデル一覧にも出ます（変換はしないので数分で終わります。ダウンロードした重みとは hardlink でつなぐので、同じディスクならディスクは増えません）。
+
+```bash
+PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli forge build \
+  --repo thinkingmachines/Inkling-2-Mini --out "$HOME/.mtplx/forge-runs" --run-id inkling2 \
+  --recipe '{"bodyBits":4,"bodyDtype":"auto","bodyGroupSize":64,"bodyMode":"affine","mtpPolicy":"keep_bf16"}' \
+  --branded-name thinkingmachines-Inkling-2-Mini-MTPLX --model-root "$HOME/.mtplx/models"
+```
+
+サーバーだけで使うときは、forge したフォルダ（またはダウンロードしたフォルダ）を指定します。
+
+```bash
+PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli serve \
+  --model "$HOME/.mtplx/models/thinkingmachines-Inkling-2-Mini-MTPLX" --host 127.0.0.1 --port 8000 --no-auth --yes
+```
+
+- M1 Max 64 GB での実測（v2.12.3-m1.19、サーバー、temperature 0）: prefill は 2K で 496、1.6 万トークンで 495〜516、3 万トークンで 469 tok/s、decode は 49 / 45 / 42 tok/s です。
+- MTP の深さや `--paged-kv-quantization q8` を指定しても、AR と fp16 の KV に自動で切り替わります。`mtplx tune` には対応していません。
+- 思考の深さ（reasoning effort）は low / medium / high / xhigh で、既定は high です。難しいエージェントの作業では長く考えるので、時間の制限がある使い方では medium が向きます。sampling の既定は temperature 1.0 です。
+- 文脈は 1M トークンまでのモデルです。既定の上限は Mac のメモリから決まり、起動時のログに出ます。それより長いプロンプトは `--context-window` で広げます（実測は CHANGES の m1.19 の節にあります）。1 トークンあたりの KV は 32 KB で、長いほど prefill と decode が遅くなります（25.6 万トークンで prefill 236 tok/s、decode 19.8 tok/s、52 万トークンで 154 tok/s と 12.0 tok/s）。64 GB の Mac では 1M は fp16 の KV が収まりません。
+
 ## 使う
 
 - ブラウザのチャット画面: <http://127.0.0.1:8000/>

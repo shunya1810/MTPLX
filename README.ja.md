@@ -90,6 +90,7 @@
 - v2.12.3-m1.16 では、Unsloth の UD-Q2_0 の GGUF で Qwen3.8-Flash-Next を動かせるようにしました（下の機能の一覧を参照）。この表のモデルの経路は変わらないので、表は測り直していません。
 - v2.12.3-m1.17 では、Qwen3.8-Flash-Next を速くしました（思考ありの日本語の decode が 1.4〜1.6 倍）。長い匿名の会話も 2 回目以降をキャッシュから戻せるようにしました。この表のモデルの経路は変わらないので、表は測り直していません。
 - v2.12.3-m1.18 では、Qwen3.8-Flash-Next の長い文脈を速くしました（12.8 万トークンの cold な読み込みが 281 → 388 tok/s、decode が 36.7 → 40.5 tok/s）。QSA の KV を既定で int8 にしたので、64 GB の Mac で 19.2 万と 25.6 万トークンも完走します（m1.17 は収まりませんでした）。この表のモデルの経路は変わらないので、表は測り直していません。
+- v2.12.3-m1.19 では、Thinking Machines の Inkling-2-Mini を動かせるようにしました（下の機能の一覧を参照）。この表のモデルの経路は変わらないので、表は測り直していません。
 - Qwen3.6-35B-A3B は、同じ構成の Ornith-1.5-35B-A3B より 32K〜64K のプロンプトの読み込みが遅くなっています（32K で 931 と 1,026 tok/s）。v2.12.2-m1.10 では同じでした（1,028 と 1,034）。m1.13 は prefill を変えておらず、同じ日の m1.12 との比較でも遅くはありません（約 2.9 万と 10.4 万トークンの cold のプロンプトで 910 と 513 tok/s、m1.12 は 697 と 444）。原因は調べている途中です。
 - 8K〜128K のプロンプトは、1 万 1 千トークンの HTML ファイルを繰り返したものです。約 256K（22 回の繰り返し）まで読ませると、3 回目の繰り返しから Qwen3.8-27B 自身の次のトークンの予測が当たらなくなり（本家でも同じ）、モデルの hidden state を読む draft ヘッドも当たらなくなります。そのため 256K 前後は、上の繰り返しのない文章の計測で示しています。
 - MacBook Pro M1 Max 64 GB、macOS 26。プロファイルは `turbo`、文脈の上限は 256K、KV キャッシュは 8bit、temperature は 0.6（seed 固定）です。
@@ -119,6 +120,7 @@
 - Qwen3.5・3.6・3.8 系のモデルは、M1 ではプロファイルを指定しないと `turbo` で起動します。系統は `config.json` の `model_type` で判定するので、派生モデルや自分で forge したモデルも対象です。
 - Qwen3.6-35B-A3B と同じ構成のモデル（expert 256 個、1 トークンあたり 8 個、隠れ層の幅 2048、40 層、本体が 4bit・64 値ごと）は、A3B 用の最適化（GPU 上で decode の round を続けて投入する経路、ファイルの書き直しを速くする context-copy など）も有効になります。
 - `turbo` の verify 用の kernel が対応する量子化は、4bit・6bit・8bit の affine です。それ以外の量子化（3bit、mxfp4、3 値など）では、標準の行列積で計算します。
+- Inkling-2-Mini は専用の AR の経路で動きます（[USAGE](docs/m1max-longctx/USAGE.ja.md#inkling-2-minithinking-machines)）。
 - ほかの系統のモデルは、本家と同じく `sustained` で起動します。`--profile turbo`、またはアプリの設定のプロファイルで `turbo` を選ぶと、M1 向けの変更が効く場合があります。この組み合わせは計測していません。
 - モデルごとに一番速い MTP の深さは、「[MTP の深さを測り直す](#mtp-の深さを測り直す)」で確かめられます。
 
@@ -219,6 +221,7 @@ scripts/m1-depth-sweep.py --model "$HOME/.mtplx/models/<モデルのフォルダ
 - 既定の設定: Qwen3.5・3.6・3.8 系は `turbo` で起動します。アプリから Qwen3.6-35B-A3B 系を起動したときも、A3B 用の経路を使います。
 - Qwen4 への下準備（実際の Qwen4 のモデルではまだ確かめていません）: 本家の `qwen4_exp` の経路は、Qwen3.8-Flash-Next（hidden 2560、MoE、query 24 / KV 2 ヘッド）用に書かれています。Qwen4 のモデルが同じアーキテクチャを別の大きさで使った場合に備えて、dense の層、ほかの幅、ほかのヘッド構成も扱えるようにしました。M1 では、この系統の bf16 のパックを fp16 に変換して動かします。
 - 64 GB の Mac で Qwen3.8-Flash-Next を動かせます。Unsloth の UD-Q2_0 の GGUF を勧めます。`scripts/setup_flashnext_unsloth.py` がダウンロードと変換をします（[USAGE](docs/m1max-longctx/USAGE.ja.md#qwen38-flash-nextunsloth-ud-q2_0)）。routed の expert（IQ2_XXS / IQ2_S / Q2_0 / IQ4_NL の block）と n-gram 表は GGUF に置いたまま、M1 向けの kernel で読みます。M1 Max では、思考ありで 2K のプロンプトのとき、decode がコード / 英語 / 日本語 / エージェントのログで 47.8 / 42.0 / 43.7 / 45.3 tok/s です。3.2 万トークンのプロンプトは約 83 秒、12.8 万トークンは約 440 秒で読み、ピークのメモリは約 50〜55 GB です（KV は fp16。64 GB の Mac で必ず収まるのは 12.8 万トークンまで）。perplexity は ISTA の Q2_0 の GGUF よりずっと低くなります（日本語の小説で 34.6 → 20.2）。ISTA の GGUF も、これまでどおり `scripts/convert_flashnext_ista_gguf.py` で変換できます。
+- Thinking Machines の Inkling-2-Mini（公式の NVFP4 / MXFP8 の重み）が動きます（MTP なしの AR、v2.12.3-m1.19）。M1 Max 64 GB で、prefill は 1.6 万トークンで約 500 tok/s、decode は 2K で 49 tok/s です。expert の行列積を expert ごとにそろえたタイルで計算し、attention は MLX の steel attention に相対位置のバイアスを入れたもので計算します。1 トークンの decode は小さな処理をまとめた kernel で動かし、次のトークンを GPU 上で引いて CPU の処理と重ねます。forge で `~/.mtplx/models` に置くとアプリでも使えます（[USAGE](docs/m1max-longctx/USAGE.ja.md#inkling-2-minithinking-machines)）。
 - エージェントの会話（M1 以外の Mac でも有効）: 履歴の書き換えをまたいで同じ会話を見つけ直す、thinking の有無を切り替えてもキャッシュを使い続ける、ツールの引数の空白を保つ、macOS が長い GPU の処理を止めたときに要求をやり直す、保存した状態の一番深いところから再開する、などの修正です。
 
 変更の一つ一つと計測の結果は、[CHANGES.ja.md](docs/m1max-longctx/CHANGES.ja.md) と[リリースノート](https://github.com/shunya1810/MTPLX/releases)にあります。
@@ -235,7 +238,7 @@ M1 向けの既定は、一つずつ環境変数で切れます。`MTPLX_M1_LONG
 | `MTPLX_M1_PAGED_PREFILL=0` | 32K 以上でオン | 8bit のページへの直接の prefill |
 | `MTPLX_M1_ENGINE_RAM_FRACTION=0.75` | メモリの 13/16 | エンジンに割り当てるメモリの上限（既定より小さくするとき） |
 | `MTPLX_M1_TURBO_DEFAULT=0` | Qwen3.5・3.6・3.8 系は `turbo` | `turbo` の既定 |
-| `MTPLX_M1_FP16_CAST=0` | `qwen4_exp` 系でオン | bf16 のパックを fp16 に変換して動かす処理（`=1` でほかの系統でもオン。fp16 のパックでは何もしません） |
+| `MTPLX_M1_FP16_CAST=0` | `qwen4_exp` 系と Inkling でオン | bf16 のパックを fp16 に変換して動かす処理（`=1` でほかの系統でもオン。fp16 のパックでは何もしません） |
 | `MTPLX_M1_MOE_LANE=0` | MoE のモデルでオン | MoE 向けの既定すべて（下の行も含む） |
 | `MTPLX_M1_RESIDENT_DECODE=0` | Qwen3.6-35B-A3B 系でオン | GPU 上で round を続けて投入する decode |
 | `MTPLX_A3B_GDN_FUSED=0` | Qwen3.6-35B-A3B 系でオン | verify で GDN の層を 1 つの kernel で計算すること |

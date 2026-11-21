@@ -122,6 +122,31 @@ PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/pyth
 - Measured on an M1 Max 64 GB with thinking on (code / English / Japanese / agent log): decode 47.8 / 42.0 / 43.7 / 45.3 tok/s after a 2K prompt, 44.2 / 41.6 / 38.4 / 48.6 after 32K and 37.5 / 37.2 / 34.8 / 42.8 after 128K; a cold 2K prompt takes about 5.4 s, 8K about 20.5 s, 32K about 83 s, 128K about 440 s.
 - Why Unsloth's file: against ISTA's Q2_0 GGUF (the one Splash serves, also supported), perplexity on English prose / Japanese prose / code / an agent log is 6.77 / 20.2 / 2.47 / 1.94 instead of 7.30 / 34.6 / 2.77 / 2.65, for a few percent slower decode and prompt reading (measured in v2.12.3-m1.16); on facts buried in the prompt it answered all 48 questions (ISTA missed 2 at 32K). Unsloth quantizes the routed experts as IQ2_XXS / IQ2_S (gate, up) and Q2_0 / IQ4_NL (down), and the dense layers at Q5_K–Q8_0 where ISTA's are Q2_0–Q4_K.
 
+## Inkling-2-Mini (Thinking Machines)
+
+Inkling-2-Mini (MoE, 8 of 128 experts, 12 of its 24 layers looped three times) runs from the official weights as they ship (NVFP4 / MXFP8, about 20 GB). It decodes autoregressively; its MTP drafter is not used. Supported from v2.12.3-m1.19.
+
+Requirements: a Mac with 32 GB or more (measured only on 64 GB), about 20 GB of free disk, and the native extensions above. Forging it into `~/.mtplx/models` also lists it in the app's model list (no conversion, a few minutes; the files are hard-linked to the download, so on the same disk it takes no extra space).
+
+```bash
+PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli forge build \
+  --repo thinkingmachines/Inkling-2-Mini --out "$HOME/.mtplx/forge-runs" --run-id inkling2 \
+  --recipe '{"bodyBits":4,"bodyDtype":"auto","bodyGroupSize":64,"bodyMode":"affine","mtpPolicy":"keep_bf16"}' \
+  --branded-name thinkingmachines-Inkling-2-Mini-MTPLX --model-root "$HOME/.mtplx/models"
+```
+
+To serve it without the app, point `--model` at the forged (or downloaded) folder:
+
+```bash
+PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli serve \
+  --model "$HOME/.mtplx/models/thinkingmachines-Inkling-2-Mini-MTPLX" --host 127.0.0.1 --port 8000 --no-auth --yes
+```
+
+- Measured on an M1 Max 64 GB (v2.12.3-m1.19, server, temperature 0): prefill 496 tok/s at 2K, 495–516 at 16K, 469 at 30K; decode 49 / 45 / 42 tok/s.
+- An MTP depth or `--paged-kv-quantization q8` falls back to AR and fp16 KV automatically. `mtplx tune` does not support it.
+- Reasoning effort is low / medium / high / xhigh, default high. It thinks long on hard agent tasks; medium suits time-limited use. Sampling defaults to temperature 1.0.
+- The model takes up to 1M tokens of context. The default window follows the Mac's memory and is printed at startup; widen it with `--context-window` (measurements in the m1.19 section of CHANGES). KV costs 32 KB per token, and prefill and decode slow down with length (256K: prefill 236 tok/s, decode 19.8 tok/s; 512K: 154 and 12.0 tok/s). On a 64 GB Mac 1M does not fit with fp16 KV.
+
 ## Use
 
 - Browser chat: <http://127.0.0.1:8000/>

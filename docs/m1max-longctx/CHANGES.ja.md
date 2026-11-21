@@ -1,8 +1,44 @@
-# v2.12.3-m1.18 / m1.17 / m1.16 / m1.15 / m1.14 / v2.12.2-m1.13 / m1.12 / m1.11 / m1.10 / m1.9 / m1.8 / m1.7 / m1.6 / m1.5 / m1.4 / m1.3 / m1.2 / m1.1 / v2.12.2-m1 / v2.12.0-m1 〜 m1.3 変更内容まとめ
+# v2.12.3-m1.19 / m1.18 / m1.17 / m1.16 / m1.15 / m1.14 / v2.12.2-m1.13 / m1.12 / m1.11 / m1.10 / m1.9 / m1.8 / m1.7 / m1.6 / m1.5 / m1.4 / m1.3 / m1.2 / m1.1 / v2.12.2-m1 / v2.12.0-m1 〜 m1.3 変更内容まとめ
 
 - **ベースリポジトリ：** MTPLX 2.12.3（本家 `youssofal/MTPLX` の v2.12.3）。`v2.12.2-m1.4`〜`m1.13` は 2.12.2、`v2.12.0-m1.3` までは 2.12.0 がベースです
-- **対象：** タグ `v2.12.3-m1.18`（ブランチ `m1max-longctx`）。下の「変更点一覧」の M1 向けの変更はそのまま引き継いでいます
+- **対象：** タグ `v2.12.3-m1.19`（ブランチ `m1max-longctx`）。下の「変更点一覧」の M1 向けの変更はそのまま引き継いでいます
 - **本家との差分：** コード、テストコード、各種ドキュメント（`docs/m1max-longctx/`）、起動・検証スクリプト
+
+## v2.12.3-m1.19 での変更（2026-11-22）
+
+Thinking Machines の Inkling-2-Mini（公式の重み `thinkingmachines/Inkling-2-Mini`、NVFP4 / MXFP8）が動くようになりました。MTP なしの自己回帰（AR）で動きます。ほかのモデルの経路は変わりません（変更はすべて Inkling の `model_type`、reasoning parser、モデル側の印で切り替わります）。ネイティブ拡張は m1.12 から変わっていないので、作り直す必要はありません。
+
+- **読み込み。** 24 層のうち 6〜17 層を 3 周する構造（層の通過は 48 回）、expert 128 個から 8 個、相対位置のバイアスと sink を持つ attention、depth attention、message gate、short conv を、このリポジトリ内のモデル（`mtplx/models/inkling2_loop.py`、mlx-lm PR #2086 の文章部分の移植）で動かします。公式の重みはそのまま読みます。expert は NVFP4（外側の倍率つき）で、20〜23 層は MXFP8 です。BF16 の射影・埋め込み・出力層は、読み込み時に 8bit の affine にします。M1 では bf16 を fp16 に変換して動かします（`MTPLX_M1_FP16_CAST`、Inkling も既定でオン）。perplexity は bf16 のままの計算と同じです（英語 / 日本語 / コード / エージェントのログで 6.593 / 10.320 / 2.157 / 1.791 → 6.599 / 10.285 / 2.165 / 1.788）。
+- **サーバー。** Inkling 用の AR の経路（`inkling2_ar`）を足しました。sampling の既定は temperature 1.0 / top_p 1.0 / top_k なし、思考の深さ（reasoning effort）は low / medium / high / xhigh で既定は high です。Inkling 独自のメッセージのチャンネル（思考、本文、ツール呼び出し）を、`reasoning_content` と `tool_calls` に変換します（`inkling2` の reasoning parser）。ツールの呼び出しと結果は、平文にせずテンプレートのまま渡します。セッションの保存は途中の境界を作らない設定にし（以前は境界ごとに全 visit の KV を複製し、5.3K トークンで 12.8 GB を保存していました）、メモリの見積もりは 1 トークンあたり 32,768 B（大域 attention の 8 回の通過の分）にしました。
+- **forge。** Inkling 用の AR だけの経路を足しました。変換はせずに重みを hardlink で置き、AR で動作を確かめ、`ar_only` の印を付けます。`~/.mtplx/models` に作れば、アプリのモデル一覧に出ます。`mtplx tune` には対応していません。
+- **decode。** 1 トークンの decode を、KV キャッシュの前後 2 つの compiled な関数で動かします。attention の前後の行の処理、message gate、short conv、NVFP4 / MXFP8 の expert（gate/up と SwiGLU、down と重み付きの和）を、それぞれ 1 つの kernel にしました。MLX の command buffer の上限（150 ops / 1000 MB）を Inkling の起動時の環境に入れます。さらに AR の生成ループで、次のトークンを GPU 上で引き、CPU が読む前に次の forward を投入します（`MTPLX_AR_PIPELINE`、Inkling では既定でオン、`=0` で切れます）。Inkling は 1 トークンの組み立てと投入に CPU を約 16 ms 使うので、これを GPU の計算と重ねます。サーバーの decode は 37 → 48 tok/s（2K）になりました。
+- **prefill。** expert の行列積を、expert ごとにタイルをそろえて計算します（`mtplx/kernels/inkling2_seg_gemm.py`）。MLX の steel の BlockMMA と量子化ローダーを使い、`gather_qmm` とビット単位で一致したまま、5.3 → 6.4 TFLOPS になりました（+13%）。相対バイアス付きの attention は、MLX の steel attention の本体にマスクとバイアスと行ごとの sink を入れたもの（`mtplx/kernels/inkling2_steel_attn.py`）に替えました（4.1〜4.4 → 5.4〜6.1 TFLOPS）。expert の前後の並べ替えと重み付きの和、message gate も kernel にしました。切り替え: `MTPLX_INKLING2_SEG_GEMM=0`、`MTPLX_INKLING2_STEEL_ATTENTION=0`、`MTPLX_INKLING2_PREFILL_MOE=0`、`MTPLX_INKLING2_GATE_COMPILE=0`。
+- **組み込んでいないもの。** 同梱の DSpark の draft（`mtp.safetensors`）は移植しました（`mtplx/models/inkling2_dspark.py`、`mtplx/models/inkling2_spec.py`）。ただ、M1 Max では投機的デコードが AR より遅いので、生成にはつないでいません。8 トークンの検証に 72 ms かかり（1 トークンは 18 ms）、受理は 1 回あたり平均 3.13 トークンでした。数トークンの検証を速くする経路（compiled、少数行の attention、expert を 1 回ずつ読む MoE）は入っています。
+
+**速さ（M1 Max 64 GB、サーバー、fp16、temperature 0、300 トークン生成、1 回ずつ）**
+
+| プロンプトの長さ | prefill（tok/s） | decode（tok/s） |
+|---|---|---|
+| 2K | 496 | 49.1 |
+| 4K | 506 | 47.3 |
+| 16K | 495〜516 | 44.6〜45.8 |
+| 30K | 469 | 41.8 |
+
+**長い文脈（同じ記録の中ほどの 1 行を答える課題、思考は low、`--context-window 1048576`、セッションの保存はオフ）**
+
+| 長さ | プロンプトの読み込み（秒） | prefill（tok/s） | decode（tok/s） | ピークのメモリ（GB） | 結果 |
+|---|---|---|---|---|---|
+| 256K | 1,113 | 236 | 19.8 | 33.9 | 正解 |
+| 512K | 3,412 | 154 | 12.0 | 43.0 | 正解 |
+| 1M（104 万） | — | — | — | 62.2（中断時） | prefill の終盤でメモリ不足（2.9 時間後に中断） |
+
+大域 attention は長さに比例して重くなるので、prefill と decode は長いほど遅くなります。1 トークンあたりの KV は 32 KB（大域の 8 回の通過の分。sliding window の 40 回の通過は 1,024 トークンで頭打ち）で、ほかの作業領域を含めると実測で約 41 KB ずつ増えます。1M（104 万トークン）は、fp16 の KV では 64 GB の Mac に収まりません。メモリの番人は受け付け時に約 80 GiB と見積もって拒否し、`--allow-swap` と `MTPLX_PREFILL_ADMISSION_SHED=0` で通しても、prefill の終盤で GPU のメモリを確保できずに止まります（スワップには逃げません）。64 GB の Mac で確かめた最長は 52 万トークンです。
+
+**動作の確認。** 日本語の 3 ターンの会話、思考の深さ 4 段階、思考なし、思考の途中での打ち切り、3.2 万トークンの中の 1 行を答える課題、複数のツールの同時呼び出しで、正しく動きました。OpenCode でのエージェントの課題（15 分の制限）では、バグ修正と型注釈は effort high で合格し、多角形の物理シミュレーションは effort medium で合格しました（high では 2 万トークン以上考えて時間切れ）。2.4 万トークンの文書を読んでまとめる課題は、英語版は満点のレポートを書きましたが、日本語版は思考が長く時間切れでした。
+
+**既知の制限。** 計測は M1 Max 64 GB の 1 台だけです。KV の 8bit 化（`--paged-kv-quantization q8`）には対応しておらず、指定しても fp16 に戻ります。思考の深さの既定（high）では、難しいエージェントの作業で長く考えます。
+
+**テスト。** 失敗は m1.18 と同じ 84 件で、増減はありません。Inkling の読み込み（公式の形式の重み）、1 トークンの decode と数行の forward、fp16 の kernel、prefill の expert の GEMM と attention、DSpark、AR の pipeline のテストを追加しました。
 
 ## v2.12.3-m1.18 での変更（2026-11-19）
 
