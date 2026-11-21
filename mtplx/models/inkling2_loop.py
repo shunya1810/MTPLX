@@ -1274,7 +1274,8 @@ class DecoderLayer(nn.Module):
             return False
         g = self.q_message_gate
         return (
-            g.down_proj.weight.dtype == mx.float16
+            g.down_proj.weight.dtype in (mx.float16, mx.bfloat16)
+            and g.down_proj.weight.shape[0] % 32 == 0
             and g.forget_gate_proj.weight.dtype == mx.float32
             and g.message_gate_proj.weight.dtype == mx.float32
         )

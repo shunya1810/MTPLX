@@ -22,11 +22,11 @@ __all__ = ["message_gates", "conv_step"]
 # --------------------------------------------------------------------------
 # Message gates
 #
-# MessageGate(h, m): s = Wd . fp16(concat(rms(h), rms(m)))   (fp16 Linear)
+# MessageGate(h, m): s = Wd . TW(concat(rms(h), rms(m)))   (TW = Wd's dtype)
 #                    out = (1 - tanh(Wf . s)) * h + tanh(Wg . s) * m
 # rms is the unweighted RMS norm (eps 1e-6), rounded to h's dtype for the h
-# half and to float16 for both halves before the projection (the reference
-# concatenates in float32 and casts to the down weight's float16).
+# half and to the down weight's dtype for both halves before the projection
+# (the reference concatenates in float32 and casts to the weight's dtype).
 
 _GATE_DOWN_SRC = r"""
     // grid: (RB-row blocks of R) x G ; threadgroup 256
@@ -57,15 +57,15 @@ _GATE_DOWN_SRC = r"""
     for (uint rr = sg; rr < (uint)RB; rr += 8) {
         const uint r = r0 + rr;
         if (r >= (uint)R) break;
-        const device half* w = wd + ((ulong)g * R + r) * (2 * D);
+        const device TW* w = wd + ((ulong)g * R + r) * (2 * D);
         float acc = 0.0f;
         for (uint i = lane; i < (uint)D; i += 32) {
-            const half xh = (half)(TH)((float)hg[i] * ih);
-            const half xm = (half)(mg[i] * im);
+            const TW xh = (TW)(float)(TH)((float)hg[i] * ih);
+            const TW xm = (TW)(mg[i] * im);
             acc += (float)w[i] * (float)xh + (float)w[D + i] * (float)xm;
         }
         acc = simd_sum(acc);
-        if (lane == 0) s[(ulong)g * R + r] = (float)(half)acc;
+        if (lane == 0) s[(ulong)g * R + r] = (float)(TW)acc;
     }
 """
 
@@ -121,17 +121,17 @@ def _gate_mix_kernel():
 
 
 def message_gates(h: mx.array, m: mx.array, wd: mx.array, wf: mx.array, wg: mx.array, *, eps: float = 1e-6) -> mx.array:
-    """h [G, D] (float16 / float32), m [G, D] float32, wd [G, R, 2D] float16,
-    wf / wg [G, D, R] float32. Returns [G, D] float32."""
+    """h [G, D] (float16 / bfloat16 / float32), m [G, D] float32, wd [G, R, 2D]
+    float16 or bfloat16, wf / wg [G, D, R] float32. Returns [G, D] float32."""
     G, D = int(h.shape[0]), int(h.shape[1])
     R = int(wd.shape[1])
-    if R % 32 or wf.dtype != mx.float32 or wg.dtype != mx.float32 or wd.dtype != mx.float16:
-        raise ValueError("message_gates: unsupported weight layout")
+    if R % 32 or wf.dtype != mx.float32 or wg.dtype != mx.float32 or wd.dtype not in (mx.float16, mx.bfloat16):
+        raise ValueError(f"message_gates: unsupported weight layout (R={R}, wd {wd.dtype}, wf {wf.dtype}, wg {wg.dtype})")
     m = m.astype(mx.float32)
     RB = 8
     (s,) = _gate_down_kernel()(
         inputs=[h, m, wd],
-        template=[("TH", h.dtype), ("D", D), ("R", R), ("RB", RB), ("EPS", _f(eps))],
+        template=[("TH", h.dtype), ("TW", wd.dtype), ("D", D), ("R", R), ("RB", RB), ("EPS", _f(eps))],
         grid=(((R + RB - 1) // RB) * 256, G, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(G, R)],
@@ -422,7 +422,7 @@ _POST_SRC = r"""
     if (!NORM) {
         for (int p = 0; p < PER; ++p) {
             const uint d = tid + p * TGN;
-            if (d < (uint)D) y[d] = mi[p];
+            if (d < (uint)D) y[d] = (YT)mi[p];
         }
         return;
     }
@@ -555,7 +555,7 @@ _PRE_SRC = r"""
         for (int qi = 0; qi < Q; ++qi)
             for (int p = 0; p < PER; ++p) {
                 const uint d = tid + p * TGN;
-                if (d < (uint)D) y[(ulong)qi * D + d] = av[qi][p];
+                if (d < (uint)D) y[(ulong)qi * D + d] = (YT)av[qi][p];
             }
         return;
     }

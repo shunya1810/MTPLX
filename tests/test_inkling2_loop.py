@@ -279,6 +279,32 @@ class TestInkling2Loop(unittest.TestCase):
             err = mx.abs(new.astype(mx.float32) - ref.astype(mx.float32)).max().item()
             self.assertLess(err, 0.01 * max(scale, 1.0), f"layer {layer}")
 
+    def test_half_precision_decode_kernels(self):
+        """The served dtypes: a BF16 checkpoint as shipped (bf16 activations)
+        and the M1 fp16 cast; the one-token kernels must build and agree with
+        the chunked forward in both."""
+        from mtplx.runtime import _cast_bf16_parameters_to_fp16
+
+        model = _model(6)
+        ckpt, _ = _checkpoint(model)
+        ckpt = {k: (v.astype(mx.bfloat16) if v.dtype == mx.float32 else v) for k, v in ckpt.items()}
+        tokens = mx.array([[5, 9, 17, 3, 44, 2, 101, 7, 19, 23]])
+        for dtype in (mx.bfloat16, mx.float16):
+            # a fresh load each time: the layers cache stacked weights on first use
+            loaded = self._load(ckpt)
+            if dtype == mx.float16:
+                _cast_bf16_parameters_to_fp16(loaded)
+            full = loaded(tokens)
+            cache = loaded.make_cache()
+            steps = [loaded(tokens[:, :4], cache=cache)]
+            for i in range(4, tokens.shape[1]):
+                steps.append(loaded(tokens[:, i : i + 1], cache=cache))
+            cached = mx.concatenate(steps, axis=1)
+            self.assertTrue(mx.isfinite(cached).all().item(), str(dtype))
+            scale = mx.abs(full).max().item()
+            err = mx.abs(cached - full).max().item()
+            self.assertLess(err, 0.05 * max(scale, 1.0), str(dtype))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1264,7 +1264,7 @@ def _model_classes_for_config(config: dict[str, Any]) -> tuple[type, type] | Non
 
 def _m1_fp16_cast_requested(config: dict[str, Any] | None = None) -> bool:
     """Run a bf16 pack in fp16: ``MTPLX_M1_FP16_CAST`` 1/0 forces; unset, on
-    for the qwen4_exp family on the M1 GPU family.
+    for the qwen4_exp and inkling2_loop families on the M1 GPU family.
 
     M1 GPUs have no bfloat16 arithmetic. Synthetic qwen4_exp trunk at
     Qwen3.8-27B widths, 64 layers, the same bf16 pack with and without the
@@ -1285,7 +1285,11 @@ def _m1_fp16_cast_requested(config: dict[str, Any] | None = None) -> bool:
     cfg = config or {}
     text = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
     types = {str(cfg.get("model_type") or "").lower(), str(text.get("model_type") or "").lower()}
-    if not types & {"qwen4_exp", "qwen4_exp_text"}:
+    # Inkling 2: the official checkpoint's BF16 parts (projections, norms,
+    # embed/head) in fp16 measured equal to bf16 on PPL (en/ja/code/agent
+    # 6.59/10.30/2.16/1.79), and its fast decode / prefill kernels are fp16
+    # (the NVFP4 experts carry their outer scale outside fp16's range).
+    if not types & {"qwen4_exp", "qwen4_exp_text", "inkling2_loop", "inkling2_loop_text"}:
         return False
     try:
         from .cache_state import m1_long_context_defaults
