@@ -104,6 +104,7 @@ _PREFILL_MOE = _env_int("MTPLX_INKLING2_PREFILL_MOE", 1) == 1
 _COMPILED_MAX_ROWS = _env_int("MTPLX_INKLING2_COMPILED_ROWS", 9)
 _SMALL_ATTENTION = _env_int("MTPLX_INKLING2_SMALL_ATTENTION", 1) == 1
 _GROUPED_MOE_MAX_TOKENS = _env_int("MTPLX_INKLING2_GROUPED_MOE_TOKENS", 9)
+_SEG_GEMM = _env_int("MTPLX_INKLING2_SEG_GEMM", 1) == 1
 
 
 # One-token kernels (kernels/inkling2_decode.py): fused message gates and the
@@ -1130,17 +1131,32 @@ class SparseMoeBlock(nn.Module):
             f_gu = mx.ones(idx.shape, mx.float32)
             f_dn = None
         xs = gather_scale_rows(x2, tok, f_gu)
-        g = mx.gather_qmm(
-            xs[:, None, :], gu["weight"], gu["scales"], None, rhs_indices=idx, transpose=True,
-            group_size=gu.group_size, bits=gu.bits, mode=gu.mode, sorted_indices=True,
-        )
         unshift = mx.array(1.0 / shift, mx.float32)
-        factor = f_dn[:, None, None] if f_dn is not None else mx.array(1.0, mx.float32)
-        h = _swiglu_rescale(g[..., 0::2], g[..., 1::2], unshift, factor, act.gate_softcap, act.up_softcap)
-        o = mx.gather_qmm(
-            h, dn["weight"], dn["scales"], None, rhs_indices=idx, transpose=True,
-            group_size=dn.group_size, bits=dn.bits, mode=dn.mode, sorted_indices=True,
-        )
+        from ..kernels.inkling2_seg_gemm import seg_gemm, seg_gemm_ok, tile_table
+
+        if (
+            _SEG_GEMM
+            and seg_gemm_ok(gu["weight"].shape[1], dims)
+            and seg_gemm_ok(dn["weight"].shape[1], gu["weight"].shape[1] // 2)
+        ):
+            # each expert's rows in their own tiles (one expert a tile, once)
+
+            table = tile_table(idx.astype(mx.uint32), gu["weight"].shape[0])
+            g = seg_gemm(xs, gu["weight"], gu["scales"], table, bits=gu.bits, group_size=gu.group_size)
+            factor = f_dn[:, None] if f_dn is not None else mx.array(1.0, mx.float32)
+            h = _swiglu_rescale(g[..., 0::2], g[..., 1::2], unshift, factor, act.gate_softcap, act.up_softcap)
+            o = seg_gemm(h, dn["weight"], dn["scales"], table, bits=dn.bits, group_size=dn.group_size)
+        else:
+            g = mx.gather_qmm(
+                xs[:, None, :], gu["weight"], gu["scales"], None, rhs_indices=idx, transpose=True,
+                group_size=gu.group_size, bits=gu.bits, mode=gu.mode, sorted_indices=True,
+            )
+            factor = f_dn[:, None, None] if f_dn is not None else mx.array(1.0, mx.float32)
+            h = _swiglu_rescale(g[..., 0::2], g[..., 1::2], unshift, factor, act.gate_softcap, act.up_softcap)
+            o = mx.gather_qmm(
+                h, dn["weight"], dn["scales"], None, rhs_indices=idx, transpose=True,
+                group_size=dn.group_size, bits=dn.bits, mode=dn.mode, sorted_indices=True,
+            )
         w = routing_weights.reshape(-1).astype(mx.float32) * (1.0 / shift)
         y = combine_rows(o.reshape(-1, dims), inv, w, topk)
         return y.reshape(hidden_states.shape)
