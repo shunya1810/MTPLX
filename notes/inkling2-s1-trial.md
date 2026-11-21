@@ -97,5 +97,48 @@
 
 ### この先の候補
 
-- DSpark：verify の幅を広げる経路が遅く、今のままでは使えない（1 token 18 ms、2 token 54 ms、8 token 91 ms。L>1 は prefill 用の汎用経路に落ちる）。drafter を入れる前に、2〜9 token の forward を decode 並みに組む必要がある。
+- DSpark：下の「DSpark の見積もり」を参照。
 - prefill の expert GEMM：gather_qmm は 5.4 TFLOPS で、dense の nvfp4 qmm（7.0）より遅い。segment ごとに揃えた自前 GEMM なら、prefill は 7〜13% 速くなる見込み。
+
+## DSpark の見積もり（2026-11-21 夜、e577804f..fb496aea）
+
+### drafter
+
+- `mtplx/models/inkling2_dspark.py` に移植した（Ollama の mlxrunner inkling2 draft.go と dflash.go が参照元）。生成ループにはまだつないでいない。
+- target 側では `TextModel.set_draft_taps` で、visit 5 / 23 / 41 に入る residual と最終 hidden を取る。
+- 受理数を offline で測った（greedy、7 token の draft）。
+
+  | prompt | 平均受理数 | 1 round あたりの token |
+  |---|---|---|
+  | code | 2.40 | 3.40 |
+  | ja | 0.91 | 1.91 |
+  | reasoning | 3.09 | 4.09 |
+  | 全体 | 2.13 | 3.13 |
+
+### verify の費用（1K 文脈、pipelined）
+
+| 行数 | 最初 | 現在 |
+|---|---|---|
+| 1 | 18 ms | 18.1 ms |
+| 2 | 54 ms | 33.0 ms |
+| 4 | 67 ms | 45.5 ms |
+| 8 | 91 ms | 71.6 ms |
+
+- 1〜9 行を compiled halves で回すようにした。
+- 9 行以下の attention は split-K の kernel にした。
+- expert は「expert ごとに 1 回だけ読む」grouped kernel にした。
+- message gates は複数行に対応させた。
+- NLL は chunked と一致する（4 / 8 行ずつ与えて |d| 0.006〜0.026 nats）。
+- 連続 token が使う expert の種類は、1 visit あたり 1 token で 8、4 token で 19〜20、8 token で 29〜31 だった。
+
+### 損益
+
+- 3 token を draft して 4 行を verify し、draft に 5 ms かかるとすると、1 token あたり約 20.4 ms になる。pipelined AR（server で約 21 ms）とほぼ変わらない。
+- 元が取れるのは、4 行の verify が約 30 ms まで下がったときである。そうなれば、約 63〜65 tok/s（今は 48）が見込める。
+- 残っている作業：
+  - 8-bit の小 M matmul を、重みを 1 回だけ読む多行 kernel にする。MLX は 4 行で projection が 2.5 倍、o_proj と head が 2 倍かかる。約 6 ms 減る見込み。
+  - grouped MoE をさらに速くする。
+  - drafter に cache を入れ、近似を使う。目標は 1 round あたり 3〜4 ms。
+  - 満杯になった SWA ring cache を巻き戻せるようにする。mlx-lm の RotatingKVCache は満杯だと trim できない。
+  - server lane を作る。
+- 注意：stub で ablation すると、その後の routing まで変わる。expert の数が減って MoE が安く見えるので、ablation の数字は過大になる。
