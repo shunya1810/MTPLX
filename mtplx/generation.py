@@ -8220,6 +8220,51 @@ def _mx_lazy_sample(row: mx.array, config: SamplerConfig, key: mx.array) -> mx.a
     return mx.where(bad, mx.array(-1, dtype=mx.int32), token)
 
 
+# A model class opts its AR decode into the pipeline by default with a true
+# ``mtplx_ar_pipeline_default`` attribute (Inkling 2); MTPLX_AR_PIPELINE=1/0
+# forces it on/off for any AR lane.
+
+
+def _ar_pipeline_sampler_ok(sampler: SamplerConfig, vocab: int | None = None) -> bool:
+    """Shapes the device sampler reproduces in distribution: greedy, plain
+    temperature over the full vocabulary, or top-k (with optional top-p)."""
+    if sampler.presence_penalty or sampler.frequency_penalty:
+        return False
+    if sampler.temperature <= 0:
+        return True
+    top_k = int(sampler.top_k or 0)
+    top_p = float(sampler.top_p or 1.0)
+    if top_k <= 0 or (vocab is not None and top_k >= vocab):
+        return not (0.0 < top_p < 1.0)
+    return top_k > 1
+
+
+def _ar_pipeline_enabled(rt: Any, sampler: SamplerConfig, constraint: Any) -> bool:
+    raw = str(os.environ.get("MTPLX_AR_PIPELINE", "")).strip().lower()
+    if raw in ("0", "false", "no", "off") or os.environ.get("MTPLX_EVAL_AUDIT"):
+        return False
+    forced = raw in ("1", "true", "yes", "on")
+    if not forced and not getattr(getattr(rt, "model", None), "mtplx_ar_pipeline_default", False):
+        return False
+    return constraint is None and _ar_pipeline_sampler_ok(sampler)
+
+
+def _ar_device_token(row: mx.array, sampler: SamplerConfig, key: mx.array) -> mx.array:
+    """The next token drawn on device from one logits row, as a LAZY int32
+    scalar (-1 when the row carries NaN / +inf or is all -inf), so the next
+    forward can be dispatched before the host reads it."""
+    bad = mx.logical_or(mx.any(mx.isnan(row)), mx.isinf(mx.max(row)))
+    if sampler.temperature <= 0:
+        token = mx.argmax(row, axis=-1).astype(mx.int32)
+    else:
+        top_k = int(sampler.top_k or 0)
+        if 1 < top_k < int(row.shape[-1]):
+            return _mx_lazy_sample(row, sampler, key)
+        inv_t = 1.0 / max(float(sampler.temperature), 1e-6)
+        token = mx.random.categorical(row.astype(mx.float32)[None] * inv_t, key=key)[0].astype(mx.int32)
+    return mx.where(bad, mx.array(-1, dtype=mx.int32), token)
+
+
 def _greedy_draft_token_and_top_values(
     logits: mx.array,
     *,
@@ -10230,6 +10275,18 @@ def generate_ar(
         in ("1", "true", "yes", "on")
     ) or bool(os.environ.get("MTPLX_EVAL_AUDIT"))
 
+    # Pipelined decode: the token is drawn on device and step t+1's forward is
+    # built and dispatched from that lazy token before the host reads it, so
+    # graph building, command encoding, sampling and the token callback of
+    # one step overlap the GPU work of the next. Steps that need the host
+    # token first (steering overlays, first-token logprobs) draw on the host
+    # as before; a stop token leaves its forward in the cache, and the
+    # final-state capture below reuses that forward instead of running it.
+    _ar_pipe = _ar_pipeline_enabled(rt, sampler, constraint)
+    _pipe_key = mx.random.key(int(seed)) if _ar_pipe else None
+    _pipe_tok = None  # lazy device token drawn from `logits`
+    _pipe_last_logits = None  # logits after a forward of the final token
+
     for step in range(max_tokens):
         if _loop_guard is not None:
             _guard_transition = _loop_guard.observe(tokens)
@@ -10267,21 +10324,58 @@ def generate_ar(
             # both the greedy and sampled branches draw from the constrained
             # distribution (-inf survives temperature/top-p/penalties).
             logits_row = constraint.mask_logits_row(logits_row)
-        if not _ar_sync_eval and step > 0:
+        _pipe_use = (
+            _pipe_tok is not None
+            and not _steer_active
+            and not (first_token_logprobs_top_k is not None and not tokens)
+        )
+        _pipe_next = None
+        if _pipe_use:
+            started = time.perf_counter()
+            if step + 1 < max_tokens:
+                with attention_phase("ar_decode"):
+                    result_next = rt.forward_ar(
+                        _pipe_tok.reshape(1, 1),
+                        cache=cache,
+                        return_hidden=ar_return_hidden,
+                    )
+                logits_next = result_next[0] if ar_return_hidden else result_next
+                _pipe_key, _sub = mx.random.split(_pipe_key)
+                tok_next = _ar_device_token(logits_next[0, -1], sampler, _sub)
+                forward_graph_elapsed = time.perf_counter() - started
+                if ar_return_hidden:
+                    mx.async_eval(tok_next, logits_next, result_next[1])
+                else:
+                    mx.async_eval(tok_next, logits_next)
+                _owner_progress_tick()
+                _pipe_next = (logits_next, tok_next)
+                target_forward_graph_time += forward_graph_elapsed
+                verify_calls += 1
             sync_started = time.perf_counter()
-            _eval(logits_row)
+            token = int(_pipe_tok.item())
             sync_elapsed = time.perf_counter() - sync_started
             target_eval_time += sync_elapsed
-            target_decode_time += sync_elapsed
-        token, _ = _sample_from_logits(
-            logits_row,
-            sampler,
-            rng,
-            token_counts=Counter(tokens)
-            if (sampler.presence_penalty or sampler.frequency_penalty)
-            else None,
-            penalty_overlay=(_ar_steer_overlay(tokens) if _steer_active else None),
-        )
+            target_decode_time += time.perf_counter() - started
+            if token < 0:
+                raise non_finite_logits_error(
+                    np.asarray(logits_row.astype(mx.float32)), "pipelined device sample"
+                )
+        else:
+            if not _ar_sync_eval and step > 0:
+                sync_started = time.perf_counter()
+                _eval(logits_row)
+                sync_elapsed = time.perf_counter() - sync_started
+                target_eval_time += sync_elapsed
+                target_decode_time += sync_elapsed
+            token, _ = _sample_from_logits(
+                logits_row,
+                sampler,
+                rng,
+                token_counts=Counter(tokens)
+                if (sampler.presence_penalty or sampler.frequency_penalty)
+                else None,
+                penalty_overlay=(_ar_steer_overlay(tokens) if _steer_active else None),
+            )
         if first_token_logprobs_top_k is not None and not tokens:
             first_logprobs = first_token_logprobs(
                 logits[0], token_id=token, top_k=first_token_logprobs_top_k
@@ -10313,7 +10407,13 @@ def generate_ar(
             )
             break
         if step + 1 >= max_tokens or _is_stop(token, stop_token_ids):
+            if _pipe_next is not None:
+                _pipe_last_logits = _pipe_next[0][:, -1, :]
             break
+        if _pipe_next is not None:
+            logits = _pipe_next[0][:, -1, :]
+            _pipe_tok = _pipe_next[1]
+            continue
 
         started = time.perf_counter()
         profiler = _ar_forward_profiler(step)
@@ -10352,6 +10452,10 @@ def generate_ar(
         target_eval_time += eval_elapsed
         verify_calls += 1
         logits = logits_next[:, -1, :]
+        if _ar_pipe:
+            _pipe_key, _sub = mx.random.split(_pipe_key)
+            _pipe_tok = _ar_device_token(logits[0], sampler, _sub)
+            mx.async_eval(_pipe_tok)
 
     if token_callback is not None and _stream_gate.window > 0:
         # Armed-stream reconcile (F35): the trim decision is known here —
@@ -10380,15 +10484,19 @@ def generate_ar(
         # forwarding it, so the cache is one token short of the committed
         # sequence and must be extended here.
         try:
-            with attention_phase("ar_decode"):
-                tail_result = rt.forward_ar(
-                    mx.array([[int(tokens[-1])]]),
-                    cache=cache,
-                    return_hidden=False,
+            if _pipe_last_logits is not None:
+                # the pipeline already forwarded the final token
+                tail_logits = _pipe_last_logits[:, None, :]
+            else:
+                with attention_phase("ar_decode"):
+                    tail_result = rt.forward_ar(
+                        mx.array([[int(tokens[-1])]]),
+                        cache=cache,
+                        return_hidden=False,
+                    )
+                tail_logits = (
+                    tail_result[0] if isinstance(tail_result, tuple) else tail_result
                 )
-            tail_logits = (
-                tail_result[0] if isinstance(tail_result, tuple) else tail_result
-            )
             _eval(tail_logits)
             final_state = GenerationFinalState(
                 final_trunk_cache=cache,

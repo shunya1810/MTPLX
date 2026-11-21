@@ -1748,6 +1748,10 @@ class InklingVisitCache(CacheList):
 
 
 class Model(nn.Module):
+    # AR decode runs pipelined (device-drawn token, next forward dispatched
+    # before the host reads it): ~16 ms of graph building and encoding a
+    # token would otherwise sit between GPU steps (mtplx.generation).
+    mtplx_ar_pipeline_default = True
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
