@@ -1437,6 +1437,7 @@ class DecoderLayer(nn.Module):
                 else:
                     q, k, v, r, gate, sinks = attn._project_all(hq, hk, hv, conv_states, None)
                     q, k, v, pb, sinks, gate = attn._prep(hq, q, k, v, r, tau, gate=gate, sinks=sinks)
+                keep = (lambda w: w) if h.shape[1] > 1 else _tail3  # full windows: verify rollback
                 return (
                     q,
                     k,
@@ -1444,8 +1445,8 @@ class DecoderLayer(nn.Module):
                     pb,
                     sinks,
                     gate,
-                    _tail3(conv_states[0]),
-                    _tail3(conv_states[1]),
+                    keep(conv_states[0]),
+                    keep(conv_states[1]),
                     normed_residual,
                 )
 
@@ -1507,6 +1508,8 @@ class DecoderLayer(nn.Module):
                 x = self.mlp(self.post_attention_layernorm(x).astype(dtype))
                 x, w3 = self.post_mlp_convolution(x, c3, None)
                 out = (residual + x.astype(mx.float32)).astype(dtype)
+                if h.shape[1] > 1:
+                    return out, bs, w2, w3  # full windows: verify rollback
                 return out, bs, _tail3(w2), _tail3(w3)
 
             fns[key] = (mx.compile(pre), mx.compile(post))
@@ -1535,6 +1538,12 @@ class DecoderLayer(nn.Module):
         out, block_states, c2, c3 = post(
             attn_out, gate, hidden_states, normed_residual, c2, c3, *extra
         )
+        if rows > 1:
+            # keep the windows so a speculative verify can step back
+            conv.verify_windows = (c0, c1, c2, c3)
+            c0, c1, c2, c3 = (_tail3(w) for w in (c0, c1, c2, c3))
+        else:
+            conv.verify_windows = None
         conv[0], conv[1], conv[2], conv[3] = c0, c1, c2, c3
         conv.advance(rows)
         return out, block_states
@@ -1992,6 +2001,33 @@ class Model(nn.Module):
     @property
     def layers(self) -> list:
         return self.model.language_model.layers
+
+    @staticmethod
+    def rollback(cache: list, rows: int) -> None:
+        """Drop the last ``rows`` positions of the latest multi-row forward
+        (a speculative verify, at most ``_COMPILED_MAX_ROWS`` rows) from every
+        visit cache: the KV tail and the conv states, rebuilt from the
+        verify's windows."""
+
+        if rows <= 0:
+            return
+        for visit in cache:
+            kv, conv = visit[0], visit[1]
+            if isinstance(kv, RotatingKVCache):
+                # a multi-row update leaves the ring in temporal order with at
+                # least max_size - 1 + L entries: cut the tail
+                kv.keys = kv.keys[..., : kv.keys.shape[2] - rows, :]
+                kv.values = kv.values[..., : kv.values.shape[2] - rows, :]
+                kv.offset -= rows
+                kv._idx = kv.keys.shape[2]
+            else:
+                kv.trim(rows)
+            windows = getattr(conv, "verify_windows", None)
+            if windows is None:
+                raise RuntimeError("rollback: the last forward kept no conv windows")
+            for i, w in enumerate(windows):
+                conv[i] = w[:, w.shape[1] - rows - 3 : w.shape[1] - rows]
+            conv.verify_windows = None
 
     def make_cache(self) -> list:
         window = self.args.text.sliding_window_size

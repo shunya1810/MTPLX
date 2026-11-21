@@ -371,6 +371,39 @@ class TestInkling2Loop(unittest.TestCase):
                 err = mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max().item()
                 self.assertLess(err, 0.02 * max(scale, 1.0), f"layer {layer} tokens {tokens}")
 
+    def test_verify_rollback_matches_forward(self):
+        """A speculative verify with two wrong trailing tokens, rolled back,
+        then decoded on: the same logits as one forward of the accepted
+        sequence (the sliding windows wrapped, global and conv state too)."""
+        from mtplx.runtime import _cast_bf16_parameters_to_fp16
+
+        for half in (False, True):
+            model = _model(9)
+            if half:
+                ckpt, _ = _checkpoint(model)
+                ckpt = {k: (v.astype(mx.bfloat16) if v.dtype == mx.float32 else v) for k, v in ckpt.items()}
+                model = self._load(ckpt)
+                _cast_bf16_parameters_to_fp16(model)
+            seq = [5, 9, 17, 3, 44, 2, 101, 7, 19, 23, 61, 8, 13, 77, 4, 30]
+            cache = model.make_cache()
+            model(mx.array([seq[:9]]), cache=cache)
+            verify = model(mx.array([seq[9:12] + [1, 2]]), cache=cache)
+            ink.Model.rollback(cache, 2)
+            steps = [model(mx.array([[t]]), cache=cache) for t in seq[12:16]]
+            got = mx.concatenate([verify[:, :3]] + steps, axis=1)
+            if half:
+                # against one-token decode through the same kernels (the random
+                # half model drifts from its own full forward either way)
+                ref_cache = model.make_cache()
+                model(mx.array([seq[:9]]), cache=ref_cache)
+                ref = mx.concatenate([model(mx.array([[t]]), cache=ref_cache) for t in seq[9:16]], axis=1)
+            else:
+                ref = model(mx.array([seq]))[:, 9:16]
+            scale = mx.abs(ref).max().item()
+            err = mx.abs(got - ref).max().item()
+            tol = (0.02 if half else 1e-3) * max(scale, 1.0)
+            self.assertLess(err, tol, f"half={half}")
+
 
 if __name__ == "__main__":
     unittest.main()
