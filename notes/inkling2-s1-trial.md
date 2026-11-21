@@ -142,3 +142,23 @@
   - 満杯になった SWA ring cache を巻き戻せるようにする。mlx-lm の RotatingKVCache は満杯だと trim できない。
   - server lane を作る。
 - 注意：stub で ablation すると、その後の routing まで変わる。expert の数が減って MoE が安く見えるので、ablation の数字は過大になる。
+
+## prefill の追加改善（2026-11-22、dc81437b・e4a121ec）
+
+- expert ごとにタイルを揃えた NVFP4 / MXFP8 GEMM（`mtplx/kernels/inkling2_seg_gemm.py`）
+  - MLX の steel BlockMMA と QuantizedBlockLoader を、install 済みの header から展開して使う。
+  - タイル表は GPU 上で作る。expert ごとに二分探索し、タイル数を scan する。
+  - gather_qmm とビット単位で一致する。速さは 5.3 → 6.4 TFLOPS。prefill は +13%。
+- MLX の steel attention を相対 bias 用に改造（`mtplx/kernels/inkling2_steel_attn.py`）
+  - causal・窓・開始 key・相対 bias・行ごとの sink を入れた。
+  - 速さは 4.1〜4.4 → 5.4〜6.1 TFLOPS。32K までの平均は 456 → 492 tok/s。
+- server 経由の prefill：16K で 422 → 495 tok/s、30K で 396 → 469 tok/s。decode は変わらず（47.8 / 44.6 / 41.8 tok/s）。
+- PPL は誤差の範囲で同じ（6.599 / 10.285 / 2.165 / 1.788）。
+- 今の prefill は 1 token あたり 10.8 GFLOP を約 6 TFLOPS で回している。A3B（6 GFLOP を 1000 tok/s）と同じ効率で、速度差は loop 構造による計算量の差である。
+
+## ANE（2026-11-22 調査）
+
+- A3B が ANE に載せていたのは GDN の入力 projection である（固定行列で、prefill の GPU 時間の 27%）。routed experts は token ごとに変わるので、ANE に載らない。
+- Inkling で載せられるのは attention の projection だけで、prefill の約 12% にあたる。ANE（AneLinear）は 1024 行の fused projection に 6.0 ms かかり、GPU（3.7 ms）より遅い。GPU と並行させても、見込みは +5% 程度である。
+  - hidden 2304 は 512 の倍数ではないので、2560 へ 0 埋めが要る。0 埋めすれば精度は問題ない（相対誤差 0.9%）。
+  - o_proj（3072 入力）は ANE の出力がずれる（相対誤差 41%）。
