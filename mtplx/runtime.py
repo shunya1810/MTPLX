@@ -1217,6 +1217,12 @@ def _prism_hadamard_qwen35_model_classes() -> tuple[type, type]:
     return Model, ModelArgs
 
 
+def _inkling2_loop_model_classes() -> tuple[type, type]:
+    from .models.inkling2_loop import Model, ModelArgs
+
+    return Model, ModelArgs
+
+
 # model_type -> loader of MTPLX-owned (Model, ModelArgs) classes for
 # architectures the pinned mlx-lm does not implement. A new in-tree
 # architecture (e.g. the Qwen3.8-Flash-Next backend) registers its loader
@@ -1234,6 +1240,9 @@ _INTREE_MODEL_CLASS_LOADERS: dict[str, Callable[[], tuple[type, type]]] = {
     # Bonsai 2 27B). A stock loader would run them without the activation
     # transform and return wrong output, so the model_type is owned here.
     "prism_hadamard_qwen35": _prism_hadamard_qwen35_model_classes,
+    # Thinking Machines' Inkling 2 Mini: looped MoE trunk, official NVFP4 /
+    # MXFP8 experts loaded as they ship (text only).
+    "inkling2_loop": _inkling2_loop_model_classes,
 }
 
 
