@@ -47,7 +47,12 @@ from mlx_lm.models.cache import (
 )
 from mlx_lm.models.switch_layers import SwitchLinear, _gather_sort, _scatter_unsort
 
-from ..kernels.inkling2_kernels import depth_attention, expert_routing, relative_attention
+from ..kernels.inkling2_kernels import (
+    depth_attention,
+    expert_routing,
+    relative_attention,
+    relative_attention_small,
+)
 
 __all__ = ["Model", "ModelArgs", "TextArgs"]
 
@@ -94,6 +99,10 @@ _DECODE_COMPILE = (os.environ.get("MTPLX_INKLING2_DECODE_COMPILE") or "1").strip
 _FUSED_MOE_MAX_PAIRS = _env_int("MTPLX_INKLING2_FUSED_MOE_PAIRS", 64)
 _FUSED_FP8 = _env_int("MTPLX_INKLING2_FUSED_FP8", 1) == 1
 _PREFILL_MOE = _env_int("MTPLX_INKLING2_PREFILL_MOE", 1) == 1
+# Forwards of up to this many rows (decode, speculative verify) run as the
+# two compiled halves around the KV cache; wider ones take the eager path.
+_COMPILED_MAX_ROWS = _env_int("MTPLX_INKLING2_COMPILED_ROWS", 9)
+_SMALL_ATTENTION = _env_int("MTPLX_INKLING2_SMALL_ATTENTION", 1) == 1
 
 
 # One-token kernels (kernels/inkling2_decode.py): fused message gates and the
@@ -687,6 +696,18 @@ class Attention(nn.Module):
         )
         if L > 1 and _use_kernels() and half:
             key_start = mx.broadcast_to(S - end, (B,))
+            if L <= 8 and _SMALL_ATTENTION:
+                # verify widths: the key range split over threadgroups
+                return relative_attention_small(
+                    query,
+                    key,
+                    value,
+                    position_bias,
+                    sinks,
+                    scale=self.scaling,
+                    window=self.sliding_window,
+                    key_start=key_start,
+                )
             return relative_attention(
                 query,
                 key,
@@ -1311,7 +1332,7 @@ class DecoderLayer(nn.Module):
         if (
             _DECODE_COMPILE
             and cache is not None
-            and hidden_states.shape[1] == 1
+            and 1 <= hidden_states.shape[1] <= _COMPILED_MAX_ROWS
             and conv_mask is None
             and cache[1].lengths is None
             and all(c is not None for c in cache[1].cache)
@@ -1473,8 +1494,12 @@ class DecoderLayer(nn.Module):
         c0, c1, c2, c3 = conv.cache
         attn = self.self_attn
         tau = None
+        rows = hidden_states.shape[1]
         if isinstance(attn, FullAttention):
-            tau = mx.array(attn.tau_scalar(kv_cache.offset), dtype=mx.float32)
+            if rows == 1:
+                tau = mx.array(attn.tau_scalar(kv_cache.offset), dtype=mx.float32)
+            else:
+                tau = attn._tau(kv_cache.offset, rows)
         key = (block_states is not None, messages is not None, tau is not None)
         pre, post = self._decode_fns(key)
         extra = [a for a in (block_states, messages, tau) if a is not None]
@@ -1488,7 +1513,7 @@ class DecoderLayer(nn.Module):
             attn_out, gate, hidden_states, normed_residual, c2, c3, *extra
         )
         conv[0], conv[1], conv[2], conv[3] = c0, c1, c2, c3
-        conv.advance(1)
+        conv.advance(rows)
         return out, block_states
 
 
@@ -1601,9 +1626,15 @@ class TextModel(nn.Module):
     def _run_loop(self, hidden_states, cache, conv_mask):
         core = self.args.loop_core
         caches = iter(cache)
+        taps = self.__dict__.get("_draft_taps")
+        visit = [0]
 
         def run(layers, hidden_states, block_states, bank=None):
             for i, layer in enumerate(layers):
+                if taps is not None and visit[0] in taps:
+                    # the residual stream entering this visit (a DSpark feature)
+                    self.__dict__["_tap_rows"].append(hidden_states)
+                visit[0] += 1
                 messages = None if bank is None else self.message_input(bank, i)
                 hidden_states, block_states = layer(
                     hidden_states,
@@ -1642,6 +1673,8 @@ class TextModel(nn.Module):
 
         if cache is None:
             cache = [None] * len(self.layer_visits)
+        if self.__dict__.get("_draft_taps") is not None:
+            self.__dict__["_tap_rows"] = []
         _reset_step_geometry()
         conv_mask = None
         if cache[0] is not None:
@@ -1660,7 +1693,25 @@ class TextModel(nn.Module):
 
         normed_states = unweighted_rms_norm(hidden_states.astype(mx.float32))
         hidden_states = self.final_input(block_states, normed_states)[..., 0, :]
-        return self.norm(hidden_states).astype(dtype)
+        out = self.norm(hidden_states).astype(dtype)
+        if self.__dict__.get("_draft_taps") is not None:
+            rows = self.__dict__["_tap_rows"]
+            rows.append(out)
+            # [B, L, taps * D]: the visits' inputs, then the final hidden
+            self.__dict__["last_draft_features"] = mx.concatenate(
+                [r.astype(dtype) for r in rows], axis=-1
+            )
+        return out
+
+    def set_draft_taps(self, visits) -> None:
+        """Record the residual stream entering these visits (plus the final
+        hidden) on every forward as ``last_draft_features``; None stops it."""
+        if visits is None:
+            self.__dict__.pop("_draft_taps", None)
+            self.__dict__.pop("last_draft_features", None)
+            return
+        num_visits = len(self.layer_visits)
+        self.__dict__["_draft_taps"] = frozenset(int(v) for v in visits if int(v) < num_visits)
 
 
 class Inkling2Model(nn.Module):

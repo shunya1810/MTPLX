@@ -288,7 +288,7 @@ class TestInkling2Loop(unittest.TestCase):
         model = _model(6)
         ckpt, _ = _checkpoint(model)
         ckpt = {k: (v.astype(mx.bfloat16) if v.dtype == mx.float32 else v) for k, v in ckpt.items()}
-        tokens = mx.array([[5, 9, 17, 3, 44, 2, 101, 7, 19, 23]])
+        tokens = mx.array([[5, 9, 17, 3, 44, 2, 101, 7, 19, 23, 61, 8, 13]])
         for dtype in (mx.bfloat16, mx.float16):
             # a fresh load each time: the layers cache stacked weights on first use
             loaded = self._load(ckpt)
@@ -296,14 +296,60 @@ class TestInkling2Loop(unittest.TestCase):
                 _cast_bf16_parameters_to_fp16(loaded)
             full = loaded(tokens)
             cache = loaded.make_cache()
-            steps = [loaded(tokens[:, :4], cache=cache)]
-            for i in range(4, tokens.shape[1]):
+            # a 9-row prefix runs the prefill attention kernel, as the full
+            # forward does; the rows after it are one-token decode steps
+            steps = [loaded(tokens[:, :9], cache=cache)]
+            for i in range(9, tokens.shape[1]):
                 steps.append(loaded(tokens[:, i : i + 1], cache=cache))
             cached = mx.concatenate(steps, axis=1)
             self.assertTrue(mx.isfinite(cached).all().item(), str(dtype))
             scale = mx.abs(full).max().item()
             err = mx.abs(cached - full).max().item()
             self.assertLess(err, 0.05 * max(scale, 1.0), str(dtype))
+
+    def test_small_attention_matches_prefill_kernel(self):
+        """The split-key few-row kernel against the prefill kernel: windows,
+        a key offset, a strided cache view, both half dtypes."""
+        from mtplx.kernels.inkling2_kernels import relative_attention, relative_attention_small
+
+        cases = ((1, 7, 8, 0), (3, 12, 8, 0), (8, 40, 0, 0), (5, 70, 16, 3), (8, 300, 0, 5))
+        for dtype in (mx.float16, mx.bfloat16):
+            for L, S, window, start in cases:
+                mx.random.seed(L * 1000 + S)
+                q = (mx.random.normal((1, 4, L, 16)) * 0.5).astype(dtype)
+                kb = (mx.random.normal((1, 2, S + 16, 16)) * 0.5).astype(dtype)
+                vb = mx.random.normal((1, 2, S + 16, 16)).astype(dtype)
+                rel = mx.random.normal((1, L, 4, 8)).astype(dtype)
+                sinks = mx.random.normal((1, L, 4)).astype(dtype)
+                kw = dict(scale=0.25, window=window, key_start=mx.array([start], mx.int32))
+                args = (q, kb[:, :, :S], vb[:, :, :S], rel, sinks)
+                ref = relative_attention(*args, **kw).astype(mx.float32)
+                got = relative_attention_small(*args, **kw).astype(mx.float32)
+                tol = 4e-3 if dtype == mx.float16 else 2e-2
+                err = mx.abs(got - ref).max().item()
+                self.assertLess(err, tol, f"{dtype} L={L} S={S} window={window}")
+
+    def test_verify_width_forward_matches(self):
+        """Rows fed a few at a time (speculative verify widths: compiled
+        halves, few-row attention, fused experts) against one forward."""
+        from mtplx.runtime import _cast_bf16_parameters_to_fp16
+
+        model = _model(7)
+        ckpt, _ = _checkpoint(model)
+        ckpt = {k: (v.astype(mx.bfloat16) if v.dtype == mx.float32 else v) for k, v in ckpt.items()}
+        loaded = self._load(ckpt)
+        _cast_bf16_parameters_to_fp16(loaded)
+        tokens = mx.array([[5, 9, 17, 3, 44, 2, 101, 7, 19, 23, 61, 8, 13, 77, 4, 30, 2, 9]])
+        full = loaded(tokens)
+        cache = loaded.make_cache()
+        steps = [loaded(tokens[:, :9], cache=cache)]
+        for i, w in zip((9, 12, 14), (3, 2, 4)):
+            steps.append(loaded(tokens[:, i : i + w], cache=cache))
+        cached = mx.concatenate(steps, axis=1)
+        self.assertEqual(cached.shape, full.shape)
+        scale = mx.abs(full).max().item()
+        err = mx.abs(cached - full).max().item()
+        self.assertLess(err, 0.05 * max(scale, 1.0))
 
 
 if __name__ == "__main__":

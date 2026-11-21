@@ -6,6 +6,7 @@
 residuals, causal attention with a relative position bias and sinks, and the
 sigmoid top-k routing."""
 
+import os
 from functools import lru_cache
 
 import mlx.core as mx
@@ -434,3 +435,246 @@ def expert_routing(
         output_shapes=[logits.shape[:-1] + (top_k,)] * 2,
         output_dtypes=[mx.uint32, mx.float32],
     )
+
+
+# Few-query relative attention (speculative verify, L <= 8 rows): the key
+# range is split over threadgroups and merged in a second pass, and one
+# threadgroup serves the G query heads of a KV head (one simdgroup a head,
+# 8 query rows each, sharing the staged K/V tile). Same fragment layout and
+# masking as the prefill kernel above; partials are in the log2 domain.
+_SMALL_ATTENTION_SOURCE = """
+    constexpr float LOG2E = 1.4426950408889634f;
+    constexpr int G = HQ / HKV;
+    constexpr int LDK = BK + 8;
+    constexpr int LDV = D + 8;
+    const int L = sizes[0];
+    const int S = sizes[1];
+    const int NS = sizes[2];
+    const int chunk = sizes[3];
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const int batch = threadgroup_position_in_grid.z;
+    const int kv_head = threadgroup_position_in_grid.y;
+    const int split = threadgroup_position_in_grid.x;
+    const int head = kv_head * G + int(sg);
+    const int start = key_start[batch];
+    const float qscale = scale * LOG2E;
+
+    const short fm = ((lane / 4) & 4) + (lane / 2) % 4;
+    const short fn = ((lane / 4) & 2) * 2 + (lane % 2) * 2;
+    const int row = fm;
+    const bool row_ok = row < L;
+    const int diag = S - L + row;
+
+    threadgroup half Ks[D * LDK];
+    threadgroup half Vs[BK * LDV];
+
+    simdgroup_half8x8 q_frag[D / 8];
+    for (int db = 0; db < D / 8; ++db) {
+        half2 qv = half2(0.0h);
+        if (row_ok) {
+            const device T* qp = q + batch * q_strides[0] + head * q_strides[1]
+                + row * q_strides[2] + db * 8 + fn;
+            qv = half2(float(qp[0]), float(qp[1]));
+        }
+        q_frag[db].thread_elements()[0] = qv.x;
+        q_frag[db].thread_elements()[1] = qv.y;
+    }
+    simdgroup_float8x8 acc[D / 8];
+    for (int db = 0; db < D / 8; ++db) {
+        acc[db] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    float row_max = -INFINITY;
+    float row_sum = 0.0f;
+    const device T* bias = rel + (size_t(batch * L + (row_ok ? row : 0)) * HQ + head) * R;
+
+    int first_key = WINDOW > 0 ? max(0, (S - L) - WINDOW + 1) : 0;
+    first_key = max(first_key, start);
+    const int lo = first_key + split * chunk;
+    const int hi = min(lo + chunk, S);
+    const device T* k_head = k + batch * k_strides[0] + kv_head * k_strides[1];
+    const device T* v_head = v + batch * v_strides[0] + kv_head * v_strides[1];
+
+    for (int k0 = lo; k0 < hi; k0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int c = tid; c < BK * D / 8; c += TG) {
+            const int r = c / (D / 8);
+            const int col = (c % (D / 8)) * 8;
+            const int key = k0 + r;
+            vec<T, 4> kv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
+            vec<T, 4> vv[2] = {vec<T, 4>(0), vec<T, 4>(0)};
+            if (key < hi) {
+                auto kp = (const device vec<T, 4>*)(k_head + key * k_strides[2] + col);
+                auto vp = (const device vec<T, 4>*)(v_head + key * v_strides[2] + col);
+                kv[0] = kp[0];
+                kv[1] = kp[1];
+                vv[0] = vp[0];
+                vv[1] = vp[1];
+            }
+            for (int j = 0; j < 8; ++j) {
+                Ks[(col + j) * LDK + r] = half(float(kv[j / 4][j % 4]));
+                Vs[r * LDV + col + j] = half(float(vv[j / 4][j % 4]));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 scores[BK / 8];
+        for (int kb = 0; kb < BK / 8; ++kb) {
+            scores[kb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int db = 0; db < D / 8; ++db) {
+                simdgroup_half8x8 k_frag;
+                simdgroup_load(k_frag, Ks + db * 8 * LDK + kb * 8, LDK);
+                simdgroup_multiply_accumulate(scores[kb], q_frag[db], k_frag, scores[kb]);
+            }
+        }
+        float tile_max = -INFINITY;
+        for (int kb = 0; kb < BK / 8; ++kb) {
+            for (int e = 0; e < 2; ++e) {
+                const int key = k0 + kb * 8 + fn + e;
+                const int d = diag - key;
+                const bool visible = row_ok && key < hi && d >= 0 && key >= start
+                    && (WINDOW == 0 || d < WINDOW);
+                float s = -INFINITY;
+                if (visible) {
+                    s = scores[kb].thread_elements()[e] * qscale;
+                    if (d < R) {
+                        s += float(bias[d]) * LOG2E;
+                    }
+                }
+                scores[kb].thread_elements()[e] = s;
+                tile_max = max(tile_max, s);
+            }
+        }
+        tile_max = max(tile_max, simd_shuffle_xor(tile_max, 1));
+        tile_max = max(tile_max, simd_shuffle_xor(tile_max, 8));
+        const float new_max = max(row_max, tile_max);
+        const float factor = (new_max == -INFINITY) ? 1.0f : fast::exp2(row_max - new_max);
+        float tile_sum = 0.0f;
+        simdgroup_half8x8 probs[BK / 8];
+        for (int kb = 0; kb < BK / 8; ++kb) {
+            for (int e = 0; e < 2; ++e) {
+                const float sv = scores[kb].thread_elements()[e];
+                const float p = (sv == -INFINITY) ? 0.0f : fast::exp2(sv - new_max);
+                probs[kb].thread_elements()[e] = half(p);
+                tile_sum += p;
+            }
+        }
+        tile_sum += simd_shuffle_xor(tile_sum, 1);
+        tile_sum += simd_shuffle_xor(tile_sum, 8);
+        row_sum = row_sum * factor + tile_sum;
+        row_max = new_max;
+        for (int db = 0; db < D / 8; ++db) {
+            acc[db].thread_elements()[0] *= factor;
+            acc[db].thread_elements()[1] *= factor;
+            for (int kb = 0; kb < BK / 8; ++kb) {
+                simdgroup_half8x8 v_frag;
+                simdgroup_load(v_frag, Vs + kb * 8 * LDV + db * 8, LDV);
+                simdgroup_multiply_accumulate(acc[db], probs[kb], v_frag, acc[db]);
+            }
+        }
+    }
+
+    if (row_ok) {
+        const size_t pi = (size_t(batch * HQ + head) * NS + split) * 8 + row;
+        if (fn == 0 && (lane % 2) == 0 && ((lane / 4) & 2) == 0) {
+            pm[pi] = row_max;
+            pl[pi] = row_sum;
+        }
+        device float* op = po + pi * D;
+        for (int db = 0; db < D / 8; ++db) {
+            op[db * 8 + fn] = acc[db].thread_elements()[0];
+            op[db * 8 + fn + 1] = acc[db].thread_elements()[1];
+        }
+    }
+"""
+
+_SMALL_MERGE_SOURCE = """
+    constexpr float LOG2E = 1.4426950408889634f;
+    const int L = sizes[0];
+    const int NS = sizes[2];
+    const uint d = thread_position_in_threadgroup.x;
+    const int idx = threadgroup_position_in_grid.x;     // over B * HQ * L
+    const int row = idx % L;
+    const int head = (idx / L) % HQ;
+    const int batch = idx / (L * HQ);
+    const float sink = float(sinks[(batch * L + row) * HQ + head]) * LOG2E;
+    const size_t base = size_t(batch * HQ + head) * NS;
+    float M = sink;
+    for (int s = 0; s < NS; ++s) M = max(M, pm[(base + s) * 8 + row]);
+    float Z = fast::exp2(sink - M);
+    float O = 0.0f;
+    for (int s = 0; s < NS; ++s) {
+        const size_t pi = (base + s) * 8 + row;
+        const float m = pm[pi];
+        if (m == -INFINITY) continue;
+        const float w = fast::exp2(m - M);
+        Z += w * pl[pi];
+        O += w * po[pi * D + d];
+    }
+    out[(size_t(batch * L + row) * HQ + head) * D + d] = T(O / Z);
+"""
+
+_small_attention_kernel = mx.fast.metal_kernel(
+    name="relative_attention_small",
+    input_names=["q", "k", "v", "rel", "key_start", "sizes", "scale"],
+    output_names=["pm", "pl", "po"],
+    source=_SMALL_ATTENTION_SOURCE,
+    ensure_row_contiguous=False,
+)
+
+_small_merge_kernel = mx.fast.metal_kernel(
+    name="relative_attention_small_merge",
+    input_names=["pm", "pl", "po", "sinks", "sizes"],
+    output_names=["out"],
+    source=_SMALL_MERGE_SOURCE,
+)
+
+_SMALL_BK = 32
+_SMALL_KEYS_PER_SPLIT = int(os.environ.get("MTPLX_INKLING2_SMALL_ATTN_KEYS", "128"))
+_SMALL_MAX_SPLITS = int(os.environ.get("MTPLX_INKLING2_SMALL_ATTN_SPLITS", "64"))
+
+
+def relative_attention_small(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    rel: mx.array,
+    sinks: mx.array,
+    *,
+    scale: float,
+    window: int,
+    key_start: mx.array,
+) -> mx.array:
+    """relative_attention for at most 8 query rows (same arguments and
+    result layout, (B, L, Hq, D))."""
+    B, Hq, L, D = q.shape
+    Hkv, S = k.shape[1], k.shape[2]
+    G = Hq // Hkv
+    if L > 8 or Hq % Hkv or G > 8:
+        raise ValueError("relative_attention_small: L <= 8 and G <= 8 only")
+    first = max(0, (S - L) - window + 1) if window > 0 else 0
+    span = max(1, S - first)
+    splits = max(1, min(_SMALL_MAX_SPLITS, -(-span // _SMALL_KEYS_PER_SPLIT)))
+    chunk = -(-span // splits)
+    chunk = -(-chunk // _SMALL_BK) * _SMALL_BK
+    splits = -(-span // chunk)
+    sizes = mx.array([L, S, splits, chunk], dtype=mx.int32)
+    tg = 32 * G
+    pm, pl, po = _small_attention_kernel(
+        inputs=[q, k, v, mx.contiguous(rel), mx.contiguous(key_start.astype(mx.int32)), sizes, scalar(scale)],
+        template=[("T", q.dtype), ("D", D), ("HQ", Hq), ("HKV", Hkv), ("R", rel.shape[-1]),
+                  ("WINDOW", window), ("BK", _SMALL_BK), ("TG", tg)],
+        grid=(splits * tg, Hkv, B),
+        threadgroup=(tg, 1, 1),
+        output_shapes=[(B * Hq * splits * 8,), (B * Hq * splits * 8,), (B * Hq * splits * 8 * D,)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    return _small_merge_kernel(
+        inputs=[pm, pl, po, mx.contiguous(sinks.astype(mx.float32)), sizes],
+        template=[("T", q.dtype), ("D", D), ("HQ", Hq)],
+        grid=(B * Hq * L * D, 1, 1),
+        threadgroup=(D, 1, 1),
+        output_shapes=[(B, L, Hq, D)],
+        output_dtypes=[q.dtype],
+    )[0]
