@@ -128,29 +128,37 @@ _DOWN_SRC = r"""
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint sg = tid / 32, lane = tid % 32, l4 = lane % LPD;
-    const uint dim = threadgroup_position_in_grid.x * (TGS / LPD) + sg * (32 / LPD) + lane / LPD;
-    if (dim >= (uint)DM) return;
-    float acc = 0.0f;
+    // a lane group (LPD lanes) owns NRD consecutive output dims
+    const uint dim0 = (threadgroup_position_in_grid.x * (TGS / LPD) + sg * (32 / LPD) + lane / LPD) * NRD;
+    if (dim0 >= (uint)DM) return;
+    float acc[NRD];
+    for (int r = 0; r < NRD; ++r) acc[r] = 0.0f;
     for (uint slot = 0; slot < (uint)TOPK; ++slot) {
         const uint e = experts[t * TOPK + slot];
-        const ulong row = (ulong)e * DM + dim;
-        const device uint4* qrow = (const device uint4*)(w + row * (N / 8));
-        const device uchar* srow = scales + row * (N / 16);
-        float d = 0.0f;
+        const float wsc = rw[t * TOPK + slot] * escale[e];
+        float d[NRD];
+        for (int r = 0; r < NRD; ++r) d[r] = 0.0f;
         for (uint c = l4; c < (uint)CH; c += LPD) {
-            const uint4 q = qrow[c];
-            const float s0 = s_lut[srow[2 * c]], s1 = s_lut[srow[2 * c + 1]];
             const uint b = (slot * N + c * 32) / 4;
             float4 hv[8];
             for (int i = 0; i < 8; ++i) hv[i] = HSTAGE ? float4(hs[b + i]) : float4(src[b + i]);
-            const float p0 = ink_dot8(q.x, hv[0], hv[1], c_lut) + ink_dot8(q.y, hv[2], hv[3], c_lut);
-            const float p1 = ink_dot8(q.z, hv[4], hv[5], c_lut) + ink_dot8(q.w, hv[6], hv[7], c_lut);
-            d += s0 * p0 + s1 * p1;
+            for (int r = 0; r < NRD; ++r) {
+                const ulong row = (ulong)e * DM + dim0 + r;
+                const uint4 q = ((const device uint4*)(w + row * (N / 8)))[c];
+                const device uchar* srow = scales + row * (N / 16);
+                const float s0 = s_lut[srow[2 * c]], s1 = s_lut[srow[2 * c + 1]];
+                const float p0 = ink_dot8(q.x, hv[0], hv[1], c_lut) + ink_dot8(q.y, hv[2], hv[3], c_lut);
+                const float p1 = ink_dot8(q.z, hv[4], hv[5], c_lut) + ink_dot8(q.w, hv[6], hv[7], c_lut);
+                d[r] += s0 * p0 + s1 * p1;
+            }
         }
-        acc = metal::fma(rw[t * TOPK + slot] * escale[e], d, acc);
+        for (int r = 0; r < NRD; ++r) acc[r] = metal::fma(wsc, d[r], acc[r]);
     }
-    for (uint o = 1; o < (uint)LPD; o *= 2) acc += simd_shuffle_xor(acc, o);
-    if (l4 == 0) y[(ulong)t * DM + dim] = (T)acc;
+    for (int r = 0; r < NRD; ++r) {
+        float a = acc[r];
+        for (uint o = 1; o < (uint)LPD; o *= 2) a += simd_shuffle_xor(a, o);
+        if (l4 == 0 && dim0 + r < (uint)DM) y[(ulong)t * DM + dim0 + r] = (T)a;
+    }
 """
 
 
@@ -227,11 +235,12 @@ def nvfp4_down(h, w, scales, escale, experts, route_w, m_rows: int):
     topk = int(experts.shape[0]) // m_rows
     lpd = _env_int("MTPLX_INKLING2_MOE_DOWN_LPD", 8, (2, 4, 8, 16, 32))
     tgs = _env_int("MTPLX_INKLING2_MOE_DOWN_TGS", 64, (64, 128, 256))
-    dpt = tgs // lpd
+    nrd = _env_int("MTPLX_INKLING2_MOE_DOWN_NRD", 1, (1, 2, 4))
+    dpt = (tgs // lpd) * nrd
     (y,) = _down_kernel()(
         inputs=[h, w, scales, escale, experts, route_w],
         template=[("T", h.dtype), ("N", n), ("DM", dmodel), ("TOPK", topk), ("LPD", lpd),
-                  ("HSTAGE", _env_int("MTPLX_INKLING2_MOE_DOWN_HSTAGE", 0, (0, 1))), ("TGS", tgs)],
+                  ("HSTAGE", _env_int("MTPLX_INKLING2_MOE_DOWN_HSTAGE", 0, (0, 1))), ("TGS", tgs), ("NRD", nrd)],
         grid=(((dmodel + dpt - 1) // dpt) * tgs, m_rows, 1),
         threadgroup=(tgs, 1, 1),
         output_shapes=[(m_rows, dmodel)],

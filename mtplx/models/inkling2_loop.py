@@ -1100,6 +1100,59 @@ class DecoderLayer(nn.Module):
             self.v_message_gate = MessageGate(dims, rank)
             self.mlp_message_gate = MessageGate(dims, rank)
 
+    def _pre_row_ok(self, h: mx.array) -> bool:
+        return (
+            _DECODE_KERNELS
+            and _use_kernels()
+            and h.ndim == 3
+            and h.shape[0] == 1
+            and h.shape[1] == 1
+            and h.dtype in (mx.float16, mx.bfloat16)
+            and (not hasattr(self, "q_message_gate") or self._gates_fusable(h))
+        )
+
+    def _pre_ln_weights(self) -> mx.array:
+        cached = self.__dict__.get("_pre_ln")
+        if cached is None:
+            if isinstance(self, FullDecoderLayer):
+                cached = mx.stack(
+                    [self.q_input_layernorm.weight, self.k_input_layernorm.weight, self.v_input_layernorm.weight]
+                )
+            else:
+                cached = self.input_layernorm.weight[None]
+            mx.eval(cached)
+            object.__setattr__(self, "_pre_ln", cached)
+        return cached
+
+    def _pre_row(self, h, bs, msg):
+        """One kernel: RMS of h, depth attention for the attention inputs and
+        (without messages) their input RMS norms. Returns hq, hk, hv and the
+        normed residual (hk / hv are hq itself on sliding layers)."""
+        from ..kernels.inkling2_decode import pre_row
+
+        dims = h.shape[-1]
+        dtype = h.dtype
+        full = isinstance(self, FullDecoderLayer)
+        query = self.attention_input.query if self.attention_input is not None else None
+        blocks = None if (bs is None or self.attention_input is None) else bs.reshape(-1, dims)
+        eps = (self.q_input_layernorm if full else self.input_layernorm).eps
+        nr, y = pre_row(h, blocks, query, self._pre_ln_weights(), norm=msg is None, eps=eps)
+        nr = nr.reshape(1, 1, dims)
+        if msg is None:
+            if full:
+                return y[0].reshape(1, 1, dims), y[1].reshape(1, 1, dims), y[2].reshape(1, 1, dims), nr
+            x = y.reshape(1, 1, dims)
+            return x, x, x, nr
+        att = [y[i].reshape(1, 1, dims) for i in range(y.shape[0])]
+        states = tuple(att) if full else (att[0],) * 3
+        states = self._mix_messages(states, msg)
+        if full:
+            norms = (self.q_input_layernorm, self.k_input_layernorm, self.v_input_layernorm)
+            hq, hk, hv = (n(s_).astype(dtype) for n, s_ in zip(norms, states))
+        else:
+            hq, hk, hv = (self.input_layernorm(s_).astype(dtype) for s_ in states)
+        return hq, hk, hv, nr
+
     def _post_mid_ok(self, x: mx.array) -> bool:
         return (
             _DECODE_KERNELS
@@ -1240,11 +1293,14 @@ class DecoderLayer(nn.Module):
                 bs = rest.pop(0) if has_block else None
                 msg = rest.pop(0) if has_msg else None
                 tau = rest.pop(0) if has_tau else None
-                normed_residual = unweighted_rms_norm(h.astype(mx.float32))
-                attention_inputs = None
-                if self.attention_input is not None:
-                    attention_inputs = self.attention_input(bs, normed_residual)
-                hq, hk, hv = self._attn_inputs(h, attention_inputs, msg)
+                if self._pre_row_ok(h):
+                    hq, hk, hv, normed_residual = self._pre_row(h, bs, msg)
+                else:
+                    normed_residual = unweighted_rms_norm(h.astype(mx.float32))
+                    attention_inputs = None
+                    if self.attention_input is not None:
+                        attention_inputs = self.attention_input(bs, normed_residual)
+                    hq, hk, hv = self._attn_inputs(h, attention_inputs, msg)
                 conv_states = [c0, c1]
                 if attn._decode_prep_ok(hq):
                     q, k, v, pb, sinks, gate = attn._decode_prep(hq, hk, hv, conv_states, tau)

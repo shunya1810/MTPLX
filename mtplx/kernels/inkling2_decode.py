@@ -333,3 +333,286 @@ def attn_prep(
     )
     q_out, k_out, v_out, pb, ks, vs = outs
     return q_out, k_out, v_out, pb, (ks if conv else None), (vs if conv else None)
+
+
+# --------------------------------------------------------------------------
+# Post-attention row (one token, one threadgroup of 1024 threads):
+#   x1 = conv_step(o)                       (post-attention short conv, dtype T)
+#   res = x1 (block boundary) | h + x1      (float32)
+#   mlp_in = depth_attention(blocks [+ nr if boundary], rms(res), query)
+#   y = rms_norm(mlp_in) * ln_w  -> T       (skipped with NORM = 0: mlp_in out)
+# Outputs: res (D) f32, y (D) T (or mlp_in f32 when NORM = 0), new conv state.
+
+_POST_SRC = r"""
+    constexpr float RSQ5 = 0.4472135954999579f;
+    constexpr int TGN = 1024;
+    constexpr int PER = (D + TGN - 1) / TGN;
+    constexpr int NSRC = NB + BOUNDARY + 1;   // block sources + this row
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint lane = tid % 32, sg = tid / 32;
+    threadgroup float red[NSRC + 2][32];
+    const float eps = params[0], qscale = params[1];
+    float resv[PER];
+    float ss = 0.0f;
+    for (int p = 0; p < PER; ++p) {
+        const uint d = tid + p * TGN;
+        resv[p] = 0.0f;
+        if (d >= (uint)D) continue;
+        float win[4];
+        for (int j = 0; j < 3; ++j) win[j] = state[(ulong)j * D + d];
+        win[3] = (float)o[d];
+        float acc = 0.0f;
+        for (int j = 0; j < 4; ++j) acc += (float)w[(ulong)d * 4 + j] * (float)(T)win[j];
+        const float x1 = (float)(T)(((float)(T)acc + win[3]) * RSQ5);
+        for (int j = 0; j < 3; ++j) state_new[(ulong)j * D + d] = win[j + 1];
+        const float rv = BOUNDARY ? x1 : (float)h[d] + x1;
+        resv[p] = rv;
+        res[d] = rv;
+        ss += rv * rv;
+    }
+    // rms of res
+    float t = simd_sum(ss);
+    if (lane == 0) red[0][sg] = t;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (int i = 0; i < 32; ++i) tot += red[0][i];
+    const float inv = metal::precise::rsqrt(tot / (float)D + eps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // scores of every source against the query
+    float sc[NSRC];
+    for (int i = 0; i < NSRC; ++i) sc[i] = 0.0f;
+    for (int p = 0; p < PER; ++p) {
+        const uint d = tid + p * TGN;
+        if (d >= (uint)D) continue;
+        const float qv = query[d];
+        for (int i = 0; i < NB; ++i) sc[i] += blocks[(ulong)i * D + d] * qv;
+        if (BOUNDARY) sc[NB] += nr[d] * qv;
+        sc[NSRC - 1] += resv[p] * inv * qv;
+    }
+    for (int i = 0; i < NSRC; ++i) {
+        const float v = simd_sum(sc[i]);
+        if (lane == 0) red[i + 1][sg] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float wgt[NSRC];
+    float mx_ = -INFINITY;
+    for (int i = 0; i < NSRC; ++i) {
+        float v = 0.0f;
+        for (int j = 0; j < 32; ++j) v += red[i + 1][j];
+        wgt[i] = v * qscale;
+        mx_ = metal::max(mx_, wgt[i]);
+    }
+    float z = 0.0f;
+    for (int i = 0; i < NSRC; ++i) { wgt[i] = metal::precise::exp(wgt[i] - mx_); z += wgt[i]; }
+    for (int i = 0; i < NSRC; ++i) wgt[i] /= z;
+    // mixed input, then the weighted RMS norm
+    float mi[PER];
+    float s2 = 0.0f;
+    for (int p = 0; p < PER; ++p) {
+        const uint d = tid + p * TGN;
+        mi[p] = 0.0f;
+        if (d >= (uint)D) continue;
+        float v = 0.0f;
+        for (int i = 0; i < NB; ++i) v += wgt[i] * blocks[(ulong)i * D + d];
+        if (BOUNDARY) v += wgt[NB] * nr[d];
+        v += wgt[NSRC - 1] * resv[p] * inv;
+        mi[p] = v;
+        s2 += v * v;
+    }
+    if (!NORM) {
+        for (int p = 0; p < PER; ++p) {
+            const uint d = tid + p * TGN;
+            if (d < (uint)D) y[d] = mi[p];
+        }
+        return;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    t = simd_sum(s2);
+    if (lane == 0) red[0][sg] = t;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    tot = 0.0f;
+    for (int i = 0; i < 32; ++i) tot += red[0][i];
+    const float inv2 = metal::precise::rsqrt(tot / (float)D + eps);
+    for (int p = 0; p < PER; ++p) {
+        const uint d = tid + p * TGN;
+        if (d < (uint)D) y[d] = (YT)(mi[p] * inv2 * (float)ln_w[d]);
+    }
+"""
+
+
+@lru_cache(maxsize=None)
+def _post_kernel():
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling2_post_mid",
+        input_names=["o", "h", "nr", "blocks", "state", "w", "query", "ln_w", "params"],
+        output_names=["res", "y", "state_new"],
+        source=_POST_SRC,
+    )
+
+
+def post_mid(o, h, nr, blocks, state, w, query, ln_w, *, boundary: bool, norm: bool, eps: float):
+    """One token. o / h (D,) dtype T, nr (D,) f32, blocks (NB, D) f32 or None,
+    state (3, D) f32, w (D, 4) T conv weight, query (D,) f32, ln_w (D,) T.
+    Returns res (D,) f32, y (D,) (T normed when norm, else f32 mlp input),
+    new state (3, D) f32."""
+    D = int(o.size)
+    T = o.dtype
+    NB = 0 if blocks is None else int(blocks.shape[0])
+    params = mx.array([eps, D ** -0.5], dtype=mx.float32)
+    blk = blocks.reshape(NB, D) if NB else mx.zeros((1, D), mx.float32)
+    res, y, st = _post_kernel()(
+        inputs=[o.reshape(D), h.reshape(D), nr.reshape(D), blk, state.reshape(3, D), w.reshape(D, 4),
+                query.reshape(D), ln_w.reshape(D), params],
+        template=[("T", T), ("YT", T if norm else mx.float32), ("D", D), ("NB", NB),
+                  ("BOUNDARY", int(boundary)), ("NORM", int(norm))],
+        grid=(1024, 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(D,), (D,), (3, D)],
+        output_dtypes=[mx.float32, T if norm else mx.float32, mx.float32],
+    )
+    return res, y, st
+
+
+# --------------------------------------------------------------------------
+# Pre-attention row (one token, one threadgroup of 1024 threads):
+#   nr = rms(h)                                    (float32, kept for post)
+#   a_q = depth_attention(blocks + [nr], query_q)  for Q queries (HAS_BLOCK)
+#         else a = h                               (the first layer)
+#   x_q = rms_norm(a_q) * ln_w[q] -> T             (NORM; else a_q float32)
+
+_PRE_SRC = r"""
+    constexpr int TGN = 1024;
+    constexpr int PER = (D + TGN - 1) / TGN;
+    constexpr int NSRC = NB + 1;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint lane = tid % 32, sg = tid / 32;
+    threadgroup float red[NSRC * Q + Q + 1][32];
+    const float eps = params[0], qscale = params[1];
+    float hv[PER];
+    float ss = 0.0f;
+    for (int p = 0; p < PER; ++p) {
+        const uint d = tid + p * TGN;
+        hv[p] = d < (uint)D ? (float)h[d] : 0.0f;
+        ss += hv[p] * hv[p];
+    }
+    float t = simd_sum(ss);
+    if (lane == 0) red[0][sg] = t;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (int i = 0; i < 32; ++i) tot += red[0][i];
+    const float inv = metal::precise::rsqrt(tot / (float)D + eps);
+    for (int p = 0; p < PER; ++p) {
+        const uint d = tid + p * TGN;
+        if (d < (uint)D) nr[d] = hv[p] * inv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float av[Q][PER];
+    if (HAS_BLOCK) {
+        float sc[Q][NSRC];
+        for (int qi = 0; qi < Q; ++qi) for (int i = 0; i < NSRC; ++i) sc[qi][i] = 0.0f;
+        for (int p = 0; p < PER; ++p) {
+            const uint d = tid + p * TGN;
+            if (d >= (uint)D) continue;
+            const float n = hv[p] * inv;
+            for (int qi = 0; qi < Q; ++qi) {
+                const float qv = query[(ulong)qi * D + d];
+                for (int i = 0; i < NB; ++i) sc[qi][i] += blocks[(ulong)i * D + d] * qv;
+                sc[qi][NB] += n * qv;
+            }
+        }
+        for (int qi = 0; qi < Q; ++qi)
+            for (int i = 0; i < NSRC; ++i) {
+                const float v = simd_sum(sc[qi][i]);
+                if (lane == 0) red[1 + qi * NSRC + i][sg] = v;
+            }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int qi = 0; qi < Q; ++qi) {
+            float wgt[NSRC];
+            float mx_ = -INFINITY;
+            for (int i = 0; i < NSRC; ++i) {
+                float v = 0.0f;
+                for (int j = 0; j < 32; ++j) v += red[1 + qi * NSRC + i][j];
+                wgt[i] = v * qscale;
+                mx_ = metal::max(mx_, wgt[i]);
+            }
+            float z = 0.0f;
+            for (int i = 0; i < NSRC; ++i) { wgt[i] = metal::precise::exp(wgt[i] - mx_); z += wgt[i]; }
+            for (int p = 0; p < PER; ++p) {
+                const uint d = tid + p * TGN;
+                float v = 0.0f;
+                if (d < (uint)D) {
+                    for (int i = 0; i < NB; ++i) v += wgt[i] * blocks[(ulong)i * D + d];
+                    v += wgt[NB] * hv[p] * inv;
+                    v /= z;
+                }
+                av[qi][p] = v;
+            }
+        }
+    } else {
+        for (int qi = 0; qi < Q; ++qi) for (int p = 0; p < PER; ++p) av[qi][p] = hv[p];
+    }
+    if (!NORM) {
+        for (int qi = 0; qi < Q; ++qi)
+            for (int p = 0; p < PER; ++p) {
+                const uint d = tid + p * TGN;
+                if (d < (uint)D) y[(ulong)qi * D + d] = av[qi][p];
+            }
+        return;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int qi = 0; qi < Q; ++qi) {
+        float s2 = 0.0f;
+        for (int p = 0; p < PER; ++p) s2 += av[qi][p] * av[qi][p];
+        s2 = simd_sum(s2);
+        if (lane == 0) red[1 + NSRC * Q + qi][sg] = s2;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int qi = 0; qi < Q; ++qi) {
+        float s2 = 0.0f;
+        for (int j = 0; j < 32; ++j) s2 += red[1 + NSRC * Q + qi][j];
+        const float inv2 = metal::precise::rsqrt(s2 / (float)D + eps);
+        for (int p = 0; p < PER; ++p) {
+            const uint d = tid + p * TGN;
+            if (d < (uint)D) y[(ulong)qi * D + d] = (YT)(av[qi][p] * inv2 * (float)ln_w[(ulong)qi * D + d]);
+        }
+    }
+"""
+
+
+@lru_cache(maxsize=None)
+def _pre_kernel():
+    return mx.fast.metal_kernel(
+        name="mtplx_inkling2_pre_row",
+        input_names=["h", "blocks", "query", "ln_w", "params"],
+        output_names=["nr", "y"],
+        source=_PRE_SRC,
+    )
+
+
+def pre_row(h, blocks, query, ln_w, *, norm: bool, eps: float):
+    """One token. h (D,) T; blocks (NB, D) f32 or None (first layer); query
+    (Q, D) f32 (ignored without blocks); ln_w (Q, D) T. Returns nr (D,) f32 and
+    y (Q, D): T normed when norm, else the float32 attention inputs."""
+    D = int(h.size)
+    T = h.dtype
+    has_block = blocks is not None
+    NB = int(blocks.shape[0]) if has_block else 0
+    Q = int(ln_w.shape[0]) if ln_w.ndim == 2 else 1
+    if has_block:
+        Q = int(query.size) // D
+    params = mx.array([eps, D ** -0.5], dtype=mx.float32)
+    blk = blocks.reshape(NB, D) if has_block else mx.zeros((1, D), mx.float32)
+    qry = query.reshape(-1, D) if has_block else mx.zeros((1, D), mx.float32)
+    lw = ln_w.reshape(-1, D)
+    if lw.shape[0] != Q:
+        lw = mx.broadcast_to(lw[:1], (Q, D))
+    nr, y = _pre_kernel()(
+        inputs=[h.reshape(D), blk, qry, lw, params],
+        template=[("T", T), ("YT", T if norm else mx.float32), ("D", D), ("NB", NB), ("Q", Q),
+                  ("HAS_BLOCK", int(has_block)), ("NORM", int(norm))],
+        grid=(1024, 1, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(D,), (Q, D)],
+        output_dtypes=[mx.float32, T if norm else mx.float32],
+    )
+    return nr, y
