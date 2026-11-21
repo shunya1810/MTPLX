@@ -1560,6 +1560,28 @@ _M1_QWEN4_MOE_ENV = {
     "MTPLX_QSA_PREFILL_DIRECT_MIN_CONTEXT": "8192",
 }
 _M1_QWEN4_MOE_DROP = ("MTPLX_PREFILL_CHUNK_SIZE_DENSE", "MTPLX_PREFILL_CHUNK_SIZE_REPAGE")
+# Inkling 2 Mini (inkling2_loop): 48 layer visits of small kernels a decode
+# step, so MLX's per-command-buffer op bound dominates. M1 Max, ctx 1K, fp16,
+# pipelined greedy decode: default bound 37.0 ms/token, 150 ops + 1000 MB
+# 30.0 ms (500 / 2000 ops: no further gain). MLX reads both once, at device
+# creation, so they ride the child env.
+_M1_INKLING2_ENV = {
+    "MLX_MAX_OPS_PER_BUFFER": "150",
+    "MLX_MAX_MB_PER_BUFFER": "1000",
+}
+
+
+def _config_is_inkling2(model_path: Any) -> bool:
+    import json
+
+    try:
+        config = json.loads((Path(str(model_path)) / "config.json").read_text())
+    except Exception:
+        return False
+    text = config.get("text_config") if isinstance(config.get("text_config"), dict) else {}
+    return str(config.get("model_type") or "").lower() == "inkling2_loop" or str(
+        text.get("model_type") or ""
+    ).lower() == "inkling2_loop_text"
 _MOE_EXPERT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
 
 
@@ -1585,7 +1607,12 @@ def _config_is_moe(model_path: Any) -> bool:
 
 
 def _m1_moe_lane_env(
-    *, moe: bool, gdn: bool, a3b_capture_commit: bool, qwen4: bool = False
+    *,
+    moe: bool,
+    gdn: bool,
+    a3b_capture_commit: bool,
+    qwen4: bool = False,
+    inkling2: bool = False,
 ) -> dict[str, str]:
     """The M1 MoE launch env for one daemon: empty for a dense model, off the
     M1 family or with ``MTPLX_M1_MOE_LANE=0``, and without any key the
@@ -1611,6 +1638,8 @@ def _m1_moe_lane_env(
         env.update(_M1_QWEN4_MOE_ENV)
     if a3b_capture_commit:
         env.update(_M1_A3B_ENV)
+    if inkling2:
+        env.update(_M1_INKLING2_ENV)
     return {key: value for key, value in env.items() if key not in os.environ}
 
 
@@ -1663,6 +1692,7 @@ def _apply_m1_moe_defaults(
         a3b_capture_commit=a3b
         and getattr(args, "verify_strategy", None) == "capture_commit",
         qwen4=_model_config_is_qwen4_exp(str(model_path)) if model_path is not None else False,
+        inkling2=_config_is_inkling2(model_path) if model_path is not None else False,
     )
 
 
