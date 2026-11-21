@@ -105,6 +105,7 @@ _COMPILED_MAX_ROWS = _env_int("MTPLX_INKLING2_COMPILED_ROWS", 9)
 _SMALL_ATTENTION = _env_int("MTPLX_INKLING2_SMALL_ATTENTION", 1) == 1
 _GROUPED_MOE_MAX_TOKENS = _env_int("MTPLX_INKLING2_GROUPED_MOE_TOKENS", 9)
 _SEG_GEMM = _env_int("MTPLX_INKLING2_SEG_GEMM", 1) == 1
+_STEEL_ATTENTION = _env_int("MTPLX_INKLING2_STEEL_ATTENTION", 1) == 1
 
 
 # One-token kernels (kernels/inkling2_decode.py): fused message gates and the
@@ -701,6 +702,20 @@ class Attention(nn.Module):
             if L <= 8 and _SMALL_ATTENTION:
                 # verify widths: the key range split over threadgroups
                 return relative_attention_small(
+                    query,
+                    key,
+                    value,
+                    position_bias,
+                    sinks,
+                    scale=self.scaling,
+                    window=self.sliding_window,
+                    key_start=key_start,
+                )
+            if _STEEL_ATTENTION and query.shape[-1] == 128:
+                # prefill widths: MLX's steel attention tiles with the relative mask
+                from ..kernels.inkling2_steel_attn import steel_relative_attention
+
+                return steel_relative_attention(
                     query,
                     key,
                     value,

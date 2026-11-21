@@ -29,3 +29,22 @@ class TestSegGemm(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSteelAttention(unittest.TestCase):
+    def test_matches_relative_attention(self):
+        from mtplx.kernels.inkling2_kernels import relative_attention
+        from mtplx.kernels.inkling2_steel_attn import steel_relative_attention
+
+        for L, S, window, start in ((40, 40, 16, 0), (70, 130, 0, 5), (33, 90, 32, 0)):
+            mx.random.seed(L + S)
+            q = (mx.random.normal((1, L, 6, 128)) * 0.3).astype(mx.float16).transpose(0, 2, 1, 3)
+            kb = (mx.random.normal((1, 2, S + 8, 128)) * 0.3).astype(mx.float16)
+            vb = mx.random.normal((1, 2, S + 8, 128)).astype(mx.float16)
+            rel = mx.random.normal((1, L, 6, 24)).astype(mx.float16)
+            sinks = mx.random.normal((1, L, 6)).astype(mx.float16)
+            kw = dict(scale=128 ** -0.5, window=window, key_start=mx.array([start], mx.int32))
+            args = (q, kb[:, :, :S], vb[:, :, :S], rel, sinks)
+            ref = relative_attention(*args, **kw).astype(mx.float32)
+            got = steel_relative_attention(*args, **kw).astype(mx.float32)
+            self.assertLess(mx.abs(got - ref).max().item(), 4e-3, f"L={L} S={S}")
