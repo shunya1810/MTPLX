@@ -26,7 +26,11 @@ import mlx.core as mx
 __all__ = ["moe_nvfp4", "nvfp4_mid", "nvfp4_down"]
 
 _HEADER = r"""
-inline void ink_build_tables(threadgroup half2* c_lut, threadgroup float* s_lut, uint tid) {
+inline void ink_build_table(threadgroup half2* c_lut, threadgroup float* s_lut, uint tid);
+inline void ink_build_tables(threadgroup half2* c_lut, threadgroup float* s_lut, uint tid, uint tgs = 256) {
+    for (uint b = tid; b < 256u; b += tgs) ink_build_table(c_lut, s_lut, b);
+}
+inline void ink_build_table(threadgroup half2* c_lut, threadgroup float* s_lut, uint tid) {
     // byte -> (E2M1 low nibble, E2M1 high nibble)
     constexpr float e2m1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
     const uint lo = tid & 15u, hi = tid >> 4;
@@ -53,8 +57,8 @@ inline float ink_dot8(uint word, float4 a, float4 b, threadgroup const half2* c_
 # consecutive j's (2 NR weight rows) and its lanes stride the 32-value chunks.
 _MID_SRC = r"""
     constexpr int CH = K / 32;
-    constexpr int LPR = 8;
-    constexpr int ROWS = 32 * NR;
+    constexpr int GPS = 32 / LPR;           // lane groups a simdgroup
+    constexpr int ROWS = 8 * GPS * NR;
     threadgroup half2 c_lut[256];
     threadgroup float s_lut[256];
     const uint tid = thread_position_in_threadgroup.x;
@@ -67,7 +71,7 @@ _MID_SRC = r"""
     const float fac = escale[e];
     const uint sg = tid / 32, lane = tid % 32;
     const uint grp = lane / LPR, l8 = lane % LPR;
-    const uint j0 = threadgroup_position_in_grid.x * ROWS + (sg * 4 + grp) * NR;
+    const uint j0 = threadgroup_position_in_grid.x * ROWS + (sg * GPS + grp) * NR;
     const device vec<T, 4>* xd = (const device vec<T, 4>*)(x + (ulong)t * K);
 
     float acc[2 * NR];
@@ -89,9 +93,7 @@ _MID_SRC = r"""
     }
     for (int rp = 0; rp < 2 * NR; ++rp) {
         float v = acc[rp];
-        v += simd_shuffle_xor(v, 1);
-        v += simd_shuffle_xor(v, 2);
-        v += simd_shuffle_xor(v, 4);
+        for (uint o = 1; o < (uint)LPR; o *= 2) v += simd_shuffle_xor(v, o);
         acc[rp] = v;
     }
     if (l8 == 0) {
@@ -116,16 +118,17 @@ _DOWN_SRC = r"""
     constexpr int NV4 = TOPK * N / 4;
     threadgroup half2 c_lut[256];
     threadgroup float s_lut[256];
-    threadgroup half4 hs[NV4];
+    threadgroup half4 hs[HSTAGE ? NV4 : 1];
     const uint tid = thread_position_in_threadgroup.x;
-    ink_build_tables(c_lut, s_lut, tid);
+    ink_build_tables(c_lut, s_lut, tid, TGS);
     const uint t = threadgroup_position_in_grid.y;
     const device vec<T, 4>* src = (const device vec<T, 4>*)(h + (ulong)t * TOPK * N);
-    for (uint i = tid; i < (uint)NV4; i += 256) hs[i] = half4(src[i]);
+    if (HSTAGE)
+        for (uint i = tid; i < (uint)NV4; i += TGS) hs[i] = half4(src[i]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint sg = tid / 32, lane = tid % 32, l4 = lane % LPD;
-    const uint dim = threadgroup_position_in_grid.x * (256 / LPD) + sg * (32 / LPD) + lane / LPD;
+    const uint dim = threadgroup_position_in_grid.x * (TGS / LPD) + sg * (32 / LPD) + lane / LPD;
     if (dim >= (uint)DM) return;
     float acc = 0.0f;
     for (uint slot = 0; slot < (uint)TOPK; ++slot) {
@@ -138,10 +141,10 @@ _DOWN_SRC = r"""
             const uint4 q = qrow[c];
             const float s0 = s_lut[srow[2 * c]], s1 = s_lut[srow[2 * c + 1]];
             const uint b = (slot * N + c * 32) / 4;
-            const float p0 = ink_dot8(q.x, float4(hs[b]), float4(hs[b + 1]), c_lut)
-                           + ink_dot8(q.y, float4(hs[b + 2]), float4(hs[b + 3]), c_lut);
-            const float p1 = ink_dot8(q.z, float4(hs[b + 4]), float4(hs[b + 5]), c_lut)
-                           + ink_dot8(q.w, float4(hs[b + 6]), float4(hs[b + 7]), c_lut);
+            float4 hv[8];
+            for (int i = 0; i < 8; ++i) hv[i] = HSTAGE ? float4(hs[b + i]) : float4(src[b + i]);
+            const float p0 = ink_dot8(q.x, hv[0], hv[1], c_lut) + ink_dot8(q.y, hv[2], hv[3], c_lut);
+            const float p1 = ink_dot8(q.z, hv[4], hv[5], c_lut) + ink_dot8(q.w, hv[6], hv[7], c_lut);
             d += s0 * p0 + s1 * p1;
         }
         acc = metal::fma(rw[t * TOPK + slot] * escale[e], d, acc);
@@ -193,8 +196,9 @@ def nvfp4_mid(x2, w, scales, escale, experts, *, gate_softcap: float, up_softcap
     m_rows, k = int(x2.shape[0]), int(x2.shape[1])
     n = int(w.shape[1]) // 2
     pairs = int(experts.shape[0])
-    nr = _env_int("MTPLX_INKLING2_MOE_MID_NR", 2, (1, 2, 4))
-    rows = 32 * nr
+    nr = _env_int("MTPLX_INKLING2_MOE_MID_NR", 1, (1, 2, 4))
+    lpr = _env_int("MTPLX_INKLING2_MOE_MID_LPR", 8, (4, 8, 16, 32))
+    rows = 8 * (32 // lpr) * nr
     (h,) = _mid_kernel()(
         inputs=[x2, w, scales, escale, experts],
         template=[
@@ -203,6 +207,7 @@ def nvfp4_mid(x2, w, scales, escale, experts, *, gate_softcap: float, up_softcap
             ("N", n),
             ("TOPK", pairs // m_rows),
             ("NR", nr),
+            ("LPR", lpr),
             ("GSOFT", _int_softcap(gate_softcap)),
             ("USOFT", _int_softcap(up_softcap)),
         ],
@@ -220,13 +225,15 @@ def nvfp4_down(h, w, scales, escale, experts, route_w, m_rows: int):
     n = int(h.shape[1])
     dmodel = int(w.shape[1])
     topk = int(experts.shape[0]) // m_rows
-    lpd = _env_int("MTPLX_INKLING2_MOE_DOWN_LPD", 4, (2, 4, 8))
-    dpt = 256 // lpd
+    lpd = _env_int("MTPLX_INKLING2_MOE_DOWN_LPD", 8, (2, 4, 8, 16, 32))
+    tgs = _env_int("MTPLX_INKLING2_MOE_DOWN_TGS", 64, (64, 128, 256))
+    dpt = tgs // lpd
     (y,) = _down_kernel()(
         inputs=[h, w, scales, escale, experts, route_w],
-        template=[("T", h.dtype), ("N", n), ("DM", dmodel), ("TOPK", topk), ("LPD", lpd)],
-        grid=(((dmodel + dpt - 1) // dpt) * 256, m_rows, 1),
-        threadgroup=(256, 1, 1),
+        template=[("T", h.dtype), ("N", n), ("DM", dmodel), ("TOPK", topk), ("LPD", lpd),
+                  ("HSTAGE", _env_int("MTPLX_INKLING2_MOE_DOWN_HSTAGE", 0, (0, 1))), ("TGS", tgs)],
+        grid=(((dmodel + dpt - 1) // dpt) * tgs, m_rows, 1),
+        threadgroup=(tgs, 1, 1),
         output_shapes=[(m_rows, dmodel)],
         output_dtypes=[h.dtype],
     )
