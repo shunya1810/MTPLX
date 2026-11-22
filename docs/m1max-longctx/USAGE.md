@@ -140,6 +140,7 @@ bin/mtplx-m1 serve --model thinkingmachines-Inkling-2-Mini-MTPLX --host 127.0.0.
 
 - Measured on an M1 Max 64 GB (v2.12.3-m1.19, server, temperature 0): prefill 496 tok/s at 2K, 495–516 at 16K, 469 at 30K; decode 49 / 45 / 42 tok/s.
 - An MTP depth or `--paged-kv-quantization q8` falls back to AR and fp16 KV automatically. `mtplx tune` does not support it.
+- Upstream's own Inkling packs (`Youssofal/Inkling-2-Mini-MTPLX-*`, offered by the MTPLX 2.13 app; on M1 the FP16 builds) run on this fork's implementation too: on the M1 family it is the default (`MTPLX_INKLING2_FORK_LANE=0` picks upstream 2.13's runtime, which failed requests on an M1 Max at a Metal threadgroup limit). Optimized Speed FP16 measured 509 / 522 / 492 tok/s prefill and 48.9 / 45.5 / 42.2 tok/s decode at 2K / 16K / 32K.
 - Reasoning effort is low / medium / high / xhigh, default high. It thinks long on hard agent tasks; medium suits time-limited use. Sampling defaults to temperature 1.0.
 - The model takes up to 1M tokens of context. The default window follows the Mac's memory and is printed at startup; widen it with `--context-window` (measurements in the m1.19 section of CHANGES). KV costs 32 KB per token, and prefill and decode slow down with length (256K: prefill 236 tok/s, decode 19.8 tok/s; 512K: 154 and 12.0 tok/s). On a 64 GB Mac 1M does not fit with fp16 KV.
 

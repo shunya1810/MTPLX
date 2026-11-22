@@ -141,6 +141,7 @@ bin/mtplx-m1 serve --model thinkingmachines-Inkling-2-Mini-MTPLX --host 127.0.0.
 
 - M1 Max 64 GB での実測（v2.12.3-m1.19、サーバー、temperature 0）: prefill は 2K で 496、1.6 万トークンで 495〜516、3 万トークンで 469 tok/s、decode は 49 / 45 / 42 tok/s です。
 - MTP の深さや `--paged-kv-quantization q8` を指定しても、AR と fp16 の KV に自動で切り替わります。`mtplx tune` には対応していません。
+- 本家の Inkling のパック（`Youssofal/Inkling-2-Mini-MTPLX-*`。MTPLX 2.13 のアプリが勧めるもので、M1 では FP16 版）も、このフォークの実装で動きます。M1 系ではこの実装が既定です（`MTPLX_INKLING2_FORK_LANE=0` で本家 2.13 の実装になりますが、M1 Max では Metal の threadgroup の上限で request が失敗しました）。Optimized Speed FP16 で、2K / 16K / 32K の prefill 509 / 522 / 492 tok/s、decode 48.9 / 45.5 / 42.2 tok/s でした。
 - 思考の深さ（reasoning effort）は low / medium / high / xhigh で、既定は high です。難しいエージェントの作業では長く考えるので、時間の制限がある使い方では medium が向きます。sampling の既定は temperature 1.0 です。
 - 文脈は 1M トークンまでのモデルです。既定の上限は Mac のメモリから決まり、起動時のログに出ます。それより長いプロンプトは `--context-window` で広げます（実測は CHANGES の m1.19 の節にあります）。1 トークンあたりの KV は 32 KB で、長いほど prefill と decode が遅くなります（25.6 万トークンで prefill 236 tok/s、decode 19.8 tok/s、52 万トークンで 154 tok/s と 12.0 tok/s）。64 GB の Mac では 1M は fp16 の KV が収まりません。
 

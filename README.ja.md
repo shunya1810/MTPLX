@@ -5,7 +5,7 @@
 
 [English](README.md) | 日本語
 
-[MTPLX](https://github.com/youssofal/MTPLX) を M1 系の Mac で速く動かすための非公式のフォークです。MTPLX 2.12.3 に、M1 系の GPU でだけ有効になる変更を加えています。対象は Qwen3.5・Qwen3.6・Qwen3.8 系のモデルで、長いプロンプトとコーディングエージェントでの利用を主な用途にしています。
+[MTPLX](https://github.com/youssofal/MTPLX) を M1 系の Mac で速く動かすための非公式のフォークです。MTPLX 2.13.0 に、M1 系の GPU でだけ有効になる変更を加えています。対象は Qwen3.5・Qwen3.6・Qwen3.8 系のモデルで、長いプロンプトとコーディングエージェントでの利用を主な用途にしています。
 
 本家と同じく、モデル自身の MTP（multi-token prediction）ヘッドで投機的デコードを行うので、出力の分布は本家と変わりません。OpenAI 互換と Anthropic 互換の API で動きます。
 
@@ -44,10 +44,10 @@
 | Qwen3.6-35B-A3B（[Youssofal Speed FP16](https://huggingface.co/Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16)） | MoE（1 トークンあたり 3B）、いちばん速い | アプリのモデル画面 | 読み込み中 32.6 GB、応答中 21〜24 GB | decode 128 tok/s（短いプロンプト）、prefill 945 tok/s（8K） |
 | Qwen3.8-27B（[Youssofal Speed FP16](https://huggingface.co/Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16)） | dense | アプリのモデル画面 | 25 GB（8K）〜36 GB（128K） | decode 32 tok/s、prefill 233 tok/s（8K） |
 | Qwen3.8-Flash-Next（Unsloth UD-Q2_0） | MoE、64 GB の Mac のみ | `~/MTPLX-m1/bin/mtplx-m1 get flash-next`（70.5 GB をダウンロード） | 50〜55 GB | decode 42〜48 tok/s（2K、思考あり）、3.2 万トークンのプロンプトを約 83 秒で読む |
-| Inkling-2-Mini（Thinking Machines） | MoE、層を繰り返す構造、MTP なし | `~/MTPLX-m1/bin/mtplx-m1 get inkling2`（約 20 GB） | 3.2 万トークンまで約 25 GB、25.6 万トークンで 33.9 GB | decode 49 tok/s（2K）、prefill 約 500 tok/s（1.6 万トークン） |
+| Inkling-2-Mini（Thinking Machines） | MoE、層を繰り返す構造、MTP なし | `~/MTPLX-m1/bin/mtplx-m1 get inkling2`（約 20 GB）、または MTPLX 2.13 アプリの本家の FP16 パック | 3.2 万トークンまで約 25 GB、25.6 万トークンで 33.9 GB | decode 49 tok/s（2K）、prefill 約 500 tok/s（1.6 万トークン） |
 
 - これらの系統のファインチューン（Ornith、Huihui、Swift など）は、アプリの Forge で作れます。
-- アプリのモデル画面には、この 2 つ（Unsloth の Flash-Next の GGUF と Inkling）は出てきません。`get` で `~/.mtplx/models` に置くと、アプリのモデル一覧に出ます。
+- アプリのモデル画面には、Unsloth の Flash-Next の GGUF と Inkling の公式の重みは出てきません。`get` で `~/.mtplx/models` に置くと、アプリのモデル一覧に出ます。MTPLX 2.13 のアプリは本家の Inkling の FP16 パックを勧めますが、このフォークのエンジンでは、そのパックも動きます。
 - 計測は M1 Max 64 GB の 1 台だけで、メモリの小さい Mac では試していません。ピークより余裕を残してください（システムとほかのアプリの分）。
 - 速さの条件は下の[主な計測値](#主な計測値)に、Flash-Next と Inkling は [USAGE](docs/m1max-longctx/USAGE.ja.md) にあります。
 
@@ -131,6 +131,7 @@
 - v2.12.3-m1.19 では、Thinking Machines の Inkling-2-Mini を動かせるようにしました（下の機能の一覧を参照）。この表のモデルの経路は変わらないので、表は測り直していません。
 - v2.12.3-m1.20 では、Inkling-2-Mini の会話を復元したときに sliding window の位置がずれていた不具合を直しました。この表のモデルの経路は変わらないので、表は測り直していません。
 - v2.12.3-m1.21 では、1 行で入れる導入スクリプトと `mtplx-m1` コマンドを足し、Inkling-2-Mini の長いプロンプトの prefill を 1〜2% 速くしました。この表のモデルの経路は変わらないので、表は測り直していません。
+- v2.13.0-m1.22 では本家 2.13.0 を取り込みましたが、これらのモデルの速さは変わりません（Qwen3.8-27B と Qwen3.6-35B-A3B を m1.21 と交互に計測し、2K〜32K の prefill と decode の差はばらつきの範囲でした）。表は測り直していません。M1 系の Inkling-2-Mini は、このフォークの実装のまま動かします（本家のパックも読めます）。本家 2.13.0 の Inkling の実装は、M1 Max では Metal の threadgroup の上限で request が失敗し、動いた場合も decode が遅かったためです。
 - Qwen3.6-35B-A3B は、同じ構成の Ornith-1.5-35B-A3B より 32K〜64K のプロンプトの読み込みが遅くなっています（32K で 931 と 1,026 tok/s）。v2.12.2-m1.10 では同じでした（1,028 と 1,034）。m1.13 は prefill を変えておらず、同じ日の m1.12 との比較でも遅くはありません（約 2.9 万と 10.4 万トークンの cold のプロンプトで 910 と 513 tok/s、m1.12 は 697 と 444）。原因は調べている途中です。
 - 8K〜128K のプロンプトは、1 万 1 千トークンの HTML ファイルを繰り返したものです。約 256K（22 回の繰り返し）まで読ませると、3 回目の繰り返しから Qwen3.8-27B 自身の次のトークンの予測が当たらなくなり（本家でも同じ）、モデルの hidden state を読む draft ヘッドも当たらなくなります。そのため 256K 前後は、上の繰り返しのない文章の計測で示しています。
 - MacBook Pro M1 Max 64 GB、macOS 26。プロファイルは `turbo`、文脈の上限は 256K、KV キャッシュは 8bit、temperature は 0.6（seed 固定）です。

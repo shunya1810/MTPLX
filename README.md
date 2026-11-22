@@ -5,7 +5,7 @@
 
 English | [日本語](README.ja.md)
 
-An unofficial fork of [MTPLX](https://github.com/youssofal/MTPLX) that makes it faster on Macs with an M1-family chip. It is MTPLX 2.12.3 plus changes that only switch on for M1-family GPUs. It targets Qwen3.5, Qwen3.6 and Qwen3.8 family models, mainly for long prompts and coding agents.
+An unofficial fork of [MTPLX](https://github.com/youssofal/MTPLX) that makes it faster on Macs with an M1-family chip. It is MTPLX 2.13.0 plus changes that only switch on for M1-family GPUs. It targets Qwen3.5, Qwen3.6 and Qwen3.8 family models, mainly for long prompts and coding agents.
 
 Like upstream, it decodes speculatively with the model's own MTP (multi-token prediction) heads, so the output distribution is the same as upstream's. It serves an OpenAI-compatible and an Anthropic-compatible API.
 
@@ -44,10 +44,10 @@ Without the app, start the server yourself (quit the app first: two engines do n
 | Qwen3.6-35B-A3B ([Youssofal Speed FP16](https://huggingface.co/Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16)) | MoE, 3B active, fastest | the app's model screen | 32.6 GB while loading, 21–24 GB answering | decode 128 tok/s (short prompts), prefill 945 tok/s (8K) |
 | Qwen3.8-27B ([Youssofal Speed FP16](https://huggingface.co/Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16)) | dense | the app's model screen | 25 GB (8K) to 36 GB (128K) | decode 32 tok/s, prefill 233 tok/s (8K) |
 | Qwen3.8-Flash-Next (Unsloth UD-Q2_0) | MoE, 64 GB Macs only | `~/MTPLX-m1/bin/mtplx-m1 get flash-next` (70.5 GB download) | 50–55 GB | decode 42–48 tok/s (2K, thinking on), a 32K prompt in about 83 s |
-| Inkling-2-Mini (Thinking Machines) | MoE, looped, no MTP | `~/MTPLX-m1/bin/mtplx-m1 get inkling2` (about 20 GB) | about 25 GB to 32K, 33.9 GB at 256K | decode 49 tok/s (2K), prefill about 500 tok/s (16K) |
+| Inkling-2-Mini (Thinking Machines) | MoE, looped, no MTP | `~/MTPLX-m1/bin/mtplx-m1 get inkling2` (about 20 GB), or upstream's FP16 packs in the MTPLX 2.13 app | about 25 GB to 32K, 33.9 GB at 256K | decode 49 tok/s (2K), prefill about 500 tok/s (16K) |
 
 - Fine-tunes of these families (Ornith, Huihui, Swift and others) can be built with the app's Forge.
-- The app's model screen does not offer these two builds (Unsloth's Flash-Next GGUF and Inkling). `get` puts them in `~/.mtplx/models`, so they appear in the app's model list.
+- The app's model screen does not offer Unsloth's Flash-Next GGUF or the official Inkling weights; `get` puts them in `~/.mtplx/models`, so they appear in the app's model list. The MTPLX 2.13 app offers upstream's Inkling FP16 packs, which this fork's engine runs too.
 - Measured on one M1 Max 64 GB; smaller Macs are untested. Leave room above the peak for the system and other apps.
 - Speeds and conditions: [Key numbers](#key-numbers) below, Flash-Next and Inkling in [USAGE](docs/m1max-longctx/USAGE.md).
 
@@ -131,6 +131,7 @@ From bench 2 of [apple-silicon-llm-bench](https://github.com/shunya1810/apple-si
 - v2.12.3-m1.19 adds Thinking Machines' Inkling-2-Mini (see the feature list below) and does not change the paths of the models in these tables, so they were not re-measured.
 - v2.12.3-m1.20 fixes Inkling-2-Mini's restored conversations (their sliding windows restarted at position 0) and does not change the paths of the models in these tables, so they were not re-measured.
 - v2.12.3-m1.21 adds the one-line installer and the `mtplx-m1` command, and reads Inkling-2-Mini's long prompts 1–2% faster; the models in these tables keep their paths and were not re-measured.
+- v2.13.0-m1.22 brings in upstream 2.13.0 and leaves these models' speed unchanged (Qwen3.8-27B and Qwen3.6-35B-A3B against m1.21, alternated: prefill and decode at 2K–32K within the run-to-run spread), so the tables were not re-measured. On the M1 family Inkling-2-Mini keeps this fork's implementation, which also reads upstream's packs: upstream 2.13.0's own Inkling runtime failed requests on the M1 Max (a Metal threadgroup limit) and decoded slower where it answered.
 - Qwen3.6-35B-A3B now reads 32K–64K prompts more slowly than Ornith-1.5-35B-A3B, which has the same layout (931 against 1,026 tok/s at 32K); on v2.12.2-m1.10 the two were equal (1,028 and 1,034). m1.13 does not change prefill and was not slower than m1.12 on the same day (cold prompts of about 29K and 104K tokens: 910 and 513 tok/s against 697 and 444). The cause is being investigated.
 - The 8K–128K prompts repeat one 11K-token HTML file. Read to about 256K (22 repeats), Qwen3.8-27B predicts its own next tokens poorly from the third repeat on (upstream MTPLX too), and the draft head, which reads the model's hidden states, then rarely matches, so 256K is shown with the non-repeating text above instead.
 - MacBook Pro M1 Max 64 GB, macOS 26. Profile `turbo`, 256K context limit, 8-bit KV cache, temperature 0.6 with fixed seeds.
