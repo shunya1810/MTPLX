@@ -20,6 +20,10 @@
 # MTPLX_M1_REF (or the first line of ~/Library/Application Support/MTPLX/fork-app-ref) picks another
 # ref than origin/m1max-longctx, for example a branch to try.
 
+# The script's own path, read here: inside a function zsh's $0 is the function's name. Piped through
+# `zsh -s` it is the shell's name, and the script has no checkout of its own.
+typeset -g _install_m1_self="$0"
+
 main() {
   setopt local_options err_exit no_unset pipe_fail
   local repo_url="https://github.com/shunya1810/MTPLX.git"
@@ -38,7 +42,7 @@ main() {
       --update-only) update_only=1; shift ;;
       --uninstall-app) uninstall=1; shift ;;
       --quiet) quiet=1; shift ;;
-      -h|--help) sed -n '2,24p' "${0:A}" 2>/dev/null || true; return 0 ;;
+      -h|--help) sed -n '2,24p' "${_install_m1_self:A}" 2>/dev/null || true; return 0 ;;
       *) print -u2 "unknown option: $1"; return 2 ;;
     esac
   done
@@ -47,7 +51,7 @@ main() {
 
   # A checkout of this fork that the script runs from, if any (piped through `zsh -s` it has none).
   local here="" repo
-  [[ "${0:t}" == install-m1.sh ]] && here="${0:A:h:h}"
+  [[ "${_install_m1_self:t}" == install-m1.sh ]] && here="${_install_m1_self:A:h:h}"
   if [[ -n "$here" && -d "$here/mtplx" && -e "$here/.git" ]]; then
     repo="$here"
   else
