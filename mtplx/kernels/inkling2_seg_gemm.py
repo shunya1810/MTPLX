@@ -19,9 +19,27 @@ from pathlib import Path
 import mlx.core as mx
 
 import os
-_BM = int(os.environ.get("MTPLX_INKLING2_SEG_BM", "32"))
+
+# Tile rows: 64 when the experts average at least _BM64_MIN_ROWS routed rows
+# (half the weight dequantization per row), else 32 (less padding in each
+# expert's last tile). Real Inkling prefill, same prompt, A/B interleaved:
+# 4,096-row chunks (256 rows an expert) 7.50 -> 7.43 s at 4K, 31.2 -> 30.7 s at
+# 16K, 66.7 -> 66.0 s at 32K; 2,048-row (128 an expert) 3.85 -> 3.91 s and
+# 1,024-row (64) 2.04 -> 2.19 s, slower. Identical logits either way.
+# Server prefill (one server, interleaved 32 / chosen, 4 runs each): 16K
+# 488.5-496.8 -> 501.1-501.3 tok/s, 30K 467.5-469.2 -> 473.1-473.8 tok/s.
+# MTPLX_INKLING2_SEG_BM fixes the rows.
+_BM_FIXED = (os.environ.get("MTPLX_INKLING2_SEG_BM") or "").strip()
+_BM64_MIN_ROWS = int(os.environ.get("MTPLX_INKLING2_SEG_BM64_MIN_ROWS", "256"))
 _BN = int(os.environ.get("MTPLX_INKLING2_SEG_BN", "64"))
 _BK = 32
+
+
+def tile_rows(pairs: int, experts: int) -> int:
+    """BM for ``pairs`` routed rows over ``experts`` experts."""
+    if _BM_FIXED:
+        return int(_BM_FIXED)
+    return 64 if pairs >= _BM64_MIN_ROWS * max(1, experts) else 32
 
 
 def _include_root() -> Path:
@@ -192,7 +210,7 @@ def seg_gemm_ok(n: int, k: int) -> bool:
 
 
 def max_tiles(pairs: int, experts: int) -> int:
-    return -(-pairs // _BM) + experts
+    return -(-pairs // tile_rows(pairs, experts)) + experts
 
 
 def tile_table(sorted_experts: mx.array, num_experts: int) -> mx.array:
@@ -202,7 +220,7 @@ def tile_table(sorted_experts: mx.array, num_experts: int) -> mx.array:
     tgs = max(32, -(-num_experts // 32) * 32)
     (table,) = _table_kernel()(
         inputs=[sorted_experts],
-        template=[("P", P), ("E", num_experts), ("BM", _BM), ("MAXT", mt), ("TGS", tgs)],
+        template=[("P", P), ("E", num_experts), ("BM", tile_rows(P, num_experts)), ("MAXT", mt), ("TGS", tgs)],
         grid=(tgs, 1, 1),
         threadgroup=(tgs, 1, 1),
         output_shapes=[(mt * 4,)],
@@ -222,7 +240,7 @@ def seg_gemm(x: mx.array, w: mx.array, scales: mx.array, table: mx.array, *, bit
     (y,) = _gemm_kernel()(
         inputs=[x, w, scales, table],
         template=[("T", x.dtype), ("K", K), ("N", N), ("GS", group_size), ("BITS", bits),
-                  ("BM", _BM), ("BN", _BN), ("BK", _BK)],
+                  ("BM", tile_rows(P, int(w.shape[0]))), ("BN", _BN), ("BK", _BK)],
         grid=((N // _BN) * 128, mt, 1),
         threadgroup=(128, 1, 1),
         output_shapes=[(P, N)],

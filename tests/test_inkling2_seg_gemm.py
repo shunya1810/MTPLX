@@ -26,6 +26,26 @@ class TestSegGemm(unittest.TestCase):
             err = mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max().item()
             self.assertLess(err, 1e-3, mode)
 
+    def test_wide_tiles_match_gather_qmm(self):
+        """64-row tiles (experts averaging 256+ routed rows, a 4,096-row
+        chunk at top-8 of 128): the same values as the sorted gather."""
+        from mtplx.kernels import inkling2_seg_gemm as sg
+
+        E, N, K = 4, 128, 64
+        counts = [0, 300, 517, 300]
+        self.assertEqual(sg.tile_rows(sum(counts), E), 64)
+        self.assertEqual(sg.tile_rows(255 * E, E), 32)
+        idx = mx.array(np.repeat(np.arange(E), counts).astype(np.uint32))
+        P = int(idx.shape[0])
+        mx.random.seed(5)
+        w = (mx.random.normal((E, N, K)) * 0.05).astype(mx.float16)
+        wq, sc = mx.quantize(w, group_size=16, bits=4, mode="nvfp4")[:2]
+        x = mx.random.normal((P, K)).astype(mx.float16)
+        ref = mx.gather_qmm(x[:, None, :], wq, sc, None, rhs_indices=idx, transpose=True,
+                            group_size=16, bits=4, mode="nvfp4", sorted_indices=True)[:, 0]
+        got = seg_gemm(x, wq, sc, tile_table(idx, E), bits=4, group_size=16)
+        self.assertEqual(mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max().item(), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
