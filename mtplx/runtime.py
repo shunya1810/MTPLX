@@ -571,6 +571,25 @@ def _install_architectures_declared_module_alias(config: dict[str, Any]) -> bool
             target,
         )
         return True
+    # Neither its model_type nor its architectures name a class of ours. Its
+    # contents can: a hybrid trunk whose every key the module reads.
+    from .backends import signature as _signature
+
+    signed = _signature.renamed_plain_trunk(config)
+    if signed is not None:
+        try:
+            module = importlib.import_module(f"mlx_lm.models.{signed}")
+        except ImportError:
+            return False
+        sys.modules[alias_name] = module
+        logger.warning(
+            "[model-signature] model_type %r is not one this build knows; its "
+            "config has the blocks of mlx_lm.models.%s and every key in it is "
+            "read, so it loads through that module",
+            model_type,
+            signed,
+        )
+        return True
     return False
 
 
@@ -678,6 +697,14 @@ def load(
         path = Path(gemma4_pair["target_model"])
     config = load_config(path)
     _export_derived_model_geometry(config)
+    from .inkling_lane import fork_lane as _inkling_fork_lane
+
+    if config.get("model_type") == "inkling2_loop" and not _inkling_fork_lane():
+        from .models.inkling.runtime import InklingRuntime
+
+        if any((mtp_adapter, merge_mtp_adapter, proj_quant, proj_requant)):
+            raise ValueError("Inkling uses its published target and DSpark precision")
+        return InklingRuntime(path, mtp=mtp, contract=contract)
     from .a3b_whole_moe import validate_a3b_whole_moe_load_options
 
     validate_a3b_whole_moe_load_options(

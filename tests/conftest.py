@@ -11,6 +11,7 @@ override these variables with their own fixtures.
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
@@ -29,6 +30,44 @@ def pytest_configure(config):
             "with MTPLX_UPDATE_GOLDENS_ACK=yes."
         )
     _drop_operator_switches()
+    _load_test_engine()
+
+
+def _load_test_engine():
+    # The native engine module for the tests that count launches and replay programs comes in
+    # under INKLING_TEST_ENGINE (MTPLX_NATIVE_ENGINE_MODULE is dropped with the switches above).
+    # It loads here, before any test module is imported, because the engine learns a kernel's name
+    # only when MLX compiles it after the module is loaded: a kernel built earlier (another file's
+    # first call in the same session) is traced without its name, counted as MLX's own launch, and
+    # refused by every program. A path that does not load stops the run instead of letting the
+    # launch tests skip.
+    path = os.environ.get("INKLING_TEST_ENGINE", "").strip()
+    if not path:
+        return
+    os.environ["MTPLX_NATIVE_ENGINE_MODULE"] = path
+    from mtplx.engine import runtime as engine_runtime
+
+    if not engine_runtime.available():
+        raise pytest.UsageError(
+            f"INKLING_TEST_ENGINE={path} did not load: {engine_runtime.unavailable()}"
+        )
+
+
+# A test that skips because the engine is absent, in a run that named the engine: the gate it guards
+# (launch counts, replays) did not run, so the run must not read green.
+_ENGINE_SKIP = ("native engine", "engine module", "INKLING_TEST_ENGINE", "module_missing")
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    if not (report.skipped and os.environ.get("INKLING_TEST_ENGINE", "").strip()):
+        return
+    reason = str(report.longrepr[2] if isinstance(report.longrepr, tuple) else report.longrepr)
+    if any(mark in reason for mark in _ENGINE_SKIP):
+        report.outcome = "failed"
+        report.longrepr = f"skipped for want of the engine although INKLING_TEST_ENGINE was given: {reason}"
 
 
 # Variables that steer the suite itself (opt-in QA arms, artifacts to check,
@@ -124,6 +163,9 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
     # same treatment: ~/.pi/agent is never written by the suite. So do the
     # OpenCode Desktop stores the OpenCode writer and launcher edit on macOS.
     monkeypatch.setenv("MTPLX_PI_MODELS_JSON", str(isolated / "pi" / "models.json"))
+    # Claude Code's MTPLX settings file and the Terminal scripts that open
+    # Claude Code and Codex: never ~/.mtplx/clients or ~/.mtplx/handoffs.
+    monkeypatch.setenv("MTPLX_AGENT_CLIENTS_DIR", str(isolated / "agent-clients"))
     monkeypatch.setenv(
         "MTPLX_OPENCODE_DESKTOP_SETTINGS_STORE", str(isolated / "opencode-desktop.dat")
     )
@@ -157,6 +199,14 @@ def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
     monkeypatch.setenv(
         "MTPLX_START_FAILURE_REPORT", str(isolated / "last-failed-start.log")
     )
+    # /health reports a one-shot receipt of the first verify attention that
+    # split its query heads, kept in the module for the life of the process.
+    # A test that reads the receipts of an empty server must not see the one
+    # an earlier test's forward left behind (the engine and prefill tests run
+    # such forwards before the health tests in a full run).
+    qwen4_exp = sys.modules.get("mtplx.models.qwen4_exp")
+    if qwen4_exp is not None:
+        qwen4_exp.reset_verify_sdpa_head_chunk_engagement()
 
 
 @pytest.fixture

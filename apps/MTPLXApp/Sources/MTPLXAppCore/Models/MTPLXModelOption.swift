@@ -27,6 +27,8 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
     /// whatever language is active when a picker renders.
     public var detail: String
     private var detailLocalizationKey: String?
+    /// Set from the current folder scan. This state is never persisted in a model preference.
+    public private(set) var isOnDisconnectedDrive = false
     public var hfModelID: String
     public var localCandidates: [String]
     public var aliases: [String]
@@ -109,6 +111,14 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             arOnly: arOnly
         )
         detailLocalizationKey = localizedDetailKey
+    }
+
+    /// A row whose pack is on a drive that is not plugged in says so in its
+    /// detail line (already localized) instead of its catalog text.
+    mutating func markNotConnected(_ text: String) {
+        detail = text
+        detailLocalizationKey = nil
+        isOnDisconnectedDrive = true
     }
 
     /// Resolves only app-authored catalog text. Arbitrary details supplied by
@@ -229,11 +239,65 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             let canonical = ModelLibrary.canonicalURL(for: expanded).path
             guard seen.insert(canonical).inserted else { continue }
             guard FileManager.default.fileExists(atPath: expanded) else { continue }
-            if Self.hasCompleteInstall(at: expanded) {
+            if Self.hasCompleteInstall(at: expanded), packIdentityProblem(at: expanded) == nil {
                 return canonical
             }
         }
         return nil
+    }
+
+    /// What a pack says about itself in its own `mtplx-pack.json`.
+    public struct PackIdentity: Equatable, Sendable {
+        public var source: String
+        public var recipe: String
+        public var precisionVariant: String?
+    }
+
+    /// A folder that carries an Inkling pack's name is taken for that pack only when its
+    /// mtplx-pack.json says it is that build: the source, the recipe, and the FP16 siblings'
+    /// precision variant. The Mac the packs were built on kept two research builds under the
+    /// published repository names (20 November), and a name alone served them as the catalog
+    /// pack. The upstream revision is not pinned: a pack rebuilt from new weights moves it, and an
+    /// older app would then refuse the new download. Mirrors `PACK_IDENTITIES` in
+    /// mtplx/model_catalog.py.
+    static let packIdentities: [String: PackIdentity] = {
+        let source = "thinkingmachines/Inkling-2-Mini"
+        return [
+            "inkling2-mini-bare-speed": PackIdentity(source: source, recipe: "bare-speed"),
+            "inkling2-mini-optimized-speed": PackIdentity(source: source, recipe: "speed"),
+            "inkling2-mini-optimized-quality": PackIdentity(source: source, recipe: "quality"),
+            "inkling2-mini-bare-speed-fp16": PackIdentity(source: source, recipe: "bare-speed", precisionVariant: "fp16"),
+            "inkling2-mini-optimized-speed-fp16": PackIdentity(source: source, recipe: "speed", precisionVariant: "fp16"),
+            "inkling2-mini-optimized-quality-fp16": PackIdentity(source: source, recipe: "quality", precisionVariant: "fp16"),
+        ]
+    }()
+
+    /// Why the folder at `path` is not this pack although it carries its name; nil when it is,
+    /// or when the catalog pins no identity for this pack. Mirrors `pack_identity_problem`.
+    public func packIdentityProblem(at path: String) -> String? {
+        guard let expected = Self.packIdentities[id] else { return nil }
+        let stampURL = URL(fileURLWithPath: Self.expand(path), isDirectory: true)
+            .appendingPathComponent("mtplx-pack.json")
+        guard let data = try? Data(contentsOf: stampURL) else {
+            return "it has no readable mtplx-pack.json, so it cannot be shown to be \(displayName)"
+        }
+        guard let stamp = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return "its mtplx-pack.json is not a pack description, so it cannot be shown to be \(displayName)"
+        }
+        func text(_ key: String) -> String? {
+            guard let value = stamp[key] as? String, !value.isEmpty else { return nil }
+            return value
+        }
+        let found = PackIdentity(
+            source: text("source") ?? "",
+            recipe: text("recipe") ?? "",
+            precisionVariant: text("precision_variant")
+        )
+        if found == expected { return nil }
+        let built = text("display_name")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let precision = found.precisionVariant.map { ", \($0)" } ?? ""
+        let recipe = found.recipe.isEmpty ? "missing" : found.recipe
+        return "its mtplx-pack.json says it is \(built.isEmpty ? "another build" : built) (recipe \(recipe)\(precision)), not \(displayName)"
     }
 
     public var isInstalled: Bool {
@@ -422,6 +486,17 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
     }
 
     public func matches(_ model: String) -> Bool {
+        guard nameMatches(model) else { return false }
+        // A folder under this pack's name is this pack only if it says so (packIdentities).
+        guard Self.packIdentities[id] != nil else { return true }
+        var isDirectory: ObjCBool = false
+        let path = Self.expand(model)
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              isDirectory.boolValue else { return true }
+        return packIdentityProblem(at: path) == nil
+    }
+
+    private func nameMatches(_ model: String) -> Bool {
         let normalized = Self.normalized(model)
         let basename = Self.normalized(URL(fileURLWithPath: model).lastPathComponent)
         if normalized == Self.normalized(id) { return true }
@@ -1020,6 +1095,110 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             recommendedFor: [.modernApple],
             arOnly: true
         ),
+        MTPLXModelOption(
+            id: "inkling2-mini-bare-speed",
+            displayName: "Inkling 2 Mini Bare Speed",
+            shortName: "Inkling 2 Mini Bare Speed",
+            localizedDetailKey: "Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding.",
+            hfModelID: "Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed",
+            localCandidates: [
+                "~/.mtplx/models/MTPLX-Inkling-2-Mini-Bare-Speed",
+                "~/.mtplx/models/Youssofal--MTPLX-Inkling-2-Mini-Bare-Speed",
+                "~/.mtplx/models/Youssofal--Inkling-2-Mini-MTPLX-Bare-Speed",
+                "~/.mtplx/models/Inkling-2-Mini-MTPLX-Bare-Speed",
+            ],
+            aliases: ["mtplx-inkling-2-mini-bare-speed", "Inkling 2 Mini Bare Speed", "MTPLX-Inkling-2-Mini-Bare-Speed", "Inkling-2-Mini-MTPLX-Bare-Speed"],
+            sizeBytes: 16_023_243_308,
+            peakMemoryGiB: 18.21,
+            recommendedFor: [.modernApple]
+        ),
+        MTPLXModelOption(
+            id: "inkling2-mini-optimized-speed",
+            displayName: "Inkling 2 Mini Optimized Speed",
+            shortName: "Inkling 2 Mini Optimized Speed",
+            localizedDetailKey: "Closer to the original weights: 8-bit attention, with vision and speculative decoding.",
+            hfModelID: "Youssofal/Inkling-2-Mini-MTPLX-Optimized-Speed",
+            localCandidates: [
+                "~/.mtplx/models/MTPLX-Inkling-2-Mini-Optimized-Speed",
+                "~/.mtplx/models/Youssofal--MTPLX-Inkling-2-Mini-Optimized-Speed",
+                "~/.mtplx/models/Youssofal--Inkling-2-Mini-MTPLX-Optimized-Speed",
+                "~/.mtplx/models/Inkling-2-Mini-MTPLX-Optimized-Speed",
+            ],
+            aliases: ["mtplx-inkling-2-mini-optimized-speed", "Inkling 2 Mini Optimized Speed", "MTPLX-Inkling-2-Mini-Optimized-Speed", "Inkling-2-Mini-MTPLX-Optimized-Speed"],
+            sizeBytes: 17_242_658_297,
+            peakMemoryGiB: 19.92,
+            recommendedFor: [.modernApple]
+        ),
+        MTPLXModelOption(
+            id: "inkling2-mini-optimized-quality",
+            displayName: "Inkling 2 Mini Optimized Quality",
+            shortName: "Inkling 2 Mini Optimized Quality",
+            localizedDetailKey: "Original expert and attention weights, with vision and speculative decoding.",
+            hfModelID: "Youssofal/Inkling-2-Mini-MTPLX-Optimized-Quality",
+            localCandidates: [
+                "~/.mtplx/models/MTPLX-Inkling-2-Mini-Optimized-Quality",
+                "~/.mtplx/models/Youssofal--MTPLX-Inkling-2-Mini-Optimized-Quality",
+                "~/.mtplx/models/Youssofal--Inkling-2-Mini-MTPLX-Optimized-Quality",
+                "~/.mtplx/models/Inkling-2-Mini-MTPLX-Optimized-Quality",
+            ],
+            aliases: ["mtplx-inkling-2-mini-optimized-quality", "Inkling 2 Mini", "MTPLX-Inkling-2-Mini-Optimized-Quality", "Inkling-2-Mini-MTPLX-Optimized-Quality"],
+            sizeBytes: 20_191_646_421,
+            peakMemoryGiB: 23.52,
+            recommendedFor: [.modernApple]
+        ),
+        // FP16 siblings for M1 and M2 Macs (no native bfloat16): the same packs with every BF16
+        // tensor cast to FP16. Recommended on the legacy tier (inklingLegacyOffer, on).
+        MTPLXModelOption(
+            id: "inkling2-mini-bare-speed-fp16",
+            displayName: "Inkling 2 Mini Bare Speed FP16",
+            shortName: "Inkling 2 Mini Bare Speed FP16",
+            localizedDetailKey: "Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding. FP16 build for M1 and M2 Macs.",
+            hfModelID: "Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed-FP16",
+            localCandidates: [
+                "~/.mtplx/models/MTPLX-Inkling-2-Mini-Bare-Speed-FP16",
+                "~/.mtplx/models/Youssofal--MTPLX-Inkling-2-Mini-Bare-Speed-FP16",
+                "~/.mtplx/models/Youssofal--Inkling-2-Mini-MTPLX-Bare-Speed-FP16",
+                "~/.mtplx/models/Inkling-2-Mini-MTPLX-Bare-Speed-FP16",
+            ],
+            aliases: ["mtplx-inkling-2-mini-bare-speed-fp16", "Inkling 2 Mini Bare Speed FP16", "MTPLX-Inkling-2-Mini-Bare-Speed-FP16", "Inkling-2-Mini-MTPLX-Bare-Speed-FP16"],
+            sizeBytes: 16_023_246_321,
+            peakMemoryGiB: 18.21,
+            recommendedFor: [.legacyApple]
+        ),
+        MTPLXModelOption(
+            id: "inkling2-mini-optimized-speed-fp16",
+            displayName: "Inkling 2 Mini Optimized Speed FP16",
+            shortName: "Inkling 2 Mini Optimized Speed FP16",
+            localizedDetailKey: "Closer to the original weights: 8-bit attention, with vision and speculative decoding. FP16 build for M1 and M2 Macs.",
+            hfModelID: "Youssofal/Inkling-2-Mini-MTPLX-Optimized-Speed-FP16",
+            localCandidates: [
+                "~/.mtplx/models/MTPLX-Inkling-2-Mini-Optimized-Speed-FP16",
+                "~/.mtplx/models/Youssofal--MTPLX-Inkling-2-Mini-Optimized-Speed-FP16",
+                "~/.mtplx/models/Youssofal--Inkling-2-Mini-MTPLX-Optimized-Speed-FP16",
+                "~/.mtplx/models/Inkling-2-Mini-MTPLX-Optimized-Speed-FP16",
+            ],
+            aliases: ["mtplx-inkling-2-mini-optimized-speed-fp16", "Inkling 2 Mini Optimized Speed FP16", "MTPLX-Inkling-2-Mini-Optimized-Speed-FP16", "Inkling-2-Mini-MTPLX-Optimized-Speed-FP16"],
+            sizeBytes: 17_242_661_312,
+            peakMemoryGiB: 19.92,
+            recommendedFor: [.legacyApple]
+        ),
+        MTPLXModelOption(
+            id: "inkling2-mini-optimized-quality-fp16",
+            displayName: "Inkling 2 Mini Optimized Quality FP16",
+            shortName: "Inkling 2 Mini Optimized Quality FP16",
+            localizedDetailKey: "Original expert and attention weights, with vision and speculative decoding. FP16 build for M1 and M2 Macs.",
+            hfModelID: "Youssofal/Inkling-2-Mini-MTPLX-Optimized-Quality-FP16",
+            localCandidates: [
+                "~/.mtplx/models/MTPLX-Inkling-2-Mini-Optimized-Quality-FP16",
+                "~/.mtplx/models/Youssofal--MTPLX-Inkling-2-Mini-Optimized-Quality-FP16",
+                "~/.mtplx/models/Youssofal--Inkling-2-Mini-MTPLX-Optimized-Quality-FP16",
+                "~/.mtplx/models/Inkling-2-Mini-MTPLX-Optimized-Quality-FP16",
+            ],
+            aliases: ["mtplx-inkling-2-mini-optimized-quality-fp16", "Inkling 2 Mini Optimized Quality FP16", "MTPLX-Inkling-2-Mini-Optimized-Quality-FP16", "Inkling-2-Mini-MTPLX-Optimized-Quality-FP16"],
+            sizeBytes: 20_191_648_443,
+            peakMemoryGiB: 23.52,
+            recommendedFor: [.legacyApple]
+        ),
     ]
 
     public static func option(matching model: String) -> MTPLXModelOption? {
@@ -1065,7 +1244,11 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
             }
         }
         var discoveredRows: [String: Int] = [:]
-        for local in modelLibrary.discoverCompleteModels() {
+        let discovered = modelLibrary.discoverCompleteModels()
+        // Remember what each readable folder holds, so its packs stay listed
+        // (as not connected) while its drive is unplugged.
+        ModelFolderIndex.record(library: modelLibrary, discovered: discovered)
+        for local in discovered {
             if let index = listedInstalls[local.path] ?? rows.indices.first(where: {
                 !rows[$0].id.hasPrefix("local:") && rows[$0].matches(local.reference)
             }) {
@@ -1106,6 +1289,37 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 aliases: [local.reference, local.path]
             ))
         }
+        // Packs last seen on a drive that is unplugged: listed and marked, so
+        // they neither vanish nor look like something to download again.
+        for remembered in ModelFolderIndex.rememberedPacks(library: modelLibrary) {
+            let text = ModelFolderIndex.notConnectedDetail(driveName: remembered.driveName)
+            if let index = rows.indices.first(where: {
+                rows[$0].localCandidates.contains(remembered.model.path)
+                    || rows[$0].matches(remembered.model.reference)
+            }) {
+                if rows[index].installedLocalPath(in: modelLibrary) == nil {
+                    // A selected folder is synthesized again on each scan. Its pack metadata is now off the Mac.
+                    if rows[index].isLocalFolder, rows[index].hfModelID == remembered.model.path,
+                       !customModels.contains(where: { $0.id == rows[index].id }) {
+                        rows[index].displayName = remembered.model.displayName
+                        rows[index].shortName = remembered.model.displayName
+                    }
+                    rows[index].markNotConnected(text)
+                }
+                continue
+            }
+            var row = MTPLXModelOption(
+                id: "local:\(remembered.model.path)",
+                displayName: remembered.model.displayName,
+                shortName: remembered.model.displayName,
+                detail: text,
+                hfModelID: remembered.model.reference,
+                localCandidates: [remembered.model.path],
+                aliases: [remembered.model.reference, remembered.model.path]
+            )
+            row.markNotConnected(text)
+            rows.append(row)
+        }
         return rows
     }
 
@@ -1145,6 +1359,17 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
     /// fp16 4B siblings exist yet, so the legacy (M1/M2) matrix keeps
     /// its fp16-only entries.
     public static let bonsaiRecommendationMinGiB: Double = 16.0
+    /// Inkling 2 Mini Bare Speed on 24 to 31 GiB Macs, directly after the tier's first pick. On
+    /// (21 November). In a simulated 24 GiB envelope the memory plan serves a 24,576-token window,
+    /// one in which every conversation can take its next turn (22 November): a 20K prompt, turns of
+    /// 532 and 3,729 new tokens, an image, inside the 18 GiB engine budget (peak 17.92 GiB), no swap.
+    /// True is the whole switch. Mirrors model_catalog.INKLING_TIGHT_MAC_OFFER.
+    public static let inklingTightMacOffer = true
+    /// The Inkling 2 Mini FP16 siblings on M1 and M2 Macs (32 GiB and up), where the modern tier
+    /// gives the trio. On by the founder's order of 21 November; their FP16 numbers are checked on
+    /// an M5 and the M1-M4 rehearsal switch, not yet on an M1 or M2 itself. True is the whole
+    /// switch. Mirrors model_catalog.INKLING_LEGACY_OFFER.
+    public static let inklingLegacyOffer = true
 
     public static func recommendedCatalogIDs(
         for hardware: DetectedHardware?,
@@ -1155,7 +1380,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         case .intel:
             return []
         case .legacyApple:
-            return recommendationIDs(
+            var ids = recommendationIDs(
                 memoryGiB: hardware.unifiedMemoryGiB,
                 small: ["qwen35-9b-optimized-speed-fp16"],
                 speed27: "optimized-speed-fp16",
@@ -1165,6 +1390,12 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 quality27: "optimized-quality-fp16",
                 trio38: qwen38TrioIDs.map { "\($0)-fp16" }
             )
+            if inklingLegacyOffer && hardware.unifiedMemoryGiB >= 48 {
+                ids.append(contentsOf: inklingIDs.map { "\($0)-fp16" })
+            } else if inklingLegacyOffer && hardware.unifiedMemoryGiB >= 32 {
+                ids.insert(contentsOf: inklingIDs.map { "\($0)-fp16" }, at: min(1, ids.count))
+            }
+            return ids
         case .modernApple, .unknown:
             let tinyIDs = ["qwen35-4b-optimized-speed", "qwen35-4b-optimized-quality"]
             if hardware.unifiedMemoryGiB < 16 {
@@ -1187,6 +1418,16 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
                 ids.insert(bonsai, at: position)
             } else {
                 ids.append(bonsai)
+            }
+            if hardware.unifiedMemoryGiB >= 48 {
+                ids.append(contentsOf: inklingIDs)
+            } else if hardware.unifiedMemoryGiB < 32 {
+                if inklingTightMacOffer && hardware.unifiedMemoryGiB >= 24 {
+                    ids.insert("inkling2-mini-bare-speed", at: min(1, ids.count))
+                }
+            } else {
+                // From 32 to 47 GiB the Inkling trio rides directly after the tier's first pick.
+                ids.insert(contentsOf: inklingIDs, at: min(1, ids.count))
             }
             // The raw list and the peak-filtered list both mirror Python.
             if hardware.unifiedMemoryGiB >= 96,
@@ -1253,6 +1494,19 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         "qwen38-27b-optimized-speed",
         "qwen38-27b-bare-speed",
         "qwen38-27b-optimized-quality",
+    ]
+
+    /// Inkling 2 Mini trio on modern chips (2.13): Bare Speed is the
+    /// recommended pack. From 32 to 47 GiB the trio rides directly after the
+    /// tier's first pick (founder, 2026-11-21: recommend Bare Speed to 36 GB
+    /// Macs), Bare Speed, then Optimized Speed, then Optimized Quality; the
+    /// peak-memory filter drops a pack where it does not fit. From 48 GiB it
+    /// keeps the family's slot near the end; below 32 GiB only Bare Speed,
+    /// behind inklingTightMacOffer. Mirrors model_catalog._INKLING_IDS.
+    private static let inklingIDs = [
+        "inkling2-mini-bare-speed",
+        "inkling2-mini-optimized-speed",
+        "inkling2-mini-optimized-quality",
     ]
 
     /// Flash-Next options on modern chips; Optimized Speed and Quality lead
@@ -1397,10 +1651,11 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         if folder != typed {
             aliases.append(folder)
         }
+        let displayName = ModelLibrary.packDisplayName(in: URL(fileURLWithPath: folder)) ?? name
         return MTPLXModelOption(
             id: "local-\(safeID)",
-            displayName: name,
-            shortName: name,
+            displayName: displayName,
+            shortName: displayName,
             localizedDetailKey: "Local model folder on this Mac.",
             hfModelID: folder,
             localCandidates: [folder],
@@ -1560,6 +1815,9 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         if normalized.contains("laguna") {
             return "laguna"
         }
+        if normalized.contains("inkling-2-mini") || normalized.contains("inkling2-mini") || normalized.contains("inkling2_loop") {
+            return "inkling2"
+        }
         if normalized.contains("glm") {
             return "glm"
         }
@@ -1667,6 +1925,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
         guard let archID else { return nil }
         let normalized = archID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !normalized.isEmpty else { return nil }
+        if normalized == "inkling2-loop" { return "inkling2" }
         if normalized.contains("gemma") { return "gemma4" }
         if normalized.contains("step") { return "step" }
         if normalized.contains("deepseek") { return "deepseek" }
@@ -1724,6 +1983,7 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
 
     private static func modelFamilyFromHint(_ raw: String) -> String {
         let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized.contains("inkling2loop") || normalized.contains("inkling2_loop") { return "inkling2" }
         if normalized.contains("gemma") { return "gemma4" }
         if normalized.contains("step") { return "step" }
         if normalized.contains("deepseek") { return "deepseek" }
@@ -1789,6 +2049,8 @@ public struct MTPLXModelOption: Codable, Equatable, Identifiable, Sendable {
 
     public static func maxContextWindow(forFamily family: String) -> Int {
         switch family {
+        case "inkling2":
+            return 1_048_576
         case "qwen3_5", "qwen3_6", "qwen3_8", "gemma4", "step", "glm", "deepseek":
             return 262_144
         default:

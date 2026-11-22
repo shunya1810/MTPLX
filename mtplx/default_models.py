@@ -16,6 +16,7 @@ from mtplx.model_catalog import (
     MODERN_TIER,
     CatalogModel,
     catalog_model_with_id,
+    pack_identity_problem,
     recommended_models,
 )
 from mtplx.profiles import (
@@ -337,7 +338,11 @@ def _complete_local_model_ref(candidates: tuple[str, ...]) -> str | None:
 
 
 def catalog_model_ref(pack: CatalogModel) -> str:
-    """Prefer a complete copy in configured libraries, including released aliases."""
+    """Prefer a complete copy in configured libraries, including released aliases.
+
+    A folder under one of the pack's names that says it is another build
+    (``pack_identity_problem``) is passed over, never served as the pack.
+    """
     from mtplx.hf_loader import cached_model_is_complete, model_library_roots
 
     basename = Path(pack.hf_model_id).name
@@ -346,7 +351,7 @@ def catalog_model_ref(pack: CatalogModel) -> str:
     for root in model_library_roots():
         for name in names:
             candidate = root / name
-            if cached_model_is_complete(candidate):
+            if cached_model_is_complete(candidate) and pack_identity_problem(candidate, pack) is None:
                 return str(candidate)
     return pack.hf_model_id
 
@@ -606,6 +611,17 @@ def _ref_name_components(text: str) -> set[str]:
     return components
 
 
+#: Inkling 2 Mini's catalog ids; each pack's first alias is its served id (mtplx-inkling-2-mini-<tier>).
+_INKLING_CATALOG_IDS = (
+    "inkling2-mini-bare-speed",
+    "inkling2-mini-optimized-speed",
+    "inkling2-mini-optimized-quality",
+    "inkling2-mini-bare-speed-fp16",
+    "inkling2-mini-optimized-speed-fp16",
+    "inkling2-mini-optimized-quality-fp16",
+)
+
+
 def _public_model_id_from_name(value: str) -> str | None:
     """Map exact first-party names (public ids, HF repo ids, released
     folder names) to their canonical public ids.
@@ -635,6 +651,19 @@ def _public_model_id_from_name(value: str) -> str | None:
     ):
         names = {public_id, repo_id.lower(), Path(repo_id).name.lower(), *(a.lower() for a in aliases)}
         if components & names:
+            return public_id
+    for model_id in _INKLING_CATALOG_IDS:
+        # Inkling 2 Mini's six packs: the repository (Youssofal/Inkling-2-Mini-MTPLX-<Tier>), the folder a
+        # download makes (Youssofal--<repo>), the catalog id and the folder name the packs were built under
+        # (MTPLX-Inkling-2-Mini-<Tier>) all serve one id, so a client set up for one finds the others.
+        pack = catalog_model_with_id(model_id)
+        public_id = pack.aliases[0]
+        names = {public_id, pack.id, pack.hf_model_id.lower(), Path(pack.hf_model_id).name.lower(),
+                 *(a.lower() for a in pack.aliases if " " not in a)}
+        if components & names:
+            folder = Path(text).expanduser()
+            if folder.is_dir() and pack_identity_problem(folder, pack):
+                continue  # another build under the pack's name keeps a name of its own
             return public_id
     if FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID in components:
         return FLASH_NEXT_BARE_SPEED_PUBLIC_MODEL_ID
@@ -784,6 +813,29 @@ def public_model_id_for_ref(
         return inferred
     basename = Path(text).name or text.split("/")[-1]
     return _sanitize_public_model_id(basename)
+
+
+def forge_local_public_model_id(branded_name: str, model_path: str | Path) -> str | None:
+    """Served id Forge stamps on a pack it built, or None to leave it unset.
+
+    First-party names already resolve to their canonical id by name at serve
+    time, so they get no stamp. Any other pack gets the sanitized branded
+    name: the id ``public_model_id_for_ref`` would infer from a directory of
+    that name, but pinned in ``mtplx_runtime.json`` so it survives a rename,
+    a ``-1`` suffix from ``_unique_model_dir`` or a copy of the pack.
+    """
+
+    if not re.search(r"[A-Za-z0-9]", str(branded_name or "")):
+        return None
+    path = Path(model_path)
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    for name in (str(branded_name), str(path), str(resolved)):
+        if _public_model_id_from_name(name):
+            return None
+    return _sanitize_public_model_id(branded_name)
 
 
 def _normalize_variant(value: str | None) -> tuple[str, str | None]:

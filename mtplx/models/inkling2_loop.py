@@ -1937,7 +1937,19 @@ class Model(nn.Module):
             if k.startswith("model.visual."):
                 continue
             if k.startswith("model.llm."):
+                # Upstream MTPLX packs (Youssofal/Inkling-2-Mini-MTPLX-*) keep
+                # the official names and store 8-bit affine projections as
+                # <name>.weight (uint32) + <name>.weight.mtplx_scales / _biases.
+                packed = None
+                for tail in (".weight.mtplx_scales", ".weight.mtplx_biases"):
+                    if k.endswith(tail):
+                        packed = "scales" if tail.endswith("scales") else "biases"
+                        k = k[: -len(tail)] + ".weight"
+                        break
                 k = _rename(k)
+                if packed is not None:
+                    sanitized[k[: -len(".weight")] + "." + packed] = v
+                    continue
                 if k.endswith("conv1d.weight"):
                     v = v.swapaxes(1, 2)
             if k.endswith(("cross_pass_queries", "cross_pass_kv_queries")):
@@ -2030,7 +2042,18 @@ class Model(nn.Module):
                 continue
             if bits and f"{path}.weight" in sanitized and f"{path}.scales" not in sanitized:
                 targets[path] = bits
-        if not targets:
+        # Projections a pack already stores quantized (weight + scales +
+        # biases, MLX affine): loaded as they are.
+        prequant: dict[str, tuple[int, int]] = {}
+        for path, module in self.named_modules():
+            if not isinstance(module, (nn.Linear, nn.Embedding)) or path in targets:
+                continue
+            w, sc = sanitized.get(f"{path}.weight"), sanitized.get(f"{path}.scales")
+            if w is None or sc is None or w.dtype != mx.uint32 or f"{path}.biases" not in sanitized:
+                continue
+            in_dims = module.weight.shape[-1]
+            prequant[path] = (in_dims // sc.shape[-1], w.shape[-1] * 32 // in_dims)
+        if not targets and not prequant:
             return
         for path, bits in targets.items():
             w = sanitized.pop(f"{path}.weight")
@@ -2040,6 +2063,9 @@ class Model(nn.Module):
             sanitized[f"{path}.biases"] = biases
 
         def predicate(path: str, module: nn.Module):
+            if path in prequant:
+                group_size, bits = prequant[path]
+                return {"group_size": group_size, "bits": bits, "mode": "affine"}
             bits = targets.get(path)
             if bits is None:
                 return False

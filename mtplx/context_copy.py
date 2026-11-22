@@ -56,6 +56,13 @@ def context_copy_enabled() -> bool:
     return not m1_long_context_defaults()
 
 
+def context_copy_explicitly_disabled() -> bool:
+    """``MTPLX_CONTEXT_COPY`` 0 / false / off: upstream's own switch, without
+    the M1 default above (that one was measured on the MTP verify lanes).
+    Upstream's Inkling runtime reads this for its prompt-copy draft."""
+    return (os.environ.get("MTPLX_CONTEXT_COPY") or "").strip() in {"0", "false", "off"}
+
+
 def context_copy_batched_enabled() -> bool:
     """Context-copy block rounds on the BATCHED verify lane (default ON;
     MTPLX_CONTEXT_COPY_BATCHED=0 disables).

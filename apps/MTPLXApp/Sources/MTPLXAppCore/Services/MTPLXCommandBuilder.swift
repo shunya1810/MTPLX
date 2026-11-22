@@ -875,13 +875,21 @@ struct ResolvedDaemonArgs {
         target: LaunchTarget?,
         processEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) {
-        let preset = TargetPreset.preset(
+        var preset = TargetPreset.preset(
             for: target,
             processEnvironment: processEnvironment
         ).applyingModelDefaults(
             for: configuration.model,
             processEnvironment: processEnvironment
         )
+        // Inkling 2 Mini keeps its SSD session cache on every serving target
+        // but the benchmark, as `mtplx start` does: its first turn after a
+        // restart resumes from the bank instead of reading the conversation
+        // again (Hermes on a restart: 14 of 5,229 tokens in 0.44 s against
+        // 1,206 in 3.07 s). Engine twin: launch_lane.FAMILY_SSD_SESSION_CACHE.
+        if ModelLaunchFamily.detect(configuration.model) == .inkling2, target != .benchmark {
+            preset.ssdSessionCache = "on"
+        }
 
         // Issue #325: Settings' Performance mode promises "use it
         // everywhere", so every serving target honors an EXPLICIT
@@ -1103,7 +1111,7 @@ struct ResolvedDaemonArgs {
         switch target {
         case nil, .chat, .benchmark, .openWebUI:
             return true
-        case .pi, .openCode, .hermes, .other:
+        case .pi, .openCode, .hermes, .claudeCode, .codex, .deepseekHarness, .other:
             return false
         }
     }
@@ -1258,6 +1266,7 @@ private enum ModelLaunchFamily {
     case gemma4
     case step
     case hy3
+    case inkling2
     case qwenDefault
 
     static func detect(_ model: String) -> ModelLaunchFamily {
@@ -1265,6 +1274,14 @@ private enum ModelLaunchFamily {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
             .replacingOccurrences(of: "_", with: "-")
+        // Inkling 2 Mini first: no Qwen launch contract applies to it (engine twin:
+        // descriptors.INKLING_DESCRIPTOR, family "inkling2").
+        if normalized.contains("inkling-2-mini")
+            || normalized.contains("inkling2-mini")
+            || MTPLXModelOption.modelFamily(for: model) == "inkling2"
+        {
+            return .inkling2
+        }
         if normalized.contains("qwen3.6-35b-a3b-mtplx-official4-cyankiwi")
             || normalized.contains("qwen3.6-35b-a3b-mtplx-optimized-speed")
             || normalized.contains("qwen3.6-35b-a3b-mtplx-flat4-cyankiwimtp")
@@ -1494,7 +1511,32 @@ private struct TargetPreset {
             return applyingStepDefaults(processEnvironment: processEnvironment)
         case .hy3:
             return applyingHy3Defaults()
+        case .inkling2:
+            return applyingInklingDefaults()
         }
+    }
+
+    /// Inkling 2 Mini's sampler, tool-call format and chat template belong to the engine's
+    /// family law (INKLING_DESCRIPTOR: temperature 1.0 over the whole distribution, its native
+    /// tool calls, the tokenizer's own template), the values bare `mtplx serve` and
+    /// `mtplx start <client>` resolve. The coding-agent presets' Qwen values do not apply:
+    /// an explicit `--tool-prompt-mode hybrid` or `--chat-template-profile local_qwen36` makes
+    /// `mtplx serve` refuse to start Inkling, and an explicit 0.6/0.95/20 replaces the model's
+    /// own sampler. So an Inkling launch passes none of them and leaves them to the engine.
+    /// The coding-agent environment stays as it is, the same block `mtplx start` exports: the
+    /// engine forwards the descriptor's tool format and template to the daemon as flags, so
+    /// the environment's Qwen defaults never reach an Inkling daemon.
+    private func applyingInklingDefaults() -> TargetPreset {
+        var preset = self
+        preset.temperature = nil
+        preset.topP = nil
+        preset.topK = nil
+        preset.draftTemperature = nil
+        preset.draftTopP = nil
+        preset.draftTopK = nil
+        preset.toolPromptMode = nil
+        preset.chatTemplateProfile = nil
+        return preset
     }
 
     private func applyingQwen36_27BOptimizedSpeedDefaults() -> TargetPreset {
@@ -1916,11 +1958,29 @@ private struct TargetPreset {
                 reasoning: "auto",
                 environment: env
             )
+        case .claudeCode, .codex, .deepseekHarness:
+            // Single-stream coding agents with long tool histories: the
+            // serial lane the OpenCode preset measured faster than the agent
+            // batch lane (51.4 against 36.8 decode tok/s at 8K), SSD session
+            // cache on like OpenCode and Hermes. Sampler, depth and reasoning
+            // effort stay with the model family and the client's request.
+            // Owner: mtplx/launch_lane.py _CLIENT_LANES["claude-code"/"codex"/
+            // "deepseek-harness"]; LaunchLaneParityTests fails if this preset
+            // parts from it.
+            return TargetPreset(
+                schedulerMode: "serial",
+                batchingPreset: "latency",
+                ssdSessionCache: "on",
+                reasoning: "auto",
+                environment: codingAgentRuntimeEnvironment(
+                    processEnvironment: processEnvironment
+                )
+            )
         case .other:
             // Custom OpenAI/Anthropic-compatible client. The user picks
             // their own port + API key in the LaunchOverlay inline
             // form; pick a balanced preset that works for both single
-            // and 2-3 client agents (Cursor, Codex CLI, Claude Code).
+            // and 2-3 client agents (Cursor, Cline, several at once).
             return TargetPreset(
                 schedulerMode: "ar_batch",
                 batchingPreset: "agent",

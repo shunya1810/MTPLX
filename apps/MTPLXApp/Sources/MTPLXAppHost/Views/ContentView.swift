@@ -352,10 +352,21 @@ struct ContentView: View {
             InferenceParamsOverlay(
                 backend: backend,
                 snapshot: snapshot.inferenceParams,
-                presented: $router.inferenceParamsPresented
+                presented: $router.inferenceParamsPresented,
+                openAllSettings: { [router] in
+                    // Reachable from the benchmark header too; closing the
+                    // overlay does not cancel a run.
+                    if router.benchmarkOverlayPresented { router.closeBenchmark() }
+                    router.openSettings()
+                }
             )
                 .equatable()
                 .zIndex(20)
+
+            // The one-time GitHub star prompt, above everything in the
+            // window; it waits for a quiet moment (StarPromptPresenter).
+            StarPromptLayer(performanceLock: snapshot.configuration.performanceLock)
+                .zIndex(30)
         }
         .animation(.smooth(duration: 0.32), value: router.benchmarkOverlayPresented)
     }

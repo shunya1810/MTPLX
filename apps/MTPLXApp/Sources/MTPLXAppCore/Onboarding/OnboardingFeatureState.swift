@@ -58,6 +58,9 @@ public enum ModelPickChoice: Equatable, Sendable, Hashable {
     case curatedQwen35BBalance
     case curatedQuality
     case curatedGemmaSpeed
+    case curatedInklingBareSpeed
+    case curatedInklingOptimizedSpeed
+    case curatedInklingOptimizedQuality
     case curatedStepFlash
     case other(hfRepo: String)
     case local(path: String)
@@ -239,6 +242,20 @@ public struct OnboardingFeatureState: Equatable, Sendable {
             return catalog.first { $0.id == id }
         case .curatedGemmaSpeed:
             return catalog.first { $0.id == "gemma4-optimized-speed" }
+        case .curatedInklingBareSpeed:
+            // The Inkling trio has FP16 precision siblings, offered on M1/M2 Macs
+            // (MTPLXModelOption.inklingLegacyOffer), as the Qwen 3.8 trio does.
+            let useFP16 = hardware?.tier == .legacyApple
+            let id = useFP16 ? "inkling2-mini-bare-speed-fp16" : "inkling2-mini-bare-speed"
+            return catalog.first { $0.id == id }
+        case .curatedInklingOptimizedSpeed:
+            let useFP16 = hardware?.tier == .legacyApple
+            let id = useFP16 ? "inkling2-mini-optimized-speed-fp16" : "inkling2-mini-optimized-speed"
+            return catalog.first { $0.id == id }
+        case .curatedInklingOptimizedQuality:
+            let useFP16 = hardware?.tier == .legacyApple
+            let id = useFP16 ? "inkling2-mini-optimized-quality-fp16" : "inkling2-mini-optimized-quality"
+            return catalog.first { $0.id == id }
         case .curatedStepFlash:
             return nil
         case .other, .local:
@@ -271,6 +288,9 @@ public struct OnboardingFeatureState: Equatable, Sendable {
              .curatedQwen35BBalance,
              .curatedQuality,
              .curatedGemmaSpeed,
+             .curatedInklingBareSpeed,
+             .curatedInklingOptimizedSpeed,
+             .curatedInklingOptimizedQuality,
              .curatedStepFlash:
             return resolvedModel?.hfModelID
         case .other(let repo):
@@ -358,6 +378,9 @@ public struct OnboardingFeatureState: Equatable, Sendable {
                  .curatedQwen35BBalance,
                  .curatedQuality,
                  .curatedGemmaSpeed,
+                 .curatedInklingBareSpeed,
+                 .curatedInklingOptimizedSpeed,
+                 .curatedInklingOptimizedQuality,
                  .curatedStepFlash:
                 return resolvedModel != nil
             case .other:

@@ -86,6 +86,7 @@
     "tier": "modern",
     "raw": [
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "qwen35-4b-optimized-speed",
@@ -93,6 +94,7 @@
     ],
     "visible": [
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "qwen35-4b-optimized-speed",
@@ -116,6 +118,9 @@
     "tier": "modern",
     "raw": [
       "qwen38-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen38-27b-bare-speed",
       "qwen38-27b-optimized-quality",
       "optimized-speed-v2",
@@ -131,6 +136,9 @@
     ],
     "visible": [
       "qwen38-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen38-27b-bare-speed",
       "optimized-speed-v2",
       "optimized-speed",
@@ -150,6 +158,9 @@
     "tier": "legacy",
     "raw": [
       "qwen38-27b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16",
       "qwen38-27b-bare-speed-fp16",
       "qwen38-27b-optimized-quality-fp16",
       "qwen35-9b-optimized-speed-fp16",
@@ -160,6 +171,9 @@
     ],
     "visible": [
       "qwen38-27b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16",
       "qwen38-27b-bare-speed-fp16",
       "qwen35-9b-optimized-speed-fp16",
       "optimized-speed-fp16",
@@ -174,6 +188,9 @@
     "tier": "modern",
     "raw": [
       "qwen38-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen38-27b-bare-speed",
       "qwen38-27b-optimized-quality",
       "optimized-speed-v2",
@@ -189,6 +206,9 @@
     ],
     "visible": [
       "qwen38-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen38-27b-bare-speed",
       "qwen38-27b-optimized-quality",
       "optimized-speed-v2",
@@ -209,6 +229,9 @@
     "tier": "legacy",
     "raw": [
       "qwen38-27b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16",
       "qwen38-27b-bare-speed-fp16",
       "qwen38-27b-optimized-quality-fp16",
       "qwen35-9b-optimized-speed-fp16",
@@ -219,6 +242,9 @@
     ],
     "visible": [
       "qwen38-27b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16",
       "qwen38-27b-bare-speed-fp16",
       "qwen38-27b-optimized-quality-fp16",
       "qwen35-9b-optimized-speed-fp16",
@@ -245,6 +271,9 @@
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen35-4b-optimized-speed",
       "qwen35-4b-optimized-quality"
     ],
@@ -261,6 +290,9 @@
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen35-4b-optimized-speed",
       "qwen35-4b-optimized-quality"
     ],
@@ -278,7 +310,10 @@
       "qwen36-35b-a3b-optimized-speed-fp16",
       "qwen36-35b-a3b-optimized-balance-fp16",
       "gemma4-optimized-speed",
-      "qwen35-9b-optimized-speed-fp16"
+      "qwen35-9b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16"
     ],
     "visible": [
       "qwen38-27b-optimized-speed-fp16",
@@ -289,7 +324,10 @@
       "qwen36-35b-a3b-optimized-speed-fp16",
       "qwen36-35b-a3b-optimized-balance-fp16",
       "gemma4-optimized-speed",
-      "qwen35-9b-optimized-speed-fp16"
+      "qwen35-9b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16"
     ],
     "default": "qwen38-27b-optimized-speed-fp16"
   },
@@ -309,6 +347,9 @@
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen35-4b-optimized-speed",
       "qwen35-4b-optimized-quality"
     ],
@@ -325,6 +366,9 @@
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen35-4b-optimized-speed",
       "qwen35-4b-optimized-quality"
     ],
@@ -342,7 +386,10 @@
       "qwen36-35b-a3b-optimized-speed-fp16",
       "qwen36-35b-a3b-optimized-balance-fp16",
       "gemma4-optimized-speed",
-      "qwen35-9b-optimized-speed-fp16"
+      "qwen35-9b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16"
     ],
     "visible": [
       "qwen38-27b-optimized-speed-fp16",
@@ -353,7 +400,10 @@
       "qwen36-35b-a3b-optimized-speed-fp16",
       "qwen36-35b-a3b-optimized-balance-fp16",
       "gemma4-optimized-speed",
-      "qwen35-9b-optimized-speed-fp16"
+      "qwen35-9b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16"
     ],
     "default": "qwen38-27b-optimized-speed-fp16"
   },
@@ -375,6 +425,9 @@
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen35-4b-optimized-speed",
       "qwen35-4b-optimized-quality"
     ],
@@ -392,6 +445,9 @@
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen35-4b-optimized-speed",
       "qwen35-4b-optimized-quality"
     ],
@@ -409,7 +465,10 @@
       "qwen36-35b-a3b-optimized-speed-fp16",
       "qwen36-35b-a3b-optimized-balance-fp16",
       "gemma4-optimized-speed",
-      "qwen35-9b-optimized-speed-fp16"
+      "qwen35-9b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16"
     ],
     "visible": [
       "qwen38-27b-optimized-speed-fp16",
@@ -420,7 +479,10 @@
       "qwen36-35b-a3b-optimized-speed-fp16",
       "qwen36-35b-a3b-optimized-balance-fp16",
       "gemma4-optimized-speed",
-      "qwen35-9b-optimized-speed-fp16"
+      "qwen35-9b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16"
     ],
     "default": "qwen38-27b-optimized-speed-fp16"
   },
@@ -443,6 +505,9 @@
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen35-4b-optimized-speed",
       "qwen35-4b-optimized-quality"
     ],
@@ -461,6 +526,9 @@
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen35-4b-optimized-speed",
       "qwen35-4b-optimized-quality"
     ],
@@ -478,7 +546,10 @@
       "qwen36-35b-a3b-optimized-speed-fp16",
       "qwen36-35b-a3b-optimized-balance-fp16",
       "gemma4-optimized-speed",
-      "qwen35-9b-optimized-speed-fp16"
+      "qwen35-9b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16"
     ],
     "visible": [
       "qwen38-27b-optimized-speed-fp16",
@@ -489,7 +560,10 @@
       "qwen36-35b-a3b-optimized-speed-fp16",
       "qwen36-35b-a3b-optimized-balance-fp16",
       "gemma4-optimized-speed",
-      "qwen35-9b-optimized-speed-fp16"
+      "qwen35-9b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16"
     ],
     "default": "qwen38-27b-optimized-speed-fp16"
   },
@@ -512,6 +586,9 @@
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen35-4b-optimized-speed",
       "qwen35-4b-optimized-quality"
     ],
@@ -531,6 +608,9 @@
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen35-4b-optimized-speed",
       "qwen35-4b-optimized-quality"
     ],
@@ -548,7 +628,10 @@
       "qwen36-35b-a3b-optimized-speed-fp16",
       "qwen36-35b-a3b-optimized-balance-fp16",
       "gemma4-optimized-speed",
-      "qwen35-9b-optimized-speed-fp16"
+      "qwen35-9b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16"
     ],
     "visible": [
       "qwen38-27b-optimized-speed-fp16",
@@ -559,7 +642,10 @@
       "qwen36-35b-a3b-optimized-speed-fp16",
       "qwen36-35b-a3b-optimized-balance-fp16",
       "gemma4-optimized-speed",
-      "qwen35-9b-optimized-speed-fp16"
+      "qwen35-9b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16"
     ],
     "default": "qwen38-27b-optimized-speed-fp16"
   },
@@ -582,6 +668,9 @@
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen35-4b-optimized-speed",
       "qwen35-4b-optimized-quality"
     ],
@@ -601,6 +690,9 @@
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen35-4b-optimized-speed",
       "qwen35-4b-optimized-quality"
     ],
@@ -618,7 +710,10 @@
       "qwen36-35b-a3b-optimized-speed-fp16",
       "qwen36-35b-a3b-optimized-balance-fp16",
       "gemma4-optimized-speed",
-      "qwen35-9b-optimized-speed-fp16"
+      "qwen35-9b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16"
     ],
     "visible": [
       "qwen38-27b-optimized-speed-fp16",
@@ -629,7 +724,10 @@
       "qwen36-35b-a3b-optimized-speed-fp16",
       "qwen36-35b-a3b-optimized-balance-fp16",
       "gemma4-optimized-speed",
-      "qwen35-9b-optimized-speed-fp16"
+      "qwen35-9b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16"
     ],
     "default": "qwen38-27b-optimized-speed-fp16"
   },
@@ -652,6 +750,9 @@
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen35-4b-optimized-speed",
       "qwen35-4b-optimized-quality"
     ],
@@ -671,6 +772,9 @@
       "mimo-v26-qwen-9b-optimized-speed",
       "qwen35-9b-optimized-speed",
       "bonsai-2-27b-optimized-speed",
+      "inkling2-mini-bare-speed",
+      "inkling2-mini-optimized-speed",
+      "inkling2-mini-optimized-quality",
       "qwen35-4b-optimized-speed",
       "qwen35-4b-optimized-quality"
     ],
@@ -688,7 +792,10 @@
       "qwen36-35b-a3b-optimized-speed-fp16",
       "qwen36-35b-a3b-optimized-balance-fp16",
       "gemma4-optimized-speed",
-      "qwen35-9b-optimized-speed-fp16"
+      "qwen35-9b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16"
     ],
     "visible": [
       "qwen38-27b-optimized-speed-fp16",
@@ -699,7 +806,10 @@
       "qwen36-35b-a3b-optimized-speed-fp16",
       "qwen36-35b-a3b-optimized-balance-fp16",
       "gemma4-optimized-speed",
-      "qwen35-9b-optimized-speed-fp16"
+      "qwen35-9b-optimized-speed-fp16",
+      "inkling2-mini-bare-speed-fp16",
+      "inkling2-mini-optimized-speed-fp16",
+      "inkling2-mini-optimized-quality-fp16"
     ],
     "default": "qwen38-27b-optimized-speed-fp16"
   }

@@ -27,6 +27,12 @@ private final class AppTerminationCoordinator {
 }
 
 private final class MTPLXApplicationDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        // One window, no document tabs: without this macOS adds Show Tab
+        // Bar and Show All Tabs to the View and Window menus.
+        NSWindow.allowsAutomaticWindowTabbing = false
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let coordinator = AppTerminationCoordinator.shared
         guard !coordinator.isCleaningUp else {
@@ -91,6 +97,14 @@ struct MTPLXApp: App {
     /// unreadable store, or fell back to memory). Lives at the app root so
     /// the sidebar's banner survives until the user dismisses it.
     @StateObject private var chatStoreRecovery: ChatStoreRecoveryState
+    /// MTPLX in the menu bar (#692): an AppKit status item fed from the
+    /// backend at most once a second (MenuBarController.swift). Held like the
+    /// backend, not as a StateObject: nothing in this Scene observes it, so
+    /// a new reading writes the item's title and never re-evaluates the Scene.
+    @State private var menuBarController: MenuBarController
+    /// The one-time GitHub star prompt after the third model load. Held
+    /// like the backend: only `StarPromptLayer` observes it.
+    @State private var starPrompt = StarPromptPresenter()
     private let chatContainer: ModelContainer
     private let memoryPressureMonitor = AppMemoryPressureMonitor()
 
@@ -153,6 +167,25 @@ struct MTPLXApp: App {
         _stopCoordinator = StateObject(wrappedValue: stopCoordinator)
         _benchmarkOrchestrator = StateObject(wrappedValue: benchmarkOrchestrator)
         _chatStoreRecovery = StateObject(wrappedValue: chatStoreRecovery)
+        let menuBarReadout = MenuBarReadout()
+        menuBarReadout.attach(to: backend)
+        let menuBarController = MenuBarController(readout: menuBarReadout) {
+            [backend, stopCoordinator, languageStore] in
+            // Built when the panel opens, released when it closes. Its own
+            // ThemeStore reads the same stored look as the window's.
+            AnyView(
+                MenuBarDashboard()
+                    .environmentObject(backend)
+                    .environmentObject(stopCoordinator)
+                    .environmentObject(ThemeStore())
+                    .environmentObject(languageStore)
+                    .environment(\.locale, languageStore.language.locale)
+                    .environment(\.layoutDirection, languageStore.language.isRightToLeft ? .rightToLeft : .leftToRight)
+            )
+        }
+        _menuBarController = State(initialValue: menuBarController)
+        // After launch: the status bar takes items once the app has finished launching.
+        DispatchQueue.main.async { menuBarController.start() }
         self.chatContainer = container
         memoryPressureMonitor.start()
         stopCoordinator.stopAllHandler = { [backend, viewModel, hermesAgentStore, benchmarkOrchestrator] reason in
@@ -189,6 +222,7 @@ struct MTPLXApp: App {
     var body: some Scene {
         WindowGroup("MTPLX", id: "main") {
             ContentView(backend: backend)
+                .background(MenuBarOpenWindowBridge())
                 .environmentObject(backend)
                 .environmentObject(themeStore)
                 .environmentObject(languageStore)
@@ -206,6 +240,7 @@ struct MTPLXApp: App {
                 .environmentObject(forgeOrchestrator)
                 .environmentObject(benchmarkOrchestrator)
                 .environmentObject(chatStoreRecovery)
+                .environmentObject(starPrompt)
                 .modelContainer(chatContainer)
                 .task {
                     // Wire the benchmark orchestrator to read the
@@ -266,6 +301,12 @@ struct MTPLXApp: App {
                             break
                         }
                     }
+                    starPrompt.attach(
+                        backend: backend,
+                        router: router,
+                        benchmark: benchmarkOrchestrator,
+                        forge: forgeOrchestrator
+                    )
                     // No auto-start during onboarding — the user hasn't
                     // even picked a model yet. After onboarding, the
                     // launch-on-open preference still applies for power
@@ -326,6 +367,16 @@ struct MTPLXApp: App {
                 CheckForUpdatesCommand(updater: appUpdater, languageStore: languageStore)
             }
 
+            // Where every Mac app keeps it: MTPLX has no Settings scene, so
+            // the standard item opens the Settings page in the window.
+            CommandGroup(replacing: .appSettings) {
+                Button(tr("Settings…")) {
+                    if router.benchmarkOverlayPresented { router.closeBenchmark() }
+                    router.openSettings()
+                }
+                .keyboardShortcut(",", modifiers: [.command])
+            }
+
             CommandGroup(after: .appInfo) {
                 Divider()
 
@@ -362,7 +413,9 @@ struct MTPLXApp: App {
                 .keyboardShortcut("l", modifiers: [.command, .option])
             }
 
-            CommandMenu(tr("View")) {
+            // Into the system View menu (beside Enter Full Screen), not a
+            // second menu of the same name.
+            CommandGroup(before: .toolbar) {
                 ForEach(Array(AppTab.allCases.enumerated()), id: \.element.id) { index, tab in
                     Button(tab.title) {
                         router.select(tab)
@@ -423,8 +476,5 @@ struct MTPLXApp: App {
                 .disabled(!chatViewModel.isStreaming)
             }
         }
-
-        // MenuBarExtra source remains in Views/MenuBar, but the scene is
-        // intentionally not installed until the mini controller is release-ready.
     }
 }

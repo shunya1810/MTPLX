@@ -6088,11 +6088,15 @@ def restore_cache(
                 install_view = not clone_states and _is_trimmable(entry)
                 _restore_state_preserving_container(entry, state, clone=not install_view)
         if meta_state is not None and (
-            restore_meta_state or getattr(entry, "mtplx_restore_meta_state", False)
+            restore_meta_state
+            or getattr(entry, "requires_restore_meta", False)
+            or getattr(entry, "mtplx_restore_meta_state", False)
         ):
             # A cache whose offsets live only in its meta state (Inkling 2's
             # sliding windows: RotatingKVCache's state setter keeps offset and
-            # ring index at 0) takes it whatever the caller's layout says.
+            # ring index at 0) takes it whatever the caller's layout says
+            # (upstream's caches: requires_restore_meta; the fork's in-tree
+            # Inkling lane: mtplx_restore_meta_state).
             entry.meta_state = _clone_tree(meta_state)
 
 

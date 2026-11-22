@@ -17,6 +17,7 @@ ones this machine should be offered.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +31,21 @@ MEMORY_SAFETY_FACTOR = 1.5
 DOWNLOAD_HEADROOM_GIB = 5.0
 # Bonsai 2 leads from this much RAM; its measured 8K-context peak is 11.80 GiB.
 BONSAI_RECOMMENDATION_MIN_GIB = 16.0
+# Inkling 2 Mini Bare Speed on 24 to 31 GiB Macs, directly after the tier's first
+# pick. On (21 November, the lead's RC-B order). In a simulated 24 GiB envelope the
+# memory plan serves a 24,576-token window, one in which every conversation can take
+# its next turn (22 November: 32,768 refused a follow-up after its stream opened, and
+# 28,672 a 4K tool result): a 20K prompt, turns of 532 and 3,729 new tokens, an
+# image, a cold 24,369-token prompt and its turn, inside the 18 GiB engine budget
+# (peak 17.92 GiB), no swap. A read there keeps one restore point instead of two.
+# True is the whole switch (mirrors MTPLXModelOption.inklingTightMacOffer).
+INKLING_TIGHT_MAC_OFFER = True
+# The Inkling 2 Mini FP16 siblings on M1 and M2 Macs (32 GiB and up), in the places the
+# modern tier gives the trio. On by the founder's order of 21 November (M1 and M2 are offered
+# the FP16 packs); their FP16 numbers are checked on an M5 and the M1-M4 rehearsal switch,
+# not yet on an M1 or M2 itself. True is the whole switch (mirrors
+# MTPLXModelOption.inklingLegacyOffer).
+INKLING_LEGACY_OFFER = True
 
 MODERN_TIER = "modern"
 LEGACY_TIER = "legacy"
@@ -520,6 +536,70 @@ OFFICIAL_CATALOG: tuple[CatalogModel, ...] = (
         ),
         ar_only=True,
     ),
+    CatalogModel(
+        id="inkling2-mini-bare-speed",
+        display_name="Inkling 2 Mini Bare Speed",
+        detail="Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding.",
+        hf_model_id="Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed",
+        size_bytes=16_023_243_308,
+        peak_memory_gib=18.21,
+        recommended_tiers=frozenset({MODERN_TIER}),
+        aliases=("mtplx-inkling-2-mini-bare-speed", "Inkling 2 Mini Bare Speed", "MTPLX-Inkling-2-Mini-Bare-Speed", "Inkling-2-Mini-MTPLX-Bare-Speed"),
+    ),
+    CatalogModel(
+        id="inkling2-mini-optimized-speed",
+        display_name="Inkling 2 Mini Optimized Speed",
+        detail="Closer to the original weights: 8-bit attention, with vision and speculative decoding.",
+        hf_model_id="Youssofal/Inkling-2-Mini-MTPLX-Optimized-Speed",
+        size_bytes=17_242_658_297,
+        peak_memory_gib=19.92,
+        recommended_tiers=frozenset({MODERN_TIER}),
+        aliases=("mtplx-inkling-2-mini-optimized-speed", "Inkling 2 Mini Optimized Speed", "MTPLX-Inkling-2-Mini-Optimized-Speed", "Inkling-2-Mini-MTPLX-Optimized-Speed"),
+    ),
+    CatalogModel(
+        id="inkling2-mini-optimized-quality",
+        display_name="Inkling 2 Mini Optimized Quality",
+        detail="Original expert and attention weights, with vision and speculative decoding.",
+        hf_model_id="Youssofal/Inkling-2-Mini-MTPLX-Optimized-Quality",
+        size_bytes=20_191_646_421,
+        peak_memory_gib=23.52,
+        recommended_tiers=frozenset({MODERN_TIER}),
+        aliases=("mtplx-inkling-2-mini-optimized-quality", "Inkling 2 Mini", "MTPLX-Inkling-2-Mini-Optimized-Quality", "Inkling-2-Mini-MTPLX-Optimized-Quality"),
+    ),
+    # FP16 siblings for M1 and M2 Macs, which have no native bfloat16: the same packs with every
+    # BF16 tensor cast to FP16 (vision tower and drafter included) and every NVFP4 and 4-bit code
+    # byte for byte; peak carried over from the parent (same tensor bytes). Recommended on the
+    # legacy tier (INKLING_LEGACY_OFFER, on).
+    CatalogModel(
+        id="inkling2-mini-bare-speed-fp16",
+        display_name="Inkling 2 Mini Bare Speed FP16",
+        detail="Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding. FP16 build for M1 and M2 Macs.",
+        hf_model_id="Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed-FP16",
+        size_bytes=16_023_246_321,
+        peak_memory_gib=18.21,
+        recommended_tiers=frozenset({LEGACY_TIER}),
+        aliases=("mtplx-inkling-2-mini-bare-speed-fp16", "Inkling 2 Mini Bare Speed FP16", "MTPLX-Inkling-2-Mini-Bare-Speed-FP16", "Inkling-2-Mini-MTPLX-Bare-Speed-FP16"),
+    ),
+    CatalogModel(
+        id="inkling2-mini-optimized-speed-fp16",
+        display_name="Inkling 2 Mini Optimized Speed FP16",
+        detail="Closer to the original weights: 8-bit attention, with vision and speculative decoding. FP16 build for M1 and M2 Macs.",
+        hf_model_id="Youssofal/Inkling-2-Mini-MTPLX-Optimized-Speed-FP16",
+        size_bytes=17_242_661_312,
+        peak_memory_gib=19.92,
+        recommended_tiers=frozenset({LEGACY_TIER}),
+        aliases=("mtplx-inkling-2-mini-optimized-speed-fp16", "Inkling 2 Mini Optimized Speed FP16", "MTPLX-Inkling-2-Mini-Optimized-Speed-FP16", "Inkling-2-Mini-MTPLX-Optimized-Speed-FP16"),
+    ),
+    CatalogModel(
+        id="inkling2-mini-optimized-quality-fp16",
+        display_name="Inkling 2 Mini Optimized Quality FP16",
+        detail="Original expert and attention weights, with vision and speculative decoding. FP16 build for M1 and M2 Macs.",
+        hf_model_id="Youssofal/Inkling-2-Mini-MTPLX-Optimized-Quality-FP16",
+        size_bytes=20_191_648_443,
+        peak_memory_gib=23.52,
+        recommended_tiers=frozenset({LEGACY_TIER}),
+        aliases=("mtplx-inkling-2-mini-optimized-quality-fp16", "Inkling 2 Mini Optimized Quality FP16", "MTPLX-Inkling-2-Mini-Optimized-Quality-FP16", "Inkling-2-Mini-MTPLX-Optimized-Quality-FP16"),
+    ),
 )
 
 # Mirrors `modernTopRecommendationIDs` in MTPLXModelOption.swift: the
@@ -550,6 +630,87 @@ _MODERN_SMALL_IDS = (
     "mimo-v26-qwen-9b-optimized-speed",
     "qwen35-9b-optimized-speed",
 )
+
+# Inkling 2 Mini trio on modern chips (2.13): Bare Speed is the recommended
+# pack. On 32 to 47 GiB Macs the trio rides directly after the tier's first
+# pick (founder, 2026-11-21: recommend Bare Speed to 36 GB Macs), Bare Speed,
+# then Optimized Speed, then Optimized Quality; the peak-memory filter drops a
+# pack where it does not fit. From 48 GiB it keeps the family's slot near the
+# end. From 24 to 31 GiB only Bare Speed, behind INKLING_TIGHT_MAC_OFFER (on).
+# Mirrors MTPLXModelOption.inklingIDs.
+_INKLING_IDS = (
+    "inkling2-mini-bare-speed",
+    "inkling2-mini-optimized-speed",
+    "inkling2-mini-optimized-quality",
+)
+
+@dataclass(frozen=True)
+class PackIdentity:
+    """What a pack says about itself in its own ``mtplx-pack.json``."""
+
+    source: str
+    recipe: str
+    precision_variant: str | None = None
+
+
+_INKLING_SOURCE = "thinkingmachines/Inkling-2-Mini"
+
+# A folder that carries an Inkling pack's name is taken for that pack only when
+# its mtplx-pack.json says it is that build: the source, the recipe, and the
+# FP16 siblings' precision variant. The Mac the packs were built on kept two
+# research builds under the published repository names (20 November), and a
+# name alone served them as the catalog pack. The upstream revision is not
+# pinned: a pack rebuilt from new weights moves it, and an older app would then
+# refuse the new download. Mirrors MTPLXModelOption.packIdentities.
+PACK_IDENTITIES: dict[str, PackIdentity] = {
+    "inkling2-mini-bare-speed": PackIdentity(_INKLING_SOURCE, "bare-speed"),
+    "inkling2-mini-optimized-speed": PackIdentity(_INKLING_SOURCE, "speed"),
+    "inkling2-mini-optimized-quality": PackIdentity(_INKLING_SOURCE, "quality"),
+    "inkling2-mini-bare-speed-fp16": PackIdentity(_INKLING_SOURCE, "bare-speed", "fp16"),
+    "inkling2-mini-optimized-speed-fp16": PackIdentity(_INKLING_SOURCE, "speed", "fp16"),
+    "inkling2-mini-optimized-quality-fp16": PackIdentity(_INKLING_SOURCE, "quality", "fp16"),
+}
+
+
+def pack_identity_problem(path: str | Path, pack: CatalogModel) -> str | None:
+    """Why the folder at ``path`` is not ``pack`` although it carries its name;
+    None when it is, or when the catalog pins no identity for ``pack``."""
+
+    expected = PACK_IDENTITIES.get(pack.id)
+    if expected is None:
+        return None
+    try:
+        stamp = json.loads((Path(path) / "mtplx-pack.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return f"it has no readable mtplx-pack.json, so it cannot be shown to be {pack.display_name}"
+    if not isinstance(stamp, dict):
+        return f"its mtplx-pack.json is not a pack description, so it cannot be shown to be {pack.display_name}"
+    found = PackIdentity(
+        source=str(stamp.get("source") or ""),
+        recipe=str(stamp.get("recipe") or ""),
+        precision_variant=str(stamp.get("precision_variant") or "") or None,
+    )
+    if found == expected:
+        return None
+    built = str(stamp.get("display_name") or "").strip() or "another build"
+    precision = f", {found.precision_variant}" if found.precision_variant else ""
+    return f"its mtplx-pack.json says it is {built} (recipe {found.recipe or 'missing'}{precision}), not {pack.display_name}"
+
+
+def catalog_model_for_repo(repo_id: str) -> CatalogModel | None:
+    wanted = repo_id.strip().casefold()
+    for model in OFFICIAL_CATALOG:
+        if model.hf_model_id.casefold() == wanted:
+            return model
+    return None
+
+
+def repo_folder_identity_problem(path: str | Path, repo_id: str) -> str | None:
+    """:func:`pack_identity_problem` for the catalog pack published as ``repo_id``."""
+
+    pack = catalog_model_for_repo(repo_id)
+    return pack_identity_problem(path, pack) if pack is not None else None
+
 
 # Flash-Next options on modern chips; Optimized Speed and Quality lead from
 # 256 GiB. Mirrors MTPLXModelOption.flashNextIDs.
@@ -583,6 +744,7 @@ def catalog_model_matching(ref: str | Path | None) -> CatalogModel | None:
         return None
     normalized = _normalized(text)
     basename = _normalized(Path(text).name)
+    folder = Path(text).expanduser()
     for model in OFFICIAL_CATALOG:
         candidates = {
             _normalized(model.id),
@@ -591,6 +753,9 @@ def catalog_model_matching(ref: str | Path | None) -> CatalogModel | None:
             *(_normalized(alias) for alias in model.aliases),
         }
         if normalized in candidates or basename in candidates:
+            # A folder under a pack's name is that pack only if it says so (PACK_IDENTITIES).
+            if model.id in PACK_IDENTITIES and folder.is_dir() and pack_identity_problem(folder, model):
+                continue
             return model
     return None
 
@@ -660,12 +825,18 @@ def recommended_catalog_ids(
             return small
         bonsai = "bonsai-2-27b-optimized-speed"
         leading = [bonsai, *small] if memory_gib >= BONSAI_RECOMMENDATION_MIN_GIB else [*small, bonsai]
-        return [*leading, *tiny_ids]
+        # Inkling Bare Speed behind INKLING_TIGHT_MAC_OFFER (on): its 24,576-token window on a 24 GB Mac
+        # is served in a simulated envelope, every next turn included.
+        inkling = ["inkling2-mini-bare-speed"] if INKLING_TIGHT_MAC_OFFER and memory_gib >= 24 else []
+        return [*leading[:1], *inkling, *leading[1:], *tiny_ids]
     if memory_gib < 48:
         if speed27_v2 is None:
-            return [*trio38, *small, speed27, "gemma4-optimized-speed", speed35, quality27]
+            inkling16 = [f"{model_id}-fp16" for model_id in _INKLING_IDS] if INKLING_LEGACY_OFFER else []
+            return [trio38[0], *inkling16, *trio38[1:], *small, speed27, "gemma4-optimized-speed", speed35, quality27]
         return [
-            *trio38,
+            trio38[0],
+            *_INKLING_IDS,
+            *trio38[1:],
             speed27_v2,
             speed27,
             *small,
@@ -698,6 +869,11 @@ def recommended_catalog_ids(
         "gemma4-optimized-speed",
         *small,
         *(["bonsai-2-27b-optimized-speed"] if chip_tier != LEGACY_TIER else []),
+        *(
+            _INKLING_IDS
+            if chip_tier != LEGACY_TIER
+            else tuple(f"{model_id}-fp16" for model_id in _INKLING_IDS) if INKLING_LEGACY_OFFER else ()
+        ),
         *tiny_ids,
     ]
 
@@ -841,7 +1017,7 @@ def scan_installed_models(
                     path=child,
                     name=child.name,
                     size_bytes=_directory_size_bytes(child),
-                    catalog=catalog_model_matching(child.name),
+                    catalog=catalog_model_matching(child),
                     root=root,
                     root_index=root_index,
                     is_primary=root_index == 0,

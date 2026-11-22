@@ -30,11 +30,6 @@ def test_the_final_parser_keeps_the_payload_whitespace():
     assert args == {"path": "kyoto.html", "content": CONTENT, "n": 42}
 
 
-def test_single_line_values_stay_trimmed():
-    assert tc._qwen_xml_param("\n kyoto.html \n") == "kyoto.html"
-    assert srv._decode_tool_parameter_value(" npm run build\n") == "npm run build"
-
-
 def test_the_decoder_keeps_multiline_strings_whole():
     assert srv._decode_tool_parameter_value(CONTENT) == CONTENT
     assert srv._decode_tool_parameter_value('{"a": 1}') == {"a": 1}

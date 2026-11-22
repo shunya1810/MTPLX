@@ -38,13 +38,21 @@ CLIENTS: tuple[str, ...] = (
     "opencode",
     "pi",
     "hermes",
+    "claude-code",
+    "codex",
+    "deepseek-harness",
     "other",
     "benchmark",
 )
-# Families whose sampler contract is their own (the official thinking-mode
-# sampler 1.0 / 0.95 / 20): a client table never overrides it.
-SAMPLER_OWNING_FAMILIES = frozenset({"qwen3_8", "qwen4_exp"})
+# Families whose sampler contract is their own (Qwen 3.8 and Flash-Next: the
+# official thinking-mode sampler 1.0 / 0.95 / 20; Inkling 2 Mini: its
+# generation_config's temperature 1.0 over the whole distribution): a client
+# table never overrides it.
+SAMPLER_OWNING_FAMILIES = frozenset({"qwen3_8", "qwen4_exp", "inkling2"})
 SEATS_GIB: tuple[int, ...] = (16, 24, 36, 48, 64, 96, 128)
+# The families the parity matrix covers: the app, `mtplx start` and bare
+# `mtplx serve` must resolve the same lane for each (Inkling 2 Mini from 2.13).
+LANE_FAMILIES: tuple[str, ...] = ("qwen4_exp", "qwen3_8", "inkling2")
 
 # --- the constants two owners used to disagree on ---------------------------
 
@@ -82,6 +90,13 @@ SSD_SESSION_CACHE_BY_ENTRY: dict[str, dict[str, str]] = {
     "benchmark": {"app": "off", "start": "off", "serve": "off"},
 }
 
+# Families whose SSD session cache is on at every entry point (the benchmark
+# excepted), whatever the client table says: Inkling 2 Mini's first turn after a
+# restart resumes from the bank (Hermes on a restart: 14 of 5,229 tokens read in
+# 0.44 s against 1,206 in 3.07 s without it), and `mtplx start` already ran it on.
+# The app's twin is in MTPLXCommandBuilder's ResolvedDaemonArgs.
+FAMILY_SSD_SESSION_CACHE: dict[str, str] = {"inkling2": "on"}
+
 # (client, choice) pairs allowed to differ between entry points, with why.
 DECLARED_ENTRY_POINT_DIFFERENCES: dict[tuple[str, str], str] = {
     ("chat", "ssd_session_cache"): "app chat ships it off, the CLI on: unmeasured, cell P3.1",
@@ -89,7 +104,9 @@ DECLARED_ENTRY_POINT_DIFFERENCES: dict[tuple[str, str], str] = {
     ("pi", "ssd_session_cache"): "app Pi ships it off, `mtplx start pi` on: unmeasured, cell P5.0",
 }
 
-_AGENT_CLIENTS = frozenset({"opencode", "pi", "hermes"})
+_AGENT_CLIENTS = frozenset(
+    {"opencode", "pi", "hermes", "claude-code", "codex", "deepseek-harness"}
+)
 
 # Per-client base lane. Sampler values apply only to families that do not
 # own their sampler; None means "the family or the pack decides".
@@ -134,6 +151,29 @@ _CLIENT_LANES: dict[str, dict[str, Any]] = {
         "chat_template_profile": "local_qwen36",
         "adaptive_policy": "expected_value",
         "preserve_thinking": "auto",
+    },
+    # Claude Code and Codex are single-stream coding agents with long tool
+    # histories, the shape the serial lane was measured on (51.4 against 36.8
+    # decode tok/s for the agent batch lane at 8K). Before they had their own
+    # Start entries they arrived through "other", the batch lane. Sampler,
+    # depth and reasoning effort stay with the model family.
+    "claude-code": {
+        "scheduler_mode": "serial",
+        "batching_preset": "latency",
+        "ssd_session_cache": "on",
+    },
+    "codex": {
+        "scheduler_mode": "serial",
+        "batching_preset": "latency",
+        "ssd_session_cache": "on",
+    },
+    # DeepSeek Harness: the same single-stream coding-agent shape (its title
+    # side request is switched off in MTPLX's profile, so nothing shares the
+    # lane with the turn).
+    "deepseek-harness": {
+        "scheduler_mode": "serial",
+        "batching_preset": "latency",
+        "ssd_session_cache": "on",
     },
     "other": {
         "scheduler_mode": "ar_batch",
@@ -356,7 +396,10 @@ def resolve_launch_lane(
     # SSD session cache.
     by_entry = SSD_SESSION_CACHE_BY_ENTRY.get(client)
     ssd_mode = by_entry[entry_point] if by_entry else base.get("ssd_session_cache", "on")
-    choices["ssd_session_cache"] = _choice(ssd_mode, "default")
+    ssd_source = "default"
+    if family_key in FAMILY_SSD_SESSION_CACHE and client != "benchmark":
+        ssd_mode, ssd_source = FAMILY_SSD_SESSION_CACHE[family_key], "family"
+    choices["ssd_session_cache"] = _choice(ssd_mode, ssd_source)
     choices["ssd_session_cache_max_size"] = _choice(
         SSD_SESSION_CACHE_MAX_SIZE,
         "default",
@@ -456,7 +499,7 @@ def family_owned_sampler_overrides(family: str | None) -> bool:
 
 def lane_matrix(
     *,
-    families: tuple[str, ...] = ("qwen4_exp", "qwen3_8"),
+    families: tuple[str, ...] = LANE_FAMILIES,
     seats_gib: tuple[int, ...] = SEATS_GIB,
     clients: tuple[str, ...] = CLIENTS,
 ) -> list[dict[str, Any]]:
@@ -502,7 +545,7 @@ APP_ARGV_KEYS: tuple[str, ...] = (
 
 def app_parity_fixture(
     *,
-    families: tuple[str, ...] = ("qwen4_exp", "qwen3_8"),
+    families: tuple[str, ...] = LANE_FAMILIES,
     seats_gib: tuple[int, ...] = SEATS_GIB,
     clients: tuple[str, ...] = CLIENTS,
 ) -> dict[str, Any]:

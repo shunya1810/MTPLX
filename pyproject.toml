@@ -1,10 +1,15 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = [
+  "setuptools>=69", "wheel",
+  "cmake>=3.27; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "mlx==0.32.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "nanobind==2.15.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mtplx"
-version = "2.12.3"
+version = "2.13.0"
 description = "Native MTP speculative decoding for Qwen3-Next on Apple Silicon."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,7 +22,13 @@ dependencies = [
   # Vision is advertised on the base install (app attachments, image_url on
   # the server) and mtplx.vision.processing imports PIL at module load, so
   # Pillow must be a base dependency, not a [server] extra (#103).
-  "pillow>=10",
+  # Exactly the major the vision gates ran on (2.13: 13.0.0 in every Inkling
+  # environment and the reference parity). Pillow 12.3 -> 13 changed the
+  # pixels of images the grid rounding enlarges (Pi's 1500x1420 screenshot:
+  # 5.5% of values, up to 11/255), so pip, Homebrew and the app install the
+  # tested major, and an app runtime on 12.x converges at its next update
+  # (pip upgrades only what fails the requirement), as the MLX pin does.
+  "pillow>=13,<14",
   # 0.32.0 exactness-gated 2026-07-11: byte-identical greedy 128-tok output
   # vs 0.31.3 on Optimized-Speed q4 turbo D3 (same 34 verify calls), and 103
   # kernel/paged-verifier/graphbank/sustained tests green under 0.32.0.
@@ -52,8 +63,16 @@ dependencies = [
   # the tool chat template (thinking on and off) and plain encodes give token
   # ids identical to 5.14.1 on the Qwen 3.8 27B, Flash-Next, Qwen 3.6 A3B,
   # Qwen 3.5 9B and LFM2.5 pack tokenizers; 5.16.1 brings tokenizers 0.23.2
-  # with the same ids. 5.17 is not verified, so the ceiling stays below it.
-  "transformers>=5.10.0,!=5.13.0,<5.17; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  # with the same ids. 5.22.2 verified 2026-11-12 (PR #684): mlx-lm 0.31.3
+  # imports; a 40-message agent transcript (tool calls, reasoning, image
+  # placeholders) through both server encode paths, at every reasoning
+  # effort with thinking and preserve_thinking on and off, gives token ids
+  # identical to 5.16.1 on 19 catalog pack tokenizers (every Flash-Next,
+  # Qwen 3.8 27B, Bonsai 2, Qwen 3.6, Qwen 3.5, MiMo and Gemma 4 pack on the
+  # test Mac: 380 of 380 cases), with the same tokenizer type for
+  # llguidance (tokenizers 0.23.3 both sides). 5.23 is not verified, so the
+  # ceiling stays below it.
+  "transformers>=5.10.0,!=5.13.0,<5.23; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "nanobind>=2; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "numpy>=2",
   "pydantic>=2",
@@ -107,8 +126,8 @@ mtplx-tune = "mtplx.cli:main_tune"
 include = ["mtplx*", "vllm_metal*"]
 
 [tool.setuptools.package-data]
-mtplx = ["templates/**/*.jinja", "data/*.npy"]
-"mtplx.benchmarks" = ["prompts/*.jsonl"]
+mtplx = ["templates/**/*.jinja", "data/*.npy", "data/deepseek-harness-lock.json"]
+"mtplx.benchmarks" = ["prompts/*.jsonl", "prompts/quality/*.toml"]
 "mtplx.dashboard" = ["_static/**/*"]
 "vllm_metal.metal" = [
   "README.md",

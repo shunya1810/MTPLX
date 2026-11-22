@@ -53,6 +53,19 @@ def _srv() -> Any:
     return openai
 
 
+def _without_deferred_tools(
+    tool_specs: list[dict[str, Any]], deferred_names: frozenset[str]
+) -> list[dict[str, Any]]:
+    """The tools the prompt's tool section renders: every declared tool but
+    the ones the client loads on demand."""
+
+    if not deferred_names:
+        return tool_specs
+    return [
+        tool for tool in tool_specs if _srv()._tool_spec_name(tool) not in deferred_names
+    ]
+
+
 def _responses_reasoning_observability(
     metadata: dict[str, Any], effective_effort: str | None
 ) -> dict[str, Any]:
@@ -145,6 +158,8 @@ class RequestPolicy:
     sampler_top_k: int | None = None
     sampler_presence_penalty: float | None = None
     sampler_frequency_penalty: float | None = None
+    # logit_bias / min_p / repetition_penalty, validated (SamplerConfig fields).
+    sampler_client_controls: dict[str, Any] = field(default_factory=dict)
     request_draft_sampler: SamplerConfig | None = None
 
     # Policy-owned observability entries.
@@ -200,6 +215,42 @@ class RequestPolicy:
             long_context_depth_policy=long_context_depth_policy,
             observability=observability,
         )
+
+
+def _resolve_client_controls(
+    request: Any, *, client_controls_allowed: bool, observability: dict[str, Any]
+) -> dict[str, Any]:
+    """``logit_bias``, ``min_p`` and ``repetition_penalty`` as SamplerConfig fields.
+
+    The request models accept them as extra fields; until 2.13 they were parsed and then
+    dropped before sampling. They follow the same ownership policy as the other sampler
+    fields. A malformed value is a 400 naming the field; a well-formed one is carried to
+    the sampler, and a backend whose fast path cannot apply it routes the request to a
+    path that does (counted there).
+    """
+    from fastapi import HTTPException
+
+    from mtplx.sampling import parse_client_controls
+
+    sent = {
+        name: getattr(request, name, None)
+        for name in ("logit_bias", "min_p", "repetition_penalty")
+        if getattr(request, name, None) is not None
+    }
+    if not sent:
+        return {}
+    if not client_controls_allowed:
+        ignored = list(observability.get("client_sampler_fields_ignored") or [])
+        observability["client_sampler_fields_ignored"] = ignored + sorted(sent)
+        return {}
+    try:
+        controls = parse_client_controls(**sent)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    observability["request_client_controls"] = {
+        name: (len(value) if name == "logit_bias" else value) for name, value in controls.items()
+    }
+    return controls
 
 
 def _resolve_sampler(
@@ -406,6 +457,9 @@ def _resolve_completions_policy(
         tools_active=False,
         observability=observability,
     )
+    sampler_client_controls = _resolve_client_controls(
+        request, client_controls_allowed=client_controls_allowed, observability=observability
+    )
     return RequestPolicy(
         endpoint="completions",
         client_controls_allowed=client_controls_allowed,
@@ -418,6 +472,7 @@ def _resolve_completions_policy(
         sampler_top_k=sampler_top_k,
         sampler_presence_penalty=sampler_presence_penalty,
         sampler_frequency_penalty=sampler_frequency_penalty,
+        sampler_client_controls=sampler_client_controls,
         request_draft_sampler=request_draft_sampler,
         observability=observability,
     )
@@ -526,8 +581,13 @@ def resolve_request_policy(
     # schema prefix. Keep the same prompt tools on auto -> none -> auto;
     # the existing trailing no-tool contract closes the tool phase, and
     # tools_active still governs parsing/emission of calls.
+    # Tools loaded on demand (Anthropic tool search) are declared for the
+    # parser but never rendered in the tool section: the conversation carries
+    # each one's definition where the client loaded it, so a load leaves the
+    # prompt's prefix as it was.
+    deferred_tool_names = getattr(request, "deferred_tool_names", frozenset())
     prompt_tool_specs = (
-        tool_specs
+        _without_deferred_tools(tool_specs, deferred_tool_names)
         if tools_active or srv._tool_choice_disables_tools(request.tool_choice)
         else None
     )
@@ -652,7 +712,11 @@ def resolve_request_policy(
     postcommit_tool_specs = (
         prompt_tool_specs
         if prompt_tool_specs
-        else (requested_tool_specs if agent_transcript_tools_active else None)
+        else (
+            _without_deferred_tools(requested_tool_specs, deferred_tool_names)
+            if agent_transcript_tools_active
+            else None
+        )
     )
     background = bool(
         chat
@@ -800,6 +864,9 @@ def resolve_request_policy(
     observability["request_reasoning_mode"] = request_reasoning_mode
     observability["request_enable_thinking"] = bool(thinking_enabled)
     observability["request_reasoning_effort"] = reasoning_effort
+    if thinking_enabled and thinking_controls_allowed:
+        # A cap on its own thinking is one of the client's thinking controls.
+        observability.update(srv._client_thinking_budget(request))
     observability.update(
         _responses_reasoning_observability(metadata, reasoning_effort)
     )
@@ -880,6 +947,15 @@ def resolve_request_policy(
             "request_filtered_tool_names": filtered_tool_names,
             "request_hidden_tool_names": hidden_tool_names,
             "request_tools_hidden_by_bridge": bool(hidden_tool_names),
+            "request_deferred_tool_count": len(deferred_tool_names),
+            "request_loaded_tool_count": len(
+                getattr(request, "loaded_tool_names", ())
+            ),
+            # Asked to load on demand, declared up front instead: the served
+            # template does not list tools the way a loaded one is written.
+            "request_defer_loading_declined_count": len(
+                getattr(request, "defer_loading_declined_names", ())
+            ),
         }
     )
     chat_template_report = getattr(state, "chat_template_report", {}) or {}
@@ -911,6 +987,9 @@ def resolve_request_policy(
         messages_for_generation=messages_for_generation,
         tools_active=tools_active,
         observability=observability,
+    )
+    sampler_client_controls = _resolve_client_controls(
+        request, client_controls_allowed=client_controls_allowed, observability=observability
     )
     return RequestPolicy(
         endpoint=endpoint,
@@ -951,6 +1030,7 @@ def resolve_request_policy(
         sampler_top_k=sampler_top_k,
         sampler_presence_penalty=sampler_presence_penalty,
         sampler_frequency_penalty=sampler_frequency_penalty,
+        sampler_client_controls=sampler_client_controls,
         request_draft_sampler=request_draft_sampler,
         observability=observability,
     )

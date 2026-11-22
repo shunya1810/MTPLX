@@ -880,11 +880,29 @@ def _one_shot_args(**overrides):
     return SimpleNamespace(**args)
 
 
+def _import_one_shot_lazy_modules() -> None:
+    """Import, for real, the modules the one-shot path imports lazily.
+
+    The one-shot tests replace mtplx.runtime, mtplx.sampling or
+    mtplx.generation in sys.modules so no model loads. A module that the
+    one-shot path imports for the first time while such a stub is installed
+    binds the stub and the import fails: since #463 the path resolves the
+    serve runtime contract (mtplx.server.openai, which imports
+    mtplx.session_bank and so mtplx.runtime.MTPLXRuntime), and the profile
+    refresh imports mtplx.qwen4_block_verify (mtplx.sampling's
+    SparseDistribution). Run alone, this file failed fifteen of these tests;
+    after any file that had imported the server they passed.
+    """
+    import mtplx.qwen4_block_verify  # noqa: F401
+    import mtplx.server.openai  # noqa: F401
+
+
 def _stub_one_shot_generation(monkeypatch) -> dict[str, object]:
     """Stub everything past the prompt so no model loads and no tokens generate.
 
     Returns a dict capturing what actually reached the generation entry.
     """
+    _import_one_shot_lazy_modules()
     # The one-shot path applies a profile, which writes MTPLX_* keys into the
     # process env for the rest of the CLI lifetime. Without this copy they leak
     # into every later in-process test.
@@ -1004,6 +1022,43 @@ def test_one_shot_never_drains_an_interactive_stdin(monkeypatch):
 
     with pytest.raises(SystemExit, match="requires a prompt"):
         public._generate_one_shot_public(_one_shot_args(), command="run")
+
+
+@pytest.mark.parametrize("backend_id,installs", [("inkling2_loop", False), ("qwen3_next", True)])
+def test_one_shot_installs_the_draft_head_only_where_the_backend_uses_one(monkeypatch, backend_id, installs):
+    """`mtplx run` on Inkling 2 Mini stopped before its first token (22 November 2026, the 2.13 wheel):
+    the one-shot path installed the profile's quantized draft head on every model it loaded, and Inkling
+    drafts with its own drafter and has no `lm_head` ("model has no lm_head and does not tie output
+    projection to embeddings"). The server installs the head only where the backend's descriptor uses one;
+    `run`, `ask` and `chat` now follow the same descriptor."""
+
+    _stub_one_shot_generation(monkeypatch)
+    loaded = SimpleNamespace(tokenizer=object(), model=object(), mtp_enabled=True, backend_id=backend_id)
+    monkeypatch.setattr(sys.modules["mtplx.runtime"], "load", lambda *a, **kw: loaded)
+    import mtplx.draft_lm_head as draft_lm_head
+
+    calls: list[dict] = []
+
+    def _install(rt, **kwargs):
+        assert rt is loaded
+        calls.append(kwargs)
+        return {"installed": True}
+
+    monkeypatch.setattr(draft_lm_head, "_install_draft_lm_head", _install)
+    code, _payload, _validations = public._generate_one_shot_public(
+        _one_shot_args(prompt="hi"), command="run"
+    )
+    assert code == 0
+    assert bool(calls) is installs
+
+
+def test_the_draft_head_spec_follows_the_loaded_backend():
+    spec = {"bits": 4, "group_size": 64, "mode": "affine"}
+    args = SimpleNamespace()
+    helper = getattr(public, "_draft_lm_head_spec_for_runtime")
+    assert helper(spec, SimpleNamespace(backend_id="inkling2_loop"), args) is None
+    assert helper(spec, SimpleNamespace(backend_id="qwen3_next"), args) == spec
+    assert helper(None, SimpleNamespace(backend_id="qwen3_next"), args) is None
 
 
 def test_piped_prompt_text_survives_an_unreadable_stdin(monkeypatch):
@@ -2132,6 +2187,7 @@ def test_terminal_quickstart_max_uses_verified_max_session(monkeypatch):
             self.thermal["restore"] = {"ok": True}
             return {"ok": True}
 
+    _import_one_shot_lazy_modules()
     fake_runtime = ModuleType("mtplx.runtime")
     fake_runtime.load = lambda *a, **kw: SimpleNamespace(tokenizer=object())
     fake_draft = ModuleType("mtplx.draft_lm_head")
@@ -2217,6 +2273,7 @@ def test_depth_sweep_native60_keeps_model_runtime_env_overrides(monkeypatch):
 
 
 def test_one_shot_max_uses_verified_max_session(monkeypatch):
+    _import_one_shot_lazy_modules()
     calls: list[str] = []
     monkeypatch.setattr(os, "environ", dict(os.environ))
 
@@ -2312,6 +2369,7 @@ def test_laguna_one_shot_uses_target_generation_defaults(monkeypatch, command):
     monkeypatch.setattr(os, "environ", os.environ.copy())
     observed: dict[str, object] = {}
 
+    _import_one_shot_lazy_modules()
     fake_runtime = ModuleType("mtplx.runtime")
 
     def fake_load(*_args, **kwargs):
@@ -2479,7 +2537,9 @@ def test_laguna_opencode_payload_uses_native_tools_and_32k_context(monkeypatch):
     assert payload["output_limit"] == 16_384
     assert payload["tool_prompt_mode"] == "native"
     assert "--tool-prompt-mode native" in payload["server_command"]
-    assert "--context-window 32768" in payload["server_command"]
+    # No window chosen: the real start passes none (the server serves the model's window as far as the Mac's
+    # memory allows and sets the client from it), so the printed command does not pin the starting 32,768.
+    assert "--context-window" not in payload["server_command"]
 
     args.context_window = 65_536
     expanded = public._quickstart_opencode_payload(args, inspection=inspection)
@@ -2487,7 +2547,9 @@ def test_laguna_opencode_payload_uses_native_tools_and_32k_context(monkeypatch):
     assert expanded["context_window"] == 65_536
     # Capped at the 32,000 OpenCode injects on large windows.
     assert expanded["output_limit"] == 32_000
-    assert "--context-window 65536" in expanded["server_command"]
+    # A chosen window sets the client; the printed `mtplx start` command never carries it: `mtplx start` and
+    # `mtplx quickstart` take no window flag (`mtplx serve` does), so it would stop with "unrecognized arguments".
+    assert "--context-window" not in expanded["server_command"]
     assert "--max-response-tokens 32768" in expanded["server_command"]
 
 
@@ -6404,7 +6466,8 @@ def test_integrate_openwebui_json(capsys):
     assert "--no-stats-footer" in payload["server_command"]
 
 
-def test_integrate_claude_code_json_uses_anthropic_root_and_auth_token(capsys):
+def test_integrate_claude_code_json_uses_anthropic_root_and_auth_token(capsys, monkeypatch):
+    monkeypatch.delenv("MTPLX_API_KEY", raising=False)
     code = main(["integrate", "claude-code", "--port", "18012", "--json"])
 
     payload = json.loads(capsys.readouterr().out)
@@ -6413,8 +6476,11 @@ def test_integrate_claude_code_json_uses_anthropic_root_and_auth_token(capsys):
     assert payload["integration"] == "claude-code"
     assert payload["base_url"] == "http://127.0.0.1:18012"
     assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:18012"
-    assert env["ANTHROPIC_AUTH_TOKEN"] == "$MTPLX_API_KEY"
-    assert env["ANTHROPIC_API_KEY"] == ""
+    # Never empty: with only a base URL, Claude Code keeps the claude.ai login
+    # and sends it to this server. Unset MTPLX_API_KEY means the local key.
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "mtplx-local"
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" in payload["unset_environment"]
     assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == payload["model_id"]
     assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == payload["model_id"]
     assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == payload["model_id"]
@@ -8075,33 +8141,33 @@ def test_quickstart_pi_passes_launch_command_to_server(monkeypatch):
     assert command == "pi --model mtplx/example"
 
 
-def test_launch_pi_in_terminal_does_not_false_positive_on_server_command(monkeypatch):
-    from mtplx import pi
+def test_launch_pi_in_terminal_does_not_false_positive_on_server_command(
+    monkeypatch, tmp_path
+):
+    from mtplx import client_opening, pi
 
     calls = {}
-    monkeypatch.setattr(pi.sys, "platform", "darwin")
+    monkeypatch.setattr(client_opening.sys, "platform", "darwin")
+    monkeypatch.setattr(client_opening, "installed_terminals", lambda search_dirs=None: [])
 
-    def fake_popen(cmd, stdout=None, stderr=None):
+    def fake_run(cmd, **_kwargs):
         calls["cmd"] = cmd
-        calls["stdout"] = stdout
-        calls["stderr"] = stderr
+        return subprocess.CompletedProcess(cmd, 0, "", "")
 
-        class Proc:
-            pass
-
-        return Proc()
-
-    monkeypatch.setattr(pi.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(client_opening.subprocess, "run", fake_run)
 
     result = pi.launch_pi_in_terminal(
         "pi --model mtplx/mtplx-qwen36-27b-optimized-speed",
         model_ref="mtplx/mtplx-qwen36-27b-optimized-speed",
+        workspace=str(tmp_path),
     )
 
     assert result["status"] == "launched"
-    assert calls["cmd"][0] == "osascript"
-    script = calls["cmd"][2]
-    assert "do script" in script
+    assert result["terminal"] == "Terminal"
+    assert calls["cmd"][:3] == ["/usr/bin/open", "-a", "Terminal"]
+    script = Path(calls["cmd"][3]).read_text()
+    assert script.startswith("#!/bin/zsh\n")
+    assert f"cd {tmp_path} || exit 1" in script
     assert "pi --model mtplx/mtplx-qwen36-27b-optimized-speed" in script
 
 
@@ -9380,6 +9446,29 @@ def test_model_contract_depth_clamps_declared_default_to_ceiling():
     assert public._model_contract_depth(inspection, profile=sustained, fallback=3) == 2
 
 
+def test_inkling_launch_depth_ignores_a_stamped_depth(tmp_path):
+    """Inkling's engine prices the draft depth every round, and only at the
+    family's launch depth (server ``_inkling_auto_depth``): a pack stamped by
+    ``forge verify --stamp`` (verify's fastest depth, the deepest verified)
+    must not pin it. Every other family keeps its measured default."""
+    stamp = {"mtp_depth_default": 2, "mtp_depth_max": 2}
+    (tmp_path / "mtplx_runtime.json").write_text(json.dumps(stamp))
+    sustained = public.get_profile("sustained")
+    inkling = {
+        "model_dir": str(tmp_path),
+        "recommended_backend": "inkling2_loop",
+        "mtp_arch": "inkling2-loop",
+        "compatibility": {"runtime_contract": dict(stamp)},
+    }
+    assert public.descriptor_from_inspection(inkling).backend_id == "inkling2_loop"
+    assert public._model_contract_depth(inkling, profile=sustained, fallback=3) == 3
+    other = {
+        "model_dir": str(tmp_path),
+        "compatibility": {"runtime_contract": dict(stamp, public_model_id="some-third-party-artifact")},
+    }
+    assert public._model_contract_depth(other, profile=sustained, fallback=3) == 2
+
+
 def test_qwen36_35b_a3b_defaults_to_measured_best_depth():
     """A3B measured best is D2 (M5 Max tune 145.0 tok/s, 1.54x; the reporter's
     sweep has D2 within 2% of best) while the D3 ceiling loses 9-22%."""
@@ -9843,7 +9932,7 @@ def test_already_running_server_window_reaches_pi_and_opencode(
         public, "_quickstart_launch_pi_now", lambda **_kwargs: launched.append("pi")
     )
     monkeypatch.setattr(
-        public, "_quickstart_launch_opencode_now", lambda: launched.append("opencode")
+        public, "_quickstart_launch_opencode_now", lambda **_kwargs: launched.append("opencode")
     )
 
     def start(client):
@@ -9955,7 +10044,7 @@ def test_attach_to_a_server_running_another_model_sets_the_client_up_for_it(
         lambda **kwargs: launched.append(("pi", kwargs["model_id"])),
     )
     monkeypatch.setattr(
-        public, "_quickstart_launch_opencode_now", lambda: launched.append(("opencode",))
+        public, "_quickstart_launch_opencode_now", lambda **_kwargs: launched.append(("opencode",))
     )
 
     def start(client, **flags):
@@ -10335,3 +10424,55 @@ def test_hermes_sync_reads_root_config_only_when_inheriting(monkeypatch, tmp_pat
             public._sync_hermes_profile(**args)
     finally:
         root_config.chmod(0o600)
+
+
+def test_start_dry_run_says_the_server_sets_the_window(monkeypatch, tmp_path, capsys):
+    """The preview tells a user what the start does: the server sets the window when it starts (the model's,
+    as far as this Mac's memory allows) and the client is set from it, never the client's starting value."""
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+    monkeypatch.setenv("MTPLX_OPENCODE_CONFIG", str(tmp_path / "opencode.json"))
+    monkeypatch.setenv("MTPLX_OPENCODE_DESKTOP_SETTINGS_STORE", str(tmp_path / "default.dat"))
+    code = main(["start", "opencode", "--dry-run", "--json", "--model", "models/example", "--yes"])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    window = payload["window"]
+    assert window["set_by"] == "server_at_start" and window["tokens"] is None
+    assert window["client_set_from_server"] is True
+    assert f"up to {window['model_maximum']:,} tokens" in window["note"]
+    assert "--context-window" not in payload["opencode"]["server_command"]
+    code = main(["start", "opencode", "--dry-run", "--model", "models/example", "--yes"])
+    assert code == 0
+    assert "window: The server sets the window when it starts" in capsys.readouterr().out
+
+
+
+def test_start_preview_of_a_pack_named_by_its_repository(monkeypatch, tmp_path):
+    """The dry run previews what the start serves when the model is named by its Hugging Face id: the pack on
+    disk when the start would find it, and, for an Inkling 2 Mini pack not downloaded yet, its family's serve
+    defaults (native tools, the tokenizer's template, the model's sampler), never the Qwen lane."""
+    seen = {}
+
+    def gate(path, **kw):
+        seen["gated"] = path
+        return {"model_dir": path, "recommended_backend": "inkling2_loop", "mtp_arch": "inkling2-loop"}, None
+
+    monkeypatch.setattr(public, "_model_gate", gate)
+    pack_dir = tmp_path / "Youssofal--Inkling-2-Mini-MTPLX-Bare-Speed"
+    pack_dir.mkdir()
+    monkeypatch.setattr(public, "_resolve_runtime_model_path", lambda model, **kw: (str(pack_dir), None))
+    args = SimpleNamespace(model="Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed", tool_prompt_mode="hybrid",
+                           chat_template_profile="local_qwen36", temperature=0.6, top_p=0.95, top_k=20,
+                           depth=3, _cli_flags=set(), cache_dir=None)
+    inspection = public._quickstart_apply_local_model_defaults(args, model=args.model)
+    assert seen["gated"] == str(pack_dir) and inspection["model_dir"] == str(pack_dir)
+    assert (args.tool_prompt_mode, args.chat_template_profile) == ("native", "tokenizer")
+    monkeypatch.setattr(public, "_resolve_runtime_model_path",
+                        lambda model, **kw: ("", {"error": "not available locally"}))
+    args = SimpleNamespace(model="Youssofal/Inkling-2-Mini-MTPLX-Bare-Speed", tool_prompt_mode="hybrid",
+                           chat_template_profile="local_qwen36", temperature=0.6, top_p=0.95, top_k=20,
+                           depth=3, _cli_flags=set(), cache_dir=None)
+    inspection = public._quickstart_apply_local_model_defaults(args, model=args.model)
+    assert inspection["recommended_backend"] == "inkling2_loop"
+    assert (args.tool_prompt_mode, args.chat_template_profile, args.temperature) == ("native", "tokenizer", 1.0)
+    other = SimpleNamespace(model="Youssofal/Some-Other-Model", _cli_flags=set(), cache_dir=None)
+    assert public._quickstart_apply_local_model_defaults(other, model=other.model) is None

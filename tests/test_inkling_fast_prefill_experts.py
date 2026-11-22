@@ -1,0 +1,229 @@
+"""The sorted prompt expert route (expert_fusion.routed_sorted) against RC6's stock body.
+
+Prompt chunks of more than 32 rows run the stock body: its two quantized gathers on pairs
+sorted by expert, with MLX ops around them. The sorted route keeps those two gathers and the
+sort exactly and replaces the glue with the fused input, route, SwiGLU and combine kernels; it
+must give the stock body's bits at every chunk size, in both expert formats and both route
+variants, and `experts_forward` must take it for 33 to 4,096 rows only.
+"""
+
+import pytest
+
+mx = pytest.importorskip("mlx.core")
+
+if not mx.metal.is_available():  # pragma: no cover - CPU-only machines
+    pytest.skip("the fused expert kernels need a Metal GPU", allow_module_level=True)
+
+from mtplx.models.inkling import expert_fusion as EF  # noqa: E402
+from mtplx.models.inkling import model as M  # noqa: E402
+
+EXPERTS = 16
+
+
+def synthetic_block(mode, seed=3):
+    """Real shapes, 16 experts carrying every route (the bias keeps the rest out)."""
+    fp4 = mode == "nvfp4"
+    keys = iter(mx.random.split(mx.random.key(seed), 16))
+    rnd = lambda shape, lo, hi: mx.random.randint(lo, hi, shape, key=next(keys)).astype(mx.uint8)
+    router = (mx.random.normal((128, 2304), key=next(keys)) * 0.02).astype(mx.bfloat16)
+    bias = mx.concatenate([mx.random.normal((EXPERTS,), key=next(keys)) * 0.01,
+                           mx.full((128 - EXPERTS,), -100.0)]).astype(mx.float32)
+    w = {"mlp.gate.weight": router, "mlp.gate.bias": bias}
+    for stem, (out, k) in (("w13", (2304, 2304)), ("w2", (2304, 1152))):
+        name = f"mlp.experts.{stem}_weight"
+        if fp4:
+            w[name] = rnd((EXPERTS, out, k // 2), 0, 256)
+            w[name + "_scale"] = (rnd((EXPERTS, out, k // 16), 3, 9) * 8 + rnd((EXPERTS, out, k // 16), 0, 8)).astype(mx.uint8)
+            w[name + "_amax"] = mx.random.uniform(1, 10, (EXPERTS,), key=next(keys))
+            w[name + "_outer_scale_denominator"] = mx.array([2688.0])
+        else:
+            w[name] = rnd((EXPERTS, out, k), 0, 256)
+            w[name + "_scale"] = rnd((EXPERTS, out, k // 32), 118, 126)
+    cfg = {"num_experts_per_tok": 8, "route_scale": 8.0, "mlp_gate_softcap": 4.0, "mlp_up_softcap": 25.0}
+    return M.Experts(w, cfg, mode)
+
+
+def hidden_rows(rows, seed):
+    x = mx.random.normal((1, rows, 2304), key=mx.random.key(seed)) * 3.0
+    return M.norm(x, (1 + 0.1 * mx.random.normal((2304,), key=mx.random.key(seed + 1))).astype(mx.bfloat16),
+                  1e-6).astype(mx.bfloat16)
+
+
+def same(a, b):
+    return a.shape == b.shape and bool(mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item())
+
+
+@pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("variant", ["fused", "scores"])
+@pytest.mark.parametrize("rows", [33, 512, 2100])
+def test_sorted_prompt_route_equals_the_stock_body(mode, variant, rows):
+    block = synthetic_block(mode)
+    hidden = hidden_rows(rows, seed=rows)
+    flat = hidden.reshape(-1, 2304)
+    assert EF.prompt_unserved(block, flat) is None
+    want = block.stock(hidden).reshape(rows, 2304)
+    got = EF.routed_sorted(block, flat, M.linear, variant=variant)
+    mx.eval(want, got)
+    assert same(got, want), (mode, variant, rows)
+
+
+def test_prompt_admission(monkeypatch):
+    block = synthetic_block("nvfp4")
+    small, wide, huge = (mx.zeros((n, 2304), mx.bfloat16) for n in (32, 512, EF.PROMPT_ROWS + 1))
+    assert EF.prompt_unserved(block, small) == "prompt_rows"
+    assert EF.prompt_unserved(block, wide) is None
+    assert EF.prompt_unserved(block, huge) == "prompt_rows"
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_EXPERTS", "stock")
+    assert EF.prompt_unserved(block, wide) == "disabled"
+
+
+def test_experts_forward_takes_the_prompt_route_and_keeps_stock_bits(monkeypatch):
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_EXPERTS", raising=False)
+    block = synthetic_block("nvfp4", seed=9)
+    hidden = hidden_rows(512, seed=21)
+    state = EF._state(block)
+    before = sum(v for k, v in state.counts.items() if ".prompt_fused." in k)
+    got = block(hidden)
+    want = block.stock(hidden)
+    mx.eval(got, want)
+    assert same(got, want)
+    assert sum(v for k, v in state.counts.items() if ".prompt_fused." in k) == before + 1
+    # more than PROMPT_ROWS rows keep the stock body, counted
+    assert EF.prompt_unserved(block, mx.zeros((EF.PROMPT_ROWS + 1, 2304), mx.bfloat16)) == "prompt_rows"
+
+
+def close(a, b):
+    """The fast route's difference from the stock body, relative to the stock body's size."""
+    a, b = a.astype(mx.float32), b.astype(mx.float32)
+    return float((mx.sum(mx.abs(a - b)) / mx.sum(mx.abs(b))).item())
+
+
+@pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("rows", [33, 2100])
+def test_the_fast_prompt_route_changes_only_the_mxfp8_gate_up_order(mode, rows):
+    # MTPLX_INKLING_PROMPT_FAST=experts: an MXFP8 block multiplied on MLX's tile kernel (from 4 pairs an
+    # expert) takes the sorted product for its gate-up, whose sums are MLX's own sorted product's on the
+    # same inputs; against the stock body (the one-row product's order) it is held to a bound. NVFP4
+    # blocks, and MXFP8 blocks below 4 pairs an expert, keep the stock body's bits.
+    block = synthetic_block(mode, seed=5)
+    hidden = hidden_rows(rows, seed=rows + 7)
+    flat = hidden.reshape(-1, 2304)
+    want = block.stock(hidden).reshape(rows, 2304)
+    got = EF.routed_sorted(block, flat, M.linear, fast=True)
+    exact = EF.routed_sorted(block, flat, M.linear)
+    mx.eval(want, got, exact)
+    assert same(exact, want)
+    tiled = rows * block.count >= EF.SORTED_TILE_PAIRS * block.router.shape[0]
+    if mode == "nvfp4" or not tiled:
+        assert same(got, want)
+        return
+    assert close(got, want) < 4e-3, (mode, rows, close(got, want))
+    # the gate-up's sums are MLX's sorted product's on the same (exactly rounded) inputs
+    fast_trace, exact_trace = {}, {}
+    EF.routed_sorted(block, flat, M.linear, trace=fast_trace, fast=True)
+    EF.routed_sorted(block, flat, M.linear, trace=exact_trace)
+    grouped = mx.gather_qmm(
+        exact_trace["values13"][fast_trace["sorted_rows"]], block.gate_up.codes, scales=block.gate_up.scales,
+        rhs_indices=fast_trace["sorted_experts"], group_size=32, bits=8, mode="mxfp8", sorted_indices=True)
+    assert bool(mx.array_equal(fast_trace["values13"].astype(mx.float32), exact_trace["values13"]).item())
+    raw = fast_trace["raw13"]
+    if raw.dtype == mx.float32:
+        assert bool(mx.array_equal(raw.view(mx.uint32), grouped.reshape(raw.shape).view(mx.uint32)).item())
+    else:  # MLX's own products (no tensor units): its bfloat16 output is the float32 sum rounded once
+        assert same(raw, grouped.astype(mx.bfloat16).reshape(raw.shape))
+
+
+def test_experts_forward_takes_the_fast_route_by_default_and_when_named_not_when_left_out(monkeypatch):
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_EXPERTS", raising=False)
+    block = synthetic_block("mxfp8", seed=11)
+    hidden = hidden_rows(512, seed=31)
+    state = EF._state(block)
+    fast = lambda: sum(v for k, v in state.counts.items() if ".prompt_fast." in k)
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FAST", raising=False)  # unset: on (class accepted 21 November)
+    monkeypatch.delenv("MTPLX_FORCE_GPU_FAMILY_FALLBACK", raising=False)
+    import mtplx.nax_detect as nax
+
+    monkeypatch.setattr(nax, "nax_available", lambda: True)  # unset, it serves the Macs with the tensor units
+    before = fast()
+    got = block(hidden)
+    want = block.stock(hidden)
+    mx.eval(got, want)
+    assert fast() == before + 1
+    assert close(got, want) < 4e-3
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FAST", "chunk")  # the chunk part alone leaves the experts
+    mx.eval(block(hidden))
+    assert fast() == before + 1
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FAST", "off")
+    mx.eval(block(hidden))
+    assert fast() == before + 1
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FAST", "experts")
+    mx.eval(block(hidden))
+    assert fast() == before + 2
+
+
+@pytest.mark.parametrize("mode", ["nvfp4", "mxfp8"])
+@pytest.mark.parametrize("stream", ["bfloat16", "float16"])
+@pytest.mark.parametrize("units", ["absent", "declined"])
+def test_without_the_tensor_units_the_fast_route_takes_the_sorted_product(monkeypatch, mode, stream, units):
+    # Wherever MLX's products serve: M1 to M4 ("absent": this Mac told it has no tensor units, and our launches
+    # unavailable as they are there) and an M5 whose launches are declined ("declined": MTPLX_INKLING_PROMPT_KERNELS=mlx,
+    # or MLX headers it cannot read). Unset, an MXFP8 block's gate-up leaves the one-row panel for MLX's sorted product
+    # (bfloat16 operands on a bfloat16 stream, float32 on a float16 one: a bfloat16 product there would round every sum
+    # to bfloat16 before the float16 stream), counted, held to the class C bound against the stock body; an NVFP4 block
+    # keeps today's route and its bits exactly. The switch turned off restores today's route.
+    import mtplx.nax_detect as nax
+
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_EXPERTS", raising=False)
+    monkeypatch.delenv("MTPLX_INKLING_PROMPT_FAST", raising=False)
+    monkeypatch.setattr(nax, "nax_available", lambda: units == "declined")
+    monkeypatch.setattr(EF, "prompt_kernels", lambda: False)
+    block = synthetic_block(mode, seed=13)
+    hidden = hidden_rows(512, seed=41).astype(getattr(mx, stream))
+    state = EF._state(block)
+    # M1 to M4 count the route with the GPU family; an M5 counts it as the fast route it is.
+    taken = lambda: sum(v for k, v in state.counts.items()
+                        if ".prompt_fast." in k and k.endswith(".without_tensor_units") == (units == "absent"))
+    before = taken()
+    got = block(hidden)
+    want = block.stock(hidden)
+    mx.eval(got, want)
+    assert got.dtype == hidden.dtype
+    expect_fast = mode == "mxfp8"
+    assert taken() == before + int(expect_fast)
+    if expect_fast:
+        # The synthetic block's MXFP8 weights are far larger than a checkpoint's and overflow a float16 stream in the
+        # stock body itself: compare where both are finite, and let at most 0.1% of elements overflow differently.
+        finite = mx.isfinite(got.astype(mx.float32)) & mx.isfinite(want.astype(mx.float32))
+        assert float(mx.mean((~finite & mx.isfinite(want.astype(mx.float32))).astype(mx.float32)).item()) <= 1e-3
+        a32, b32 = (mx.where(finite, v.astype(mx.float32), 0.0) for v in (got, want))
+        assert close(a32, b32) < 4e-3, (mode, stream, close(a32, b32))
+        trace = {}
+        EF.routed_sorted(block, hidden.reshape(-1, 2304), M.linear, trace=trace, fast=True)
+        operand = mx.bfloat16 if stream == "bfloat16" else mx.float32
+        assert trace["values13"].dtype == operand and trace["values2"].dtype == operand
+    else:
+        assert same(got, want)
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_FAST", "off")
+    mx.eval(block(hidden))
+    assert taken() == before + int(expect_fast)
+
+
+
+def test_mlx_products_in_the_prompt_route_are_counted_in_the_request(monkeypatch):
+    # F1's F-3: where the sort and products are MLX's (no tensor units, or the switch), the prompt route says so
+    # in the request's attention receipt and /health, beside the expert block's own route counters.
+    from mtplx.models.inkling import attention as A
+
+    monkeypatch.setenv("MTPLX_INKLING_PROMPT_KERNELS", "mlx")
+    block = synthetic_block("nvfp4", seed=13)
+    flat = hidden_rows(512, seed=41).reshape(-1, 2304)
+    receipt = {"graph_selections": {}}
+    token = A._request.set((receipt, None))
+    try:
+        got = EF.routed_sorted(block, flat, M.linear)
+    finally:
+        A._request.reset(token)
+    want = block.stock(flat.reshape(1, 512, 2304)).reshape(512, 2304)
+    mx.eval(got, want)
+    assert same(got, want)
+    assert receipt["graph_selections"] == {"prompt_experts.products.mlx.disabled": 1}

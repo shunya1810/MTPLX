@@ -203,8 +203,11 @@ struct ModelPickStep: View {
         } else if row.choice == .curatedQwen38OptimizedSpeed
             || row.choice == .curatedQwen38BareSpeed
             || row.choice == .curatedQwen38OptimizedQuality
+            || row.choice == .curatedInklingBareSpeed
+            || row.choice == .curatedInklingOptimizedSpeed
+            || row.choice == .curatedInklingOptimizedQuality
         {
-            // Qwen 3.8 trio: legacy (M1/M2) Macs get the FP16 precision sibling.
+            // Qwen 3.8 and Inkling 2 Mini trios: legacy (M1/M2) Macs get the FP16 precision sibling.
             id = hardware?.tier == .legacyApple ? "\(row.modelID)-fp16" : row.modelID
         } else if row.choice == .curatedQwen35BSpeed {
             id = hardware?.tier == .legacyApple
@@ -845,6 +848,12 @@ struct RecommendedModelRow: Identifiable, Sendable {
             return .qwen27Quality
         case "gemma4-optimized-speed":
             return .gemma31
+        case "inkling2-mini-bare-speed", "inkling2-mini-bare-speed-fp16":
+            return .inklingBareSpeed
+        case "inkling2-mini-optimized-speed", "inkling2-mini-optimized-speed-fp16":
+            return .inklingOptimizedSpeed
+        case "inkling2-mini-optimized-quality", "inkling2-mini-optimized-quality-fp16":
+            return .inklingOptimizedQuality
         default:
             return nil
         }
@@ -987,11 +996,37 @@ struct RecommendedModelRow: Identifiable, Sendable {
         title: "Gemma 4 31B Optimized Speed",
         detailLocalizationKey: "High quality. Moderate speeds."
     )
+
+    // Inkling 2 Mini: the catalog's own detail keys, already in every language table.
+    static let inklingBareSpeed = RecommendedModelRow(
+        choice: .curatedInklingBareSpeed,
+        modelID: "inkling2-mini-bare-speed",
+        logo: .inkling,
+        title: "Inkling 2 Mini Bare Speed",
+        detailLocalizationKey: "Fastest Inkling 2 Mini: 4-bit attention and output, with vision and speculative decoding."
+    )
+
+    static let inklingOptimizedSpeed = RecommendedModelRow(
+        choice: .curatedInklingOptimizedSpeed,
+        modelID: "inkling2-mini-optimized-speed",
+        logo: .inkling,
+        title: "Inkling 2 Mini Optimized Speed",
+        detailLocalizationKey: "Closer to the original weights: 8-bit attention, with vision and speculative decoding."
+    )
+
+    static let inklingOptimizedQuality = RecommendedModelRow(
+        choice: .curatedInklingOptimizedQuality,
+        modelID: "inkling2-mini-optimized-quality",
+        logo: .inkling,
+        title: "Inkling 2 Mini Optimized Quality",
+        detailLocalizationKey: "Original expert and attention weights, with vision and speculative decoding."
+    )
 }
 
 enum ProviderLogoKind: Equatable, Sendable {
     case qwen
     case google
+    case inkling
     case huggingFace
     case localFolder
 }
@@ -1020,6 +1055,11 @@ private struct ProviderLogoMark: View {
             qwenMark
         case .google:
             googleMark
+        case .inkling:
+            // The middle 12 layers run three times a token: a loop, not a vendor logo.
+            Image(systemName: "infinity")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(selected ? Brand.bgOuter : Brand.typeBody)
         case .huggingFace:
             Image(systemName: "link")
                 .font(.system(size: 13, weight: .semibold))

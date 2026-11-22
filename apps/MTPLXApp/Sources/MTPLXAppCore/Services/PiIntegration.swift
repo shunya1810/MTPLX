@@ -129,9 +129,11 @@ public struct PiIntegration: Sendable {
             return staleHandoffResult(command: command)
         }
 
+        // The terminal the user picked for Pi (Settings, or `pi_opens_in`).
+        let opening = ClientOpenings.currentTerminal(.pi)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        process.arguments = ["-a", "Terminal", handoff.commandURL.path]
+        process.arguments = ["-a", opening.openApplication, handoff.commandURL.path]
         let stderr = Pipe()
         process.standardError = stderr
         // The backend store calls this from the main actor, so a wedged
@@ -210,7 +212,7 @@ public struct PiIntegration: Sendable {
             return PiLaunchResult(
                 action: .launched,
                 command: command,
-                detail: tr("opened Pi in Terminal"),
+                detail: tr("opened Pi in %@", opening.terminalName),
                 launchedProcessIDs: [lease.processID],
                 terminalHandoffLease: lease
             )
@@ -660,6 +662,10 @@ public struct PiIntegration: Sendable {
         vision: Bool,
         reasoningEnabled: Bool
     ) -> [String: JSONValue] {
+        let inkling = MTPLXModelOption.modelFamily(for: modelID) == "inkling2"
+        let levelMap: [String: JSONValue] = inkling
+            ? ["minimal": .string("minimal"), "xhigh": .string("xhigh"), "max": .string("max")]
+            : ["minimal": .null, "xhigh": .string("xhigh")]
         // Mirrors the CLI provider block (mtplx/pi.py build_pi_provider_config):
         // the Qwen thinking format makes Pi 0.84.x serialize exactly the
         // request fields the MTPLX server accepts — top-level enable_thinking
@@ -689,10 +695,7 @@ public struct PiIntegration: Sendable {
                     // MTPLX vocabulary is low/medium/high/xhigh. null hides
                     // Pi's duplicate "minimal" tier; "xhigh" must be mapped
                     // to appear in Pi's picker at all; "max" stays hidden.
-                    "thinkingLevelMap": .object([
-                        "minimal": .null,
-                        "xhigh": .string("xhigh"),
-                    ]),
+                    "thinkingLevelMap": .object(levelMap),
                     "input": .array(vision ? [.string("text"), .string("image")] : [.string("text")]),
                     "contextWindow": .number(Double(contextWindow)),
                     // Pi silently substitutes a 16,384 output ceiling for

@@ -503,6 +503,15 @@ public struct OpenCodeIntegration: Sendable {
            ].contains(option.id) {
             return "mtplx-\(option.id)"
         }
+        // Inkling 2 Mini: every folder of an official pack (the repository's name, a download's
+        // Youssofal--<repo>, the folder the packs were built under) serves one id, the pack's first
+        // alias (engine twin: default_models._public_model_id_from_name over _INKLING_CATALOG_IDS).
+        // An exact catalog match, so a derivative folder keeps its own sanitized id.
+        if let option = MTPLXModelOption.option(matching: model),
+           option.id.hasPrefix("inkling2-mini-"),
+           let servedID = option.aliases.first {
+            return servedID
+        }
         let lower = model.lowercased()
         if lower.contains("gemma4") || lower.contains("gemma-4") {
             return "gemma4-mtplx-optimized-speed"
@@ -646,6 +655,9 @@ public struct OpenCodeIntegration: Sendable {
     /// family effort dial.
     public static func reasoningEffortLevels(forModelID modelID: String) -> [String]? {
         let lower = modelID.lowercased()
+        if MTPLXModelOption.modelFamily(for: modelID) == "inkling2" {
+            return ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        }
         if MTPLXModelOption.isBonsai2Model(modelID) {
             return ["xhigh", "medium"]
         }
@@ -672,6 +684,9 @@ public struct OpenCodeIntegration: Sendable {
 
     public static func reasoningEffort(forModelID modelID: String) -> String? {
         let lower = modelID.lowercased()
+        if MTPLXModelOption.modelFamily(for: modelID) == "inkling2" {
+            return "high"
+        }
         if lower.contains("flash-next") || lower.contains("flash_next") || lower.contains("qwen4") {
             // Agent-lane default is medium (engine codec default_agent_effort):
             // the 2026-08-28 wall-clock A/B on the identical multifile coding
@@ -1266,6 +1281,56 @@ public struct OpenCodeIntegration: Sendable {
                 )
             }
         }
+    }
+
+    /// OpenCode's terminal UI on the MTPLX model, in the terminal picked for
+    /// OpenCode (Settings, or `opencode_opens_in`), as `mtplx start opencode`
+    /// opens it. It reads the config `sync` wrote, like the Desktop app.
+    /// The window is the user's: Stop does not close it.
+    @MainActor
+    public func launchInTerminal(
+        configuration: MTPLXAppConfiguration,
+        handoffDirectory: URL = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".mtplx/handoffs", isDirectory: true)
+    ) async -> OpenCodeDesktopResult {
+        let opening = ClientOpenings.currentTerminal(.openCode)
+        func result(_ action: OpenCodeDesktopAction, _ detail: String) -> OpenCodeDesktopResult {
+            OpenCodeDesktopResult(
+                action: action, wasRunning: false, didTerminateExistingInstance: false,
+                didOpen: action == .opened, detail: detail
+            )
+        }
+        let quote = AgentCLIIntegration.shellQuote
+        // The provider `sync` writes (`providers["mtplx"]`).
+        let reference = "mtplx/\(Self.modelID(for: configuration.model))"
+        let script = [
+            "#!/bin/zsh",
+            "cd \(quote(PiIntegration.resolvedWorkspacePath(configuration: configuration))) || exit 1",
+            "command -v opencode >/dev/null 2>&1 || { print -r -- "
+                + quote("OpenCode for the terminal is not installed: npm install -g opencode-ai")
+                + "; exit 127; }",
+            "exec opencode --model \(quote(reference))",
+        ].joined(separator: "\n") + "\n"
+        let scriptURL = handoffDirectory
+            .appendingPathComponent("open-opencode-\(UUID().uuidString.lowercased()).command")
+        do {
+            try MTPLXTerminalHandoffLease.writeSecureCommandScript(script, to: scriptURL)
+        } catch {
+            return result(.unavailable, tr("could not open OpenCode automatically: %@", String(describing: error)))
+        }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-a", opening.openApplication, scriptURL.path]
+        let watchdog = SubprocessWatchdog(process)
+        do {
+            try process.run()
+        } catch {
+            return result(.unavailable, tr("could not open OpenCode automatically: %@", String(describing: error)))
+        }
+        guard watchdog.wait(for: process, timeout: 30), process.terminationStatus == 0 else {
+            return result(.unavailable, tr("could not open OpenCode automatically: %@", "open exited \(process.terminationStatus)"))
+        }
+        return result(.opened, tr("opened OpenCode in %@", opening.terminalName))
     }
     #endif
 }
