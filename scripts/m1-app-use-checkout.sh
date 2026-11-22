@@ -14,7 +14,9 @@ set -euo pipefail
 repo="${0:A:h:h}"
 label="io.github.shunya1810.mtplx-m1-checkout"
 plist="$HOME/Library/LaunchAgents/$label.plist"
-wrapper="$repo/bin/mtplx"
+# MTPLX_M1_APP_WRAPPER: another engine wrapper (scripts/install-m1.sh --auto-update writes one that
+# follows each release); default this checkout's bin/mtplx.
+wrapper="${MTPLX_M1_APP_WRAPPER:-$repo/bin/mtplx}"
 
 case "${1:-status}" in
   install)

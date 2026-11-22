@@ -11,7 +11,7 @@ This page shows how to start this branch's server locally and use it.
 - **Server only**: start the server from the command line and use its own chat page or the OpenAI-compatible API (see "Server only")
 
 Both use the Python of the app's runtime (`~/Library/Application Support/MTPLX/runtime-venv`) and load `mtplx` from this checkout.
-Opening the app normally still runs the upstream release bundled with the app.
+`scripts/install-m1.sh --app` (add `--auto-update` to follow each release) makes the app run this checkout however it is opened; without it the app runs its bundled engine.
 
 ## Requirements
 
@@ -40,6 +40,8 @@ It creates `.build-venv` from the app runtime's Python, installs `mlx` (the runt
 Without the extensions the server still runs; those features fall back to the GPU path (slower prefill, serial draft).
 
 ## Run it in the app
+
+The simplest way is `scripts/install-m1.sh --app` (or `scripts/m1-app-use-checkout.sh install`): it sets the two variables below for every login. The rest of this section shows what happens underneath.
 
 Given `MTPLX_APP_ALLOW_SOURCE_WRAPPER=1` and `MTPLX_APP_SOURCE_WRAPPER_PATH=<checkout>/bin/mtplx`, the app starts its engine through that wrapper ahead of its own runtime (`apps/MTPLXApp/Sources/MTPLXAppCore/Services/MTPLXCommandBuilder.swift`).
 `bin/mtplx` runs this checkout's `mtplx` with the Python named by `MTPLX_RUNTIME_VENV_PY` in `~/Library/Application Support/MTPLX/runtime.env`.
@@ -78,13 +80,12 @@ Notes:
 Quit the MTPLX app if it is running (an engine uses the GPU and about 20 GB of memory; two cannot run side by side).
 
 ```bash
-PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli serve \
-  --model "$HOME/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed-FP16" \
+bin/mtplx-m1 serve --model Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed-FP16 \
   --profile turbo --depth 3 --host 127.0.0.1 --port 8000 \
   --context-window 262144 --no-auth --yes
 ```
 
-- `PYTHONPATH="$PWD"` makes the app's runtime Python load `mtplx` from this checkout
+- `bin/mtplx-m1` runs this checkout's `mtplx` on the app runtime's Python; `--model` takes a folder name in `~/.mtplx/models` or a path
 - The server is ready when it prints `MTPLX is ready.` (the model loads in ten seconds to a minute)
 - Stop it with Ctrl-C
 
@@ -100,19 +101,18 @@ Main options:
 
 ## Qwen3.8-Flash-Next (Unsloth UD-Q2_0)
 
-Qwen3.8-Flash-Next (125B total, 6B active, 48 layers of MoE with a 51B n-gram embedding table) fits a 64 GB M1 Mac as Unsloth's UD-Q2_0 GGUF. This fork reads that GGUF's experts and n-gram table in place and converts the rest into a model folder. It is a server-only model: the app's model screen does not list it.
+Qwen3.8-Flash-Next (125B total, 6B active, 48 layers of MoE with a 51B n-gram embedding table) fits a 64 GB M1 Mac as Unsloth's UD-Q2_0 GGUF. This fork reads that GGUF's experts and n-gram table in place and converts the rest into a model folder. The app's model screen does not offer it.
 
 Needs: a 64 GB Mac, about 78 GB of free disk (70.5 GB GGUF + 6 GB converted folder + 1.7 GB MTP head), the native extensions above. Setup (download with resume, then a few minutes of conversion on the CPU):
 
 ```bash
-PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" scripts/setup_flashnext_unsloth.py
+bin/mtplx-m1 get flash-next
 ```
 
-It writes `~/models/Qwen3.8-Flash-Next-UD-Q2_0-GGUF` (keep it: the model folder reads the experts and the n-gram table from it) and `~/models/Qwen3.8-Flash-Next-UD-Q2_0-MTPLX`; `--models-dir` puts both elsewhere. Then quit other memory-heavy apps and serve:
+It writes the GGUF to `~/models/Qwen3.8-Flash-Next-UD-Q2_0-GGUF` (keep it: the model folder reads the experts and the n-gram table from it) and the model folder to `~/.mtplx/models/Qwen3.8-Flash-Next-UD-Q2_0-MTPLX`, so the app's model list shows it (serving it from the app has not been tried); `--models-dir` moves the GGUF. Then quit other memory-heavy apps and serve:
 
 ```bash
-PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli serve \
-  --model "$HOME/models/Qwen3.8-Flash-Next-UD-Q2_0-MTPLX" \
+bin/mtplx-m1 serve --model Qwen3.8-Flash-Next-UD-Q2_0-MTPLX \
   --profile turbo --host 127.0.0.1 --port 8000 --no-auth --yes
 ```
 
@@ -129,17 +129,13 @@ Inkling-2-Mini (MoE, 8 of 128 experts, 12 of its 24 layers looped three times) r
 Requirements: a Mac with 32 GB or more (measured only on 64 GB), about 20 GB of free disk, and the native extensions above. Forging it into `~/.mtplx/models` also lists it in the app's model list (no conversion, a few minutes; the files are hard-linked to the download, so on the same disk it takes no extra space).
 
 ```bash
-PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli forge build \
-  --repo thinkingmachines/Inkling-2-Mini --out "$HOME/.mtplx/forge-runs" --run-id inkling2 \
-  --recipe '{"bodyBits":4,"bodyDtype":"auto","bodyGroupSize":64,"bodyMode":"affine","mtpPolicy":"keep_bf16"}' \
-  --branded-name thinkingmachines-Inkling-2-Mini-MTPLX --model-root "$HOME/.mtplx/models"
+bin/mtplx-m1 get inkling2   # = mtplx forge build --repo thinkingmachines/Inkling-2-Mini ... into ~/.mtplx/models
 ```
 
 To serve it without the app, point `--model` at the forged (or downloaded) folder:
 
 ```bash
-PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli serve \
-  --model "$HOME/.mtplx/models/thinkingmachines-Inkling-2-Mini-MTPLX" --host 127.0.0.1 --port 8000 --no-auth --yes
+bin/mtplx-m1 serve --model thinkingmachines-Inkling-2-Mini-MTPLX --host 127.0.0.1 --port 8000 --no-auth --yes
 ```
 
 - Measured on an M1 Max 64 GB (v2.12.3-m1.19, server, temperature 0): prefill 496 tok/s at 2K, 495–516 at 16K, 469 at 30K; decode 49 / 45 / 42 tok/s.

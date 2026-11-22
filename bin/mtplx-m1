@@ -1,0 +1,70 @@
+#!/bin/zsh
+# mtplx-m1: the command of MTPLX for M1 Macs (this fork), on the MTPLX app's runtime.
+#
+#   mtplx-m1 serve --model NAME|PATH [options]   start the server; NAME is a folder in ~/.mtplx/models
+#   mtplx-m1 models                              list the folders in ~/.mtplx/models
+#   mtplx-m1 get inkling2                        Thinking Machines' Inkling-2-Mini (about 20 GB) into ~/.mtplx/models
+#   mtplx-m1 get flash-next                      Qwen3.8-Flash-Next, Unsloth UD-Q2_0 (70.5 GB download)
+#   mtplx-m1 update                              move this checkout to the latest release, rebuild what changed
+#   mtplx-m1 <other mtplx command>               passed to mtplx (for example `mtplx-m1 serve --help`)
+#
+# Models the app downloads land in ~/.mtplx/models and appear in the app; the two above are fetched
+# here because the app's model screen does not offer them.
+setopt err_exit no_unset
+repo="${0:A:h:h}"
+models="$HOME/.mtplx/models"
+export MTPLX_RUNTIME_VENV_PY="${MTPLX_RUNTIME_VENV_PY:-$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python}"
+# Run this checkout, never a runtime source copy the app may keep under ~/Library/Caches/MTPLX.
+export MTPLX_RUNTIME_SOURCE_SHADOW="${MTPLX_RUNTIME_SOURCE_SHADOW:-$repo/.no-runtime-shadow}"
+if [[ ! -x "$MTPLX_RUNTIME_VENV_PY" ]]; then
+  print -u2 "The MTPLX app's runtime was not found. Install the MTPLX app (https://github.com/youssofal/MTPLX) and open it once."
+  exit 1
+fi
+
+case "${1:-}" in
+  serve)
+    shift
+    args=()
+    while (( $# )); do
+      case "$1" in
+        --model)
+          (( $# >= 2 )) || { print -u2 "--model needs a value"; exit 2; }
+          m="$2"; [[ ! -e "$m" && -d "$models/$m" ]] && m="$models/$m"
+          args+=(--model "$m"); shift 2 ;;
+        --model=*)
+          m="${1#--model=}"; [[ ! -e "$m" && -d "$models/$m" ]] && m="$models/$m"
+          args+=(--model "$m"); shift ;;
+        *) args+=("$1"); shift ;;
+      esac
+    done
+    exec "$repo/bin/mtplx" serve "${args[@]}"
+    ;;
+  models)
+    [[ -d "$models" ]] && ls -1 "$models" || print "no models yet: download one in the MTPLX app, or use mtplx-m1 get"
+    ;;
+  get)
+    case "${2:-}" in
+      inkling2|inkling|Inkling-2-Mini)
+        exec "$repo/bin/mtplx" forge build --repo thinkingmachines/Inkling-2-Mini \
+          --out "$HOME/.mtplx/forge-runs" --run-id inkling2 \
+          --recipe '{"bodyBits":4,"bodyDtype":"auto","bodyGroupSize":64,"bodyMode":"affine","mtpPolicy":"keep_bf16"}' \
+          --branded-name thinkingmachines-Inkling-2-Mini-MTPLX --model-root "$models"
+        ;;
+      flash-next|flashnext)
+        # The GGUF (70.5 GB) stays in ~/models: the converted pack reads its experts and n-gram table from it.
+        exec env PYTHONPATH="$repo" "$MTPLX_RUNTIME_VENV_PY" "$repo/scripts/setup_flashnext_unsloth.py" \
+          --models-dir "$HOME/models" --out "$models/Qwen3.8-Flash-Next-UD-Q2_0-MTPLX" "${@:3}"
+        ;;
+      *) print -u2 "usage: mtplx-m1 get inkling2 | flash-next"; exit 2 ;;
+    esac
+    ;;
+  update)
+    exec "$repo/scripts/install-m1.sh" --update-only
+    ;;
+  ""|-h|--help)
+    sed -n '2,14p' "${0:A}"
+    ;;
+  *)
+    exec "$repo/bin/mtplx" "$@"
+    ;;
+esac

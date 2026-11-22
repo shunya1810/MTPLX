@@ -13,6 +13,44 @@ Like upstream, it decodes speculatively with the model's own MTP (multi-token pr
 - **You need the upstream MTPLX app.** This fork uses the app's Python runtime and the models you download in the app.
 - This is an unofficial fork, not affiliated with the MTPLX project. The changes were developed with AI assistance (Claude) and measured on one MacBook Pro M1 Max (64 GB). Upstream's README is in [README.upstream.md](README.upstream.md).
 
+## Quick start
+
+1. Install the [MTPLX app](https://github.com/youssofal/MTPLX) and open it once (this fork runs on the app's Python runtime).
+2. Install this fork and make the app use it (about two minutes; needs Xcode's Metal toolchain, see [Install by hand](#install-by-hand)):
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/shunya1810/MTPLX/m1max-longctx/scripts/install-m1.sh | zsh -s -- --app --auto-update
+   ```
+
+   It clones the latest release into `~/MTPLX-m1`, builds the M1 native extensions and switches the app's engine to this fork. With `--auto-update` the app's engine moves to each new release of this fork when it starts. Leave out `--app` to keep the app on its bundled engine and use the fork from the command line only.
+3. Quit and reopen the app, then pick a model ([Which model](#which-model-for-your-mac)).
+
+Without the app, start the server yourself (quit the app first: two engines do not fit in memory side by side) and open <http://127.0.0.1:8000>:
+
+```bash
+~/MTPLX-m1/bin/mtplx-m1 serve --model Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16
+```
+
+`--model` takes a folder name in `~/.mtplx/models` (where the app keeps its models) or a path. `~/MTPLX-m1/bin/mtplx-m1 models` lists them.
+
+- **Updates:** with `--auto-update` nothing to do. Otherwise run `~/MTPLX-m1/bin/mtplx-m1 update` and reopen the app.
+- **The app's update notices** are for the upstream app. Updating it is fine; it can bring a new MLX, and the next update of this fork (automatic with `--auto-update`) rebuilds the native extensions for it.
+- **Back to the app's own engine:** `~/MTPLX-m1/scripts/install-m1.sh --uninstall-app`, then reopen the app.
+
+## Which model for your Mac
+
+| Model | Type | Get it | Peak memory (M1 Max 64 GB) | Speed on the M1 Max |
+|---|---|---|---|---|
+| Qwen3.6-35B-A3B ([Youssofal Speed FP16](https://huggingface.co/Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16)) | MoE, 3B active, fastest | the app's model screen | 32.6 GB while loading, 21–24 GB answering | decode 128 tok/s (short prompts), prefill 945 tok/s (8K) |
+| Qwen3.8-27B ([Youssofal Speed FP16](https://huggingface.co/Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16)) | dense | the app's model screen | 25 GB (8K) to 36 GB (128K) | decode 32 tok/s, prefill 233 tok/s (8K) |
+| Qwen3.8-Flash-Next (Unsloth UD-Q2_0) | MoE, 64 GB Macs only | `~/MTPLX-m1/bin/mtplx-m1 get flash-next` (70.5 GB download) | 50–55 GB | decode 42–48 tok/s (2K, thinking on), a 32K prompt in about 83 s |
+| Inkling-2-Mini (Thinking Machines) | MoE, looped, no MTP | `~/MTPLX-m1/bin/mtplx-m1 get inkling2` (about 20 GB) | about 25 GB to 32K, 33.9 GB at 256K | decode 49 tok/s (2K), prefill about 500 tok/s (16K) |
+
+- Fine-tunes of these families (Ornith, Huihui, Swift and others) can be built with the app's Forge.
+- The app's model screen does not offer these two builds (Unsloth's Flash-Next GGUF and Inkling). `get` puts them in `~/.mtplx/models`, so they appear in the app's model list.
+- Measured on one M1 Max 64 GB; smaller Macs are untested. Leave room above the peak for the system and other apps.
+- Speeds and conditions: [Key numbers](#key-numbers) below, Flash-Next and Inkling in [USAGE](docs/m1max-longctx/USAGE.md).
+
 ## Key numbers
 
 This fork and upstream MTPLX 2.12.2 (the version it was based on until v2.12.2-m1.13), measured on the same Mac under the same conditions. Bold is this fork.
@@ -125,43 +163,24 @@ From bench 2 of [apple-silicon-llm-bench](https://github.com/shunya1810/apple-si
 - Models of other families launch on `sustained`, as upstream. Choosing `turbo` with `--profile turbo` or the profile setting in the app may enable the M1 changes for them; that combination is not measured.
 - [Re-measure the MTP depth](#re-measure-the-mtp-depth) finds each model's fastest depth.
 
-## Requirements
+## Install by hand
+
+What `scripts/install-m1.sh` does, step by step.
 
 - An M1-family Mac (measured: M1 Max 64 GB, macOS 26)
-- Xcode with the Metal toolchain (`xcrun metal` must work)
-- The [MTPLX app](https://github.com/youssofal/MTPLX), opened once. Download models from the app's model screen.
-
-## Install
+- The [MTPLX app](https://github.com/youssofal/MTPLX), opened once
+- Xcode with the Metal toolchain (`xcrun metal` must work; `xcodebuild -downloadComponent MetalToolchain` installs it)
 
 ```bash
-git clone --branch v2.12.3-m1.14 https://github.com/shunya1810/MTPLX.git MTPLX-m1
-cd MTPLX-m1
+git clone --branch m1max-longctx https://github.com/shunya1810/MTPLX.git ~/MTPLX-m1   # the branch is always the latest release
+cd ~/MTPLX-m1
 scripts/build-m1-native-extensions.sh   # about a minute; done when it prints "mfa_attn: ok", "ane_ffn: ok" and "qsa_kernels: ok"
+scripts/m1-app-use-checkout.sh install  # optional: the app runs this checkout (quit and reopen the app)
 ```
 
-The server also runs without the native extensions (the Neural Engine prefill and the M1 attention), with a slower prefill.
+The server also runs without the native extensions (the Neural Engine prefill and the M1 attention), with a slower prefill. To update, `git pull` (or `scripts/install-m1.sh`, which also rebuilds the extensions when needed) and reopen the app. `scripts/m1-app-use-checkout.sh uninstall` puts the app back on its bundled engine.
 
-### Use it from the app
-
-Switch the app's engine to this fork:
-
-```bash
-scripts/m1-app-use-checkout.sh install
-```
-
-Quit and reopen the app; it then runs this fork's engine, however it is opened (Dock, Finder and so on). The setting survives logging out. To go back, run `scripts/m1-app-use-checkout.sh uninstall` and reopen the app.
-
-### Run it as a server
-
-Quit the MTPLX app first (two engines do not fit in memory side by side), then start the server. Pass the folder of a model downloaded in the app to `--model`.
-
-```bash
-PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli serve \
-  --model "$HOME/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16" \
-  --context-window 262144 --paged-kv-quantization q8
-```
-
-The server listens on `http://127.0.0.1:8000`. Check that it answers:
+Check that a server answers:
 
 ```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions -H 'content-type: application/json' \
@@ -169,16 +188,6 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'content-type: application/
 ```
 
 More: [docs/m1max-longctx/USAGE.md](docs/m1max-longctx/USAGE.md).
-
-### Update to a new release
-
-```bash
-git fetch --tags
-git checkout <new tag>                  # for example v2.12.3-m1.14
-scripts/build-m1-native-extensions.sh   # needed only when the native extensions changed (the release notes say so)
-```
-
-If you use it from the app, reopen the app after updating.
 
 ## Use it with a coding agent
 
@@ -252,6 +261,7 @@ Each M1 default can be turned off with an environment variable; `MTPLX_M1_LONG_C
 - Measured on one M1 Max 64 GB. M1 Pro, M1 Ultra and other memory sizes run the same code but are untested.
 - The Neural Engine path uses Apple's private `AppleNeuralEngine.framework` and may stop working after a macOS update; prefill then falls back to the GPU.
 - The Neural Engine prefill computes in int8, so it is not bit-identical to the GPU prefill (on Qwen3.6-35B-A3B, 98.25% of next tokens agree over 24,576 positions). `MTPLX_ANE_PREFILL=0` / `MTPLX_ANE_PREFILL_MOE=0` keep prefill on the GPU.
+- The runtime reports Inkling-2-Mini to the app's Forge as runnable without MTP (`trunk-ar-fallback`), and the Forge may not build it; `mtplx-m1 get inkling2` builds it from the command line.
 - Thinking models sometimes reason for a very long time on hard agent tasks. Reasoning length is not capped by default; on requests that carry tools, `MTPLX_THINKING_BUDGET=<tokens>` caps it.
 - Some upstream tests assume upstream's defaults and fail with the M1 defaults on; most pass with `MTPLX_M1_LONG_CONTEXT=0`.
 

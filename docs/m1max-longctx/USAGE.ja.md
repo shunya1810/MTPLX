@@ -11,7 +11,7 @@
 - **サーバーだけを起動する**: コマンドでサーバーを起動し、サーバー自身のチャット画面か OpenAI 互換の API から使います（下の「サーバーだけを起動する」）
 
 どちらも、アプリの実行環境（`~/Library/Application Support/MTPLX/runtime-venv`）の Python を使い、このリポジトリの `mtplx` を読ませます。
-アプリを普通に開いたときは、これまでどおりアプリ同梱の upstream のリリース版で動きます。
+`scripts/install-m1.sh --app`（新しいリリースに追従するなら `--auto-update` も）を実行すると、アプリはどこから開いてもこのリポジトリで動きます。実行しなければ、アプリ同梱のエンジンで動きます。
 
 ## 用意するもの
 
@@ -40,6 +40,8 @@ scripts/build-m1-native-extensions.sh
 拡張がなくてもサーバーは動きます。その場合、これらの機能は GPU だけの処理に戻ります（prefill が遅くなり、draft は 1 段ずつになります）。
 
 ## アプリで動かす
+
+いちばん簡単なのは `scripts/install-m1.sh --app`（または `scripts/m1-app-use-checkout.sh install`）です。下の 2 つの環境変数を、ログインのたびに設定します。この節の残りは、その中で行っていることの説明です。
 
 アプリには、環境変数 `MTPLX_APP_ALLOW_SOURCE_WRAPPER=1` と `MTPLX_APP_SOURCE_WRAPPER_PATH=<リポジトリ>/bin/mtplx` を渡すと、アプリ専用の実行環境より優先してそのラッパーでエンジンを起動する仕組みがあります（`apps/MTPLXApp/Sources/MTPLXAppCore/Services/MTPLXCommandBuilder.swift`）。
 `bin/mtplx` は、`~/Library/Application Support/MTPLX/runtime.env` に書いた `MTPLX_RUNTIME_VENV_PY` の Python で、このリポジトリの `mtplx` を動かします。
@@ -79,13 +81,12 @@ ps eww -p "$(pgrep -f mtplx.server.openai | head -1)" -o command= | grep -o 'PYT
 MTPLX アプリが動いていれば終了します（エンジンは GPU とメモリを約 20 GB 使うため、2つ同時には動かせません）。
 
 ```bash
-PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli serve \
-  --model "$HOME/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed-FP16" \
+bin/mtplx-m1 serve --model Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed-FP16 \
   --profile turbo --depth 3 --host 127.0.0.1 --port 8000 \
   --context-window 262144 --no-auth --yes
 ```
 
-- `PYTHONPATH="$PWD"` で、アプリの実行環境の Python に、このリポジトリの `mtplx` を読ませます
+- `bin/mtplx-m1` は、アプリの実行環境の Python で、このリポジトリの `mtplx` を動かします。`--model` には `~/.mtplx/models` のフォルダ名か、パスを指定します
 - `MTPLX is ready.` と表示されたら使えます（モデルの読み込みに十数秒〜1分）
 - 止めるときは Ctrl-C
 
@@ -101,19 +102,18 @@ PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/pyth
 
 ## Qwen3.8-Flash-Next（Unsloth UD-Q2_0）
 
-Qwen3.8-Flash-Next（全体 125B、1 トークンあたり 6B を使う MoE、48 層、51B の n-gram 埋め込み表つき）は、Unsloth の UD-Q2_0 の GGUF なら 64 GB の M1 Mac に載ります。このフォークは、GGUF の expert と n-gram 表をその場で読み、残りをモデルのフォルダに変換します。アプリのモデル画面には出ないので、サーバーだけで使います。
+Qwen3.8-Flash-Next（全体 125B、1 トークンあたり 6B を使う MoE、48 層、51B の n-gram 埋め込み表つき）は、Unsloth の UD-Q2_0 の GGUF なら 64 GB の M1 Mac に載ります。このフォークは、GGUF の expert と n-gram 表をその場で読み、残りをモデルのフォルダに変換します。アプリのモデル画面からは入手できません。
 
 必要なもの: 64 GB の Mac、約 78 GB の空きディスク（GGUF 70.5 GB、変換後のフォルダ 6 GB、MTP ヘッド 1.7 GB）、上のネイティブ拡張。準備は次の 1 行です（途中で止まっても続きからダウンロードし、そのあと CPU で数分かけて変換します）。
 
 ```bash
-PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" scripts/setup_flashnext_unsloth.py
+bin/mtplx-m1 get flash-next
 ```
 
-`~/models/Qwen3.8-Flash-Next-UD-Q2_0-GGUF` と `~/models/Qwen3.8-Flash-Next-UD-Q2_0-MTPLX` ができます。モデルのフォルダは expert と n-gram 表を GGUF から読むので、GGUF は消さないでください。置き場所は `--models-dir` で変えられます。メモリを多く使うアプリを閉じてから起動します。
+GGUF は `~/models/Qwen3.8-Flash-Next-UD-Q2_0-GGUF` に、モデルのフォルダは `~/.mtplx/models/Qwen3.8-Flash-Next-UD-Q2_0-MTPLX` にできるので、アプリのモデル一覧にも出ます（アプリから起動するのは試していません）。モデルのフォルダは expert と n-gram 表を GGUF から読むので、GGUF は消さないでください。GGUF の置き場所は `--models-dir` で変えられます。メモリを多く使うアプリを閉じてから起動します。
 
 ```bash
-PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli serve \
-  --model "$HOME/models/Qwen3.8-Flash-Next-UD-Q2_0-MTPLX" \
+bin/mtplx-m1 serve --model Qwen3.8-Flash-Next-UD-Q2_0-MTPLX \
   --profile turbo --host 127.0.0.1 --port 8000 --no-auth --yes
 ```
 
@@ -130,17 +130,13 @@ Inkling-2-Mini（MoE、expert 128 個から 8 個、24 層のうち 12 層を 3 
 必要なもの: 32 GB 以上の Mac（計測は 64 GB だけです）、約 20 GB の空きディスク、上のネイティブ拡張。forge で `~/.mtplx/models` に置くと、アプリのモデル一覧にも出ます（変換はしないので数分で終わります。ダウンロードした重みとは hardlink でつなぐので、同じディスクならディスクは増えません）。
 
 ```bash
-PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli forge build \
-  --repo thinkingmachines/Inkling-2-Mini --out "$HOME/.mtplx/forge-runs" --run-id inkling2 \
-  --recipe '{"bodyBits":4,"bodyDtype":"auto","bodyGroupSize":64,"bodyMode":"affine","mtpPolicy":"keep_bf16"}' \
-  --branded-name thinkingmachines-Inkling-2-Mini-MTPLX --model-root "$HOME/.mtplx/models"
+bin/mtplx-m1 get inkling2   # = mtplx forge build --repo thinkingmachines/Inkling-2-Mini ... into ~/.mtplx/models
 ```
 
 サーバーだけで使うときは、forge したフォルダ（またはダウンロードしたフォルダ）を指定します。
 
 ```bash
-PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli serve \
-  --model "$HOME/.mtplx/models/thinkingmachines-Inkling-2-Mini-MTPLX" --host 127.0.0.1 --port 8000 --no-auth --yes
+bin/mtplx-m1 serve --model thinkingmachines-Inkling-2-Mini-MTPLX --host 127.0.0.1 --port 8000 --no-auth --yes
 ```
 
 - M1 Max 64 GB での実測（v2.12.3-m1.19、サーバー、temperature 0）: prefill は 2K で 496、1.6 万トークンで 495〜516、3 万トークンで 469 tok/s、decode は 49 / 45 / 42 tok/s です。

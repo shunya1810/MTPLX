@@ -13,6 +13,44 @@
 - **本家の MTPLX アプリが必要です。** このフォークは、アプリの Python の実行環境と、アプリでダウンロードしたモデルを使います。
 - MTPLX のプロジェクトとは関係のない、非公式のフォークです。変更は AI（Claude）の支援を受けて作り、MacBook Pro M1 Max（64 GB）1 台で計測しました。本家の README は [README.upstream.md](README.upstream.md) にあります。
 
+## すぐに使う
+
+1. [MTPLX アプリ](https://github.com/youssofal/MTPLX)を入れて、一度起動します（このフォークは、アプリの Python の実行環境で動きます）。
+2. このフォークを入れて、アプリのエンジンをこのフォークに切り替えます（2 分ほど。Xcode の Metal ツールチェーンが要ります。[手動でのインストール](#手動でのインストール)を参照）。
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/shunya1810/MTPLX/m1max-longctx/scripts/install-m1.sh | zsh -s -- --app --auto-update
+   ```
+
+   最新のリリースを `~/MTPLX-m1` に取得し、M1 用のネイティブ拡張をビルドして、アプリのエンジンをこのフォークに切り替えます。`--auto-update` を付けると、アプリがエンジンを起動するたびに、このフォークの新しいリリースへ自動で追従します。`--app` を外すと、アプリは同梱のエンジンのままで、このフォークはコマンドラインからだけ使います。
+3. アプリを終了して開き直し、モデルを選びます（[どのモデルを使うか](#どのモデルを使うか)）。
+
+アプリを使わずにサーバーを起動する場合は、先にアプリを終了してから（エンジンを 2 つ同時に動かすとメモリに収まりません）、次を実行して <http://127.0.0.1:8000> を開きます。
+
+```bash
+~/MTPLX-m1/bin/mtplx-m1 serve --model Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16
+```
+
+`--model` には、`~/.mtplx/models`（アプリがモデルを置く場所）のフォルダ名か、パスを指定します。`~/MTPLX-m1/bin/mtplx-m1 models` で一覧を表示します。
+
+- **更新：** `--auto-update` を付けた場合は何もしなくてかまいません。付けていない場合は `~/MTPLX-m1/bin/mtplx-m1 update` を実行して、アプリを開き直します。
+- **アプリの更新の通知**は、本家のアプリのものです。アプリを更新してもかまいません。アプリの更新で MLX が新しくなることがありますが、次にこのフォークを更新するとき（`--auto-update` なら自動）に、ネイティブ拡張を作り直します。
+- **アプリを同梱のエンジンに戻す：** `~/MTPLX-m1/scripts/install-m1.sh --uninstall-app` を実行して、アプリを開き直します。
+
+## どのモデルを使うか
+
+| モデル | 種類 | 入手方法 | ピークのメモリ（M1 Max 64 GB） | M1 Max での速さ |
+|---|---|---|---|---|
+| Qwen3.6-35B-A3B（[Youssofal Speed FP16](https://huggingface.co/Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16)） | MoE（1 トークンあたり 3B）、いちばん速い | アプリのモデル画面 | 読み込み中 32.6 GB、応答中 21〜24 GB | decode 128 tok/s（短いプロンプト）、prefill 945 tok/s（8K） |
+| Qwen3.8-27B（[Youssofal Speed FP16](https://huggingface.co/Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16)） | dense | アプリのモデル画面 | 25 GB（8K）〜36 GB（128K） | decode 32 tok/s、prefill 233 tok/s（8K） |
+| Qwen3.8-Flash-Next（Unsloth UD-Q2_0） | MoE、64 GB の Mac のみ | `~/MTPLX-m1/bin/mtplx-m1 get flash-next`（70.5 GB をダウンロード） | 50〜55 GB | decode 42〜48 tok/s（2K、思考あり）、3.2 万トークンのプロンプトを約 83 秒で読む |
+| Inkling-2-Mini（Thinking Machines） | MoE、層を繰り返す構造、MTP なし | `~/MTPLX-m1/bin/mtplx-m1 get inkling2`（約 20 GB） | 3.2 万トークンまで約 25 GB、25.6 万トークンで 33.9 GB | decode 49 tok/s（2K）、prefill 約 500 tok/s（1.6 万トークン） |
+
+- これらの系統のファインチューン（Ornith、Huihui、Swift など）は、アプリの Forge で作れます。
+- アプリのモデル画面には、この 2 つ（Unsloth の Flash-Next の GGUF と Inkling）は出てきません。`get` で `~/.mtplx/models` に置くと、アプリのモデル一覧に出ます。
+- 計測は M1 Max 64 GB の 1 台だけで、メモリの小さい Mac では試していません。ピークより余裕を残してください（システムとほかのアプリの分）。
+- 速さの条件は下の[主な計測値](#主な計測値)に、Flash-Next と Inkling は [USAGE](docs/m1max-longctx/USAGE.ja.md) にあります。
+
 ## 主な計測値
 
 このフォークと本家 MTPLX 2.12.2（v2.12.2-m1.13 までのこのフォークの元の版）を、同じ Mac・同じ条件で測りました。太字がこのフォークです。
@@ -125,43 +163,24 @@
 - ほかの系統のモデルは、本家と同じく `sustained` で起動します。`--profile turbo`、またはアプリの設定のプロファイルで `turbo` を選ぶと、M1 向けの変更が効く場合があります。この組み合わせは計測していません。
 - モデルごとに一番速い MTP の深さは、「[MTP の深さを測り直す](#mtp-の深さを測り直す)」で確かめられます。
 
-## 必要なもの
+## 手動でのインストール
+
+`scripts/install-m1.sh` が行う内容を、手で行う手順です。
 
 - M1 系の Mac（計測は M1 Max 64 GB、macOS 26）
-- Metal のツールチェーンが入った Xcode（`xcrun metal` が動くこと）
-- 一度起動した [MTPLX アプリ](https://github.com/youssofal/MTPLX)。モデルは、アプリのモデル画面からダウンロードします。
-
-## インストール
+- 一度起動した [MTPLX アプリ](https://github.com/youssofal/MTPLX)
+- Metal のツールチェーンが入った Xcode（`xcrun metal` が動くこと。`xcodebuild -downloadComponent MetalToolchain` で入ります）
 
 ```bash
-git clone --branch v2.12.3-m1.14 https://github.com/shunya1810/MTPLX.git MTPLX-m1
-cd MTPLX-m1
+git clone --branch m1max-longctx https://github.com/shunya1810/MTPLX.git ~/MTPLX-m1   # このブランチは常に最新のリリース
+cd ~/MTPLX-m1
 scripts/build-m1-native-extensions.sh   # 1 分ほど。「mfa_attn: ok」「ane_ffn: ok」「qsa_kernels: ok」が出れば完了
+scripts/m1-app-use-checkout.sh install  # 任意：アプリがこのチェックアウトで動く（アプリを開き直す）
 ```
 
-ネイティブ拡張（Neural Engine の prefill と、M1 向けの attention）を作らなくてもサーバーは動きますが、prefill は遅くなります。
+ネイティブ拡張（Neural Engine の prefill と、M1 向けの attention）を作らなくてもサーバーは動きますが、prefill は遅くなります。更新は `git pull`（または、必要なときだけネイティブ拡張も作り直す `scripts/install-m1.sh`）を実行して、アプリを開き直します。`scripts/m1-app-use-checkout.sh uninstall` で、アプリは同梱のエンジンに戻ります。
 
-### アプリから使う
-
-アプリのエンジンを、このフォークに切り替えます。
-
-```bash
-scripts/m1-app-use-checkout.sh install
-```
-
-アプリを終了して開き直すと、アプリはこのフォークのエンジンで動きます。Dock や Finder など、どこから開いても同じです。この設定は、ログインし直しても残ります。元に戻すときは `scripts/m1-app-use-checkout.sh uninstall` を実行して、アプリを開き直します。
-
-### サーバーとして使う
-
-MTPLX アプリを終了してから（エンジンを 2 つ同時に動かすとメモリに収まりません）、サーバーを起動します。`--model` には、アプリでダウンロードしたモデルのフォルダを指定します。
-
-```bash
-PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli serve \
-  --model "$HOME/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16" \
-  --context-window 262144 --paged-kv-quantization q8
-```
-
-サーバーは `http://127.0.0.1:8000` で待ち受けます。次のコマンドで応答を確かめます。
+サーバーが応答するかは、次のコマンドで確かめます。
 
 ```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions -H 'content-type: application/json' \
@@ -169,16 +188,6 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'content-type: application/
 ```
 
 使い方の詳細は [docs/m1max-longctx/USAGE.ja.md](docs/m1max-longctx/USAGE.ja.md) にあります。
-
-### 新しい版に更新する
-
-```bash
-git fetch --tags
-git checkout <新しいタグ>               # 例: v2.12.3-m1.14
-scripts/build-m1-native-extensions.sh   # ネイティブ拡張が変わった版だけ必要です（リリースノートに書きます）
-```
-
-アプリから使っている場合は、更新した後にアプリを開き直します。
 
 ## コーディングエージェントで使う
 
@@ -249,6 +258,7 @@ M1 向けの既定は、一つずつ環境変数で切れます。`MTPLX_M1_LONG
 
 ## 既知の制限
 
+- 実行環境は Inkling-2-Mini を、アプリの Forge に「MTP なしなら動く」（`trunk-ar-fallback`）と返します。Forge では作れないことがあるので、`mtplx-m1 get inkling2` でコマンドラインから作ってください。
 - 計測は M1 Max 64 GB の 1 台だけです。M1 Pro、M1 Ultra、ほかのメモリの容量でも同じコードが動きますが、確かめていません。
 - Neural Engine の経路は、Apple の非公開の `AppleNeuralEngine.framework` を使っています。macOS の更新で動かなくなる可能性があり、その場合は GPU の prefill に戻ります。
 - Neural Engine の prefill は int8 で計算するので、GPU の prefill とビット単位では一致しません（Qwen3.6-35B-A3B で、24,576 か所のうち 98.25% で次のトークンが一致）。`MTPLX_ANE_PREFILL=0` / `MTPLX_ANE_PREFILL_MOE=0` で GPU だけの prefill にできます。
